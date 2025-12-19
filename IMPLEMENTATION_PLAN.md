@@ -545,25 +545,117 @@ export async function restoreVersion(versionId: string): Promise<void> {
 
 ## Phase 7: UI/UX Design
 
+> **Design System:** See `DESIGN_SYSTEM.md` for complete Lovable-inspired design specifications.
+
 ### 7.1 Tab Navigation
 - **Projects** - List of all projects
 - **Chat** - Conversation with Claude
 - **Editor** - Code editor with file tree
 - **Preview** - Live app preview
 
-### 7.2 Color Scheme (Dark Mode Focus)
+### 7.2 Color Scheme (Light Theme - Lovable Inspired)
+
 ```typescript
-const colors = {
-  background: '#0D1117',
-  surface: '#161B22',
-  border: '#30363D',
-  text: '#C9D1D9',
-  textSecondary: '#8B949E',
-  primary: '#58A6FF',
-  success: '#3FB950',
-  error: '#F85149',
-  warning: '#D29922',
+// theme/colors.ts
+export const colors = {
+  // Primary Colors
+  background: '#FFFFFF',
+  foreground: '#1C1C1C',
+  cardBackground: '#F8F8F8',
+  cardForeground: '#1C1C1C',
+
+  // Secondary Colors
+  secondary: '#F0F0F0',
+  secondaryForeground: '#1C1C1C',
+  muted: '#F5F5F5',
+  mutedForeground: '#888888',
+
+  // Borders & Inputs
+  border: '#E5E5E5',
+  inputBorder: '#D0D0D0',
+
+  // Brand Accents (Lovable coral/orange)
+  brandTiger: '#C53307',      // Primary coral
+  brandSaffron: '#B74106',    // Deep orange
+  brandSapphire: '#1F6AD9',   // Blue
+  brandTwilight: '#5337CD',   // Purple
+  brandBubblegum: '#B517A0',  // Pink
+
+  // Semantic
+  destructive: '#D10808',
+  success: '#22C55E',
+  warning: '#F59E0B',
 };
+
+// Spacing scale
+export const spacing = {
+  xs: 4,
+  sm: 8,
+  md: 16,
+  lg: 20,
+  xl: 24,
+  '2xl': 32,
+  '3xl': 48,
+};
+
+// Border radius
+export const radius = {
+  sm: 4,
+  md: 6,
+  lg: 12,
+  xl: 16,
+  full: 9999,
+};
+```
+
+### 7.3 Typography
+
+```typescript
+// theme/typography.ts
+export const typography = {
+  h1: { fontSize: 48, fontWeight: '500', lineHeight: 48 },
+  h2: { fontSize: 24, fontWeight: '500', lineHeight: 32 },
+  h3: { fontSize: 18, fontWeight: '500', lineHeight: 27 },
+  body: { fontSize: 16, fontWeight: '400', lineHeight: 24 },
+  bodyLarge: { fontSize: 20, fontWeight: '400', lineHeight: 25 },
+  button: { fontSize: 14, fontWeight: '500' },
+  caption: { fontSize: 12, fontWeight: '400', lineHeight: 18 },
+};
+```
+
+### 7.4 Component Styles
+
+```typescript
+// Primary Button
+{
+  backgroundColor: colors.foreground,  // #1C1C1C
+  color: '#FFFFFF',
+  paddingHorizontal: 16,
+  paddingVertical: 8,
+  borderRadius: radius.md,  // 6
+}
+
+// Secondary Button
+{
+  backgroundColor: colors.secondary,  // #F0F0F0
+  color: colors.foreground,
+  borderWidth: 1,
+  borderColor: colors.border,
+  borderRadius: radius.md,
+}
+
+// Card
+{
+  backgroundColor: '#FFFFFF',
+  borderRadius: radius.xl,  // 16
+  borderWidth: 1,
+  borderColor: colors.border,
+  padding: spacing.lg,  // 20
+  shadowColor: '#000',
+  shadowOpacity: 0.05,
+  shadowRadius: 10,
+  shadowOffset: { width: 0, height: 4 },
+}
 ```
 
 ---
