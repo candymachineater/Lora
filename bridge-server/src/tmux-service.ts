@@ -7,10 +7,13 @@
  * - Reliable command sending with separate Enter key
  * - Clean output capture via capture-pane
  * - Control key support (Ctrl+C, Ctrl+D, etc.)
+ * - Sandbox isolation per project
  */
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const execAsync = promisify(exec);
 
@@ -47,6 +50,66 @@ function shellEscape(str: string): string {
  */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Set up sandbox configuration for a project directory.
+ * Creates .claude/settings.local.json to restrict Claude Code's access
+ * to only the project directory.
+ */
+export function setupProjectSandbox(projectPath: string): void {
+  const claudeDir = path.join(projectPath, '.claude');
+  const settingsPath = path.join(claudeDir, 'settings.local.json');
+
+  // Create .claude directory if it doesn't exist
+  if (!fs.existsSync(claudeDir)) {
+    fs.mkdirSync(claudeDir, { recursive: true });
+    console.log(`[Sandbox] Created .claude directory in ${projectPath}`);
+  }
+
+  // Create/update settings.local.json with sandbox restrictions
+  const settings = {
+    // Restrict file access to only this project directory
+    permissions: {
+      allow: [
+        projectPath,  // Allow access to project directory
+      ],
+      deny: [
+        path.dirname(projectPath),  // Deny access to parent (projects folder)
+        path.join(path.dirname(projectPath), '*'),  // Deny access to sibling projects
+      ]
+    },
+    // Additional safety settings
+    sandbox: {
+      enabled: true,
+      rootDirectory: projectPath,
+    }
+  };
+
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  console.log(`[Sandbox] Created settings.local.json for project sandbox`);
+
+  // Also create a CLAUDE.md in the project to reinforce sandbox rules
+  const claudeMdPath = path.join(projectPath, 'CLAUDE.md');
+  if (!fs.existsSync(claudeMdPath)) {
+    const claudeMd = `# Project Sandbox Rules
+
+This project is running in a sandboxed environment.
+
+## Important Restrictions
+
+- You can ONLY access files within this project directory: \`${projectPath}\`
+- You CANNOT access parent directories or other projects
+- All file operations must be within this project folder
+- Do not attempt to navigate outside this directory using \`cd ..\` or absolute paths
+
+## Project Structure
+
+This is an isolated Expo/React Native project. Focus on building and modifying files within this directory only.
+`;
+    fs.writeFileSync(claudeMdPath, claudeMd);
+    console.log(`[Sandbox] Created CLAUDE.md with sandbox instructions`);
+  }
 }
 
 /**
@@ -110,6 +173,9 @@ export async function createSession(
     return session;
   }
 
+  // Set up sandbox configuration for the project
+  setupProjectSandbox(projectPath);
+
   // Create new detached session
   console.log(`[Tmux] Creating new session ${sessionName} in ${projectPath}`);
   await execAsync(
@@ -133,7 +199,7 @@ export async function createSession(
   if (options?.autoStartClaude !== false) {
     await sleep(500); // Wait for shell to initialize
     console.log(`[Tmux] Auto-starting Claude Code in ${sessionName}`);
-    await sendCommand(sessionName, 'claude');
+    await sendCommand(sessionName, 'claude --dangerously-skip-permissions');
     await sendEnter(sessionName);
     session.isClaudeRunning = true;
   }
@@ -329,8 +395,86 @@ function updateSessionActivity(sessionName: string): void {
 }
 
 /**
+ * Claude Code state detection
+ */
+export interface ClaudeCodeState {
+  isReady: boolean;           // Ready for input (shows prompt)
+  isProcessing: boolean;      // Actively working (spinners, etc.)
+  isWaitingConfirm: boolean;  // Waiting for y/n confirmation
+  hasInputPrompt: boolean;    // > prompt visible at end
+  rawOutput: string;          // Full captured output
+}
+
+/**
+ * Analyze Claude Code output to determine state
+ */
+export function analyzeClaudeCodeState(output: string): ClaudeCodeState {
+  const lines = output.split('\n');
+  const lastLines = lines.slice(-15).join('\n'); // Focus on recent output
+  const lastLine = lines[lines.length - 1] || '';
+  const secondLastLine = lines[lines.length - 2] || '';
+
+  // Check for active processing indicators
+  const processingPatterns = [
+    /[·✻✽✿✸⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/,  // Spinner characters
+    /\bThinking\b/i,
+    /\bWorking\b/i,
+    /\bProcessing\b/i,
+    /\bAnalyzing\b/i,
+    /\bReading\b/i,
+    /\bWriting\b/i,
+    /\bSearching\b/i,
+    /\bRunning\b/i,
+    /esc to interrupt/i,
+    /\.\.\.\s*$/,  // Trailing ellipsis
+  ];
+
+  const isProcessing = processingPatterns.some(pattern => pattern.test(lastLines));
+
+  // Check for confirmation prompts
+  const confirmPatterns = [
+    /\[y\/n\]/i,
+    /\[Y\/n\]/i,
+    /\[yes\/no\]/i,
+    /Do you want to proceed/i,
+    /Would you like to/i,
+    /Continue\?/i,
+    /Proceed\?/i,
+    /\(yes\/no\)/i,
+  ];
+
+  const isWaitingConfirm = confirmPatterns.some(pattern => pattern.test(lastLines));
+
+  // Check for input prompt at end
+  // Claude Code shows ">" on a line by itself or with minimal content when ready
+  const promptPatterns = [
+    /^>\s*$/,                    // Just > on a line
+    /^>\s+$/,                    // > with trailing spaces
+    /^\s*>\s*$/,                 // > with leading/trailing whitespace
+    /What would you like/i,
+    /How can I help/i,
+    /What can I help/i,
+  ];
+
+  const hasInputPrompt = promptPatterns.some(pattern =>
+    pattern.test(lastLine) || pattern.test(secondLastLine)
+  );
+
+  // Ready when: has prompt AND not processing
+  const isReady = (hasInputPrompt || isWaitingConfirm) && !isProcessing;
+
+  return {
+    isReady,
+    isProcessing,
+    isWaitingConfirm,
+    hasInputPrompt,
+    rawOutput: output
+  };
+}
+
+/**
  * Wait for Claude Code response by polling output
- * Returns when output stabilizes (no changes for stabilityMs)
+ * Uses smart state detection to know when Claude is truly done
  */
 export async function waitForResponse(
   sessionName: string,
@@ -338,32 +482,79 @@ export async function waitForResponse(
     timeoutMs?: number;
     stabilityMs?: number;
     pollIntervalMs?: number;
+    minResponseTime?: number;  // Minimum time to wait before checking readiness
   }
 ): Promise<string> {
   const {
-    timeoutMs = 30000,
-    stabilityMs = 2000,
-    pollIntervalMs = 500
+    timeoutMs = 120000,        // 2 minutes for long tasks
+    stabilityMs = 1500,        // Output stable for 1.5s
+    pollIntervalMs = 300,      // Poll every 300ms
+    minResponseTime = 1000     // Wait at least 1s before checking readiness
   } = options || {};
 
   const startTime = Date.now();
   let lastOutput = '';
   let stableTime = 0;
+  let outputBeforeCommand = '';
+  let firstOutputTime = 0;
+  let hasSeenNewOutput = false;
 
-  console.log(`[Tmux] Waiting for response from ${sessionName}...`);
+  // Capture initial state before the command runs
+  outputBeforeCommand = await captureOutput(sessionName, 100);
+
+  console.log(`[Tmux] Waiting for Claude Code response from ${sessionName}...`);
+  console.log(`[Tmux] Config: timeout=${timeoutMs}ms, stability=${stabilityMs}ms, poll=${pollIntervalMs}ms`);
 
   while (Date.now() - startTime < timeoutMs) {
     const currentOutput = await captureOutput(sessionName, 100);
+    const state = analyzeClaudeCodeState(currentOutput);
 
-    if (currentOutput === lastOutput) {
-      stableTime += pollIntervalMs;
-      if (stableTime >= stabilityMs) {
-        console.log(`[Tmux] Output stable for ${stabilityMs}ms, extracting response`);
-        return extractClaudeResponse(currentOutput);
+    // Track when we first see new output
+    if (currentOutput !== outputBeforeCommand && !hasSeenNewOutput) {
+      hasSeenNewOutput = true;
+      firstOutputTime = Date.now();
+      console.log(`[Tmux] New output detected after ${Date.now() - startTime}ms`);
+    }
+
+    // Don't check readiness until min response time has passed
+    const timeSinceFirstOutput = firstOutputTime > 0 ? Date.now() - firstOutputTime : 0;
+
+    // Debug state periodically
+    if (Math.floor((Date.now() - startTime) / 2000) !== Math.floor((Date.now() - startTime - pollIntervalMs) / 2000)) {
+      console.log(`[Tmux] State check: ready=${state.isReady}, processing=${state.isProcessing}, prompt=${state.hasInputPrompt}, stable=${stableTime}ms`);
+    }
+
+    // If Claude Code is ready (has prompt and not processing)
+    if (state.isReady && timeSinceFirstOutput >= minResponseTime) {
+      // Still check for stability to avoid false positives
+      if (currentOutput === lastOutput) {
+        stableTime += pollIntervalMs;
+        if (stableTime >= stabilityMs) {
+          console.log(`[Tmux] Claude Code is ready (prompt detected, stable for ${stabilityMs}ms)`);
+          return extractClaudeResponse(currentOutput);
+        }
+      } else {
+        stableTime = 0;
+        lastOutput = currentOutput;
       }
-    } else {
+    } else if (state.isProcessing) {
+      // Reset stability timer if still processing
       stableTime = 0;
       lastOutput = currentOutput;
+    } else {
+      // Not explicitly ready or processing - use stability check
+      if (currentOutput === lastOutput) {
+        stableTime += pollIntervalMs;
+        // For non-processing state, require longer stability
+        const requiredStability = state.hasInputPrompt ? stabilityMs : stabilityMs * 2;
+        if (stableTime >= requiredStability && timeSinceFirstOutput >= minResponseTime) {
+          console.log(`[Tmux] Output stable for ${stableTime}ms, extracting response`);
+          return extractClaudeResponse(currentOutput);
+        }
+      } else {
+        stableTime = 0;
+        lastOutput = currentOutput;
+      }
     }
 
     await sleep(pollIntervalMs);
@@ -371,6 +562,55 @@ export async function waitForResponse(
 
   console.log(`[Tmux] Timeout waiting for response after ${timeoutMs}ms`);
   return extractClaudeResponse(lastOutput);
+}
+
+/**
+ * Wait specifically for Claude Code to be ready for input
+ * More aggressive timeout and prompt detection for voice mode
+ */
+export async function waitForClaudeReady(
+  sessionName: string,
+  options?: {
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+  }
+): Promise<ClaudeCodeState> {
+  const {
+    timeoutMs = 180000,   // 3 minutes max for long tasks
+    pollIntervalMs = 500
+  } = options || {};
+
+  const startTime = Date.now();
+  let lastState: ClaudeCodeState | null = null;
+  let readyCount = 0;
+  const READY_CONFIRMATIONS = 3; // Must be ready for 3 consecutive checks
+
+  console.log(`[Tmux] Waiting for Claude Code to be ready in ${sessionName}...`);
+
+  while (Date.now() - startTime < timeoutMs) {
+    const output = await captureOutput(sessionName, 100);
+    const state = analyzeClaudeCodeState(output);
+
+    if (state.isReady) {
+      readyCount++;
+      console.log(`[Tmux] Ready check ${readyCount}/${READY_CONFIRMATIONS}`);
+      if (readyCount >= READY_CONFIRMATIONS) {
+        console.log(`[Tmux] Claude Code confirmed ready after ${Date.now() - startTime}ms`);
+        return state;
+      }
+    } else {
+      if (readyCount > 0) {
+        console.log(`[Tmux] Ready interrupted (processing=${state.isProcessing})`);
+      }
+      readyCount = 0;
+    }
+
+    lastState = state;
+    await sleep(pollIntervalMs);
+  }
+
+  console.log(`[Tmux] Timeout waiting for Claude ready after ${timeoutMs}ms`);
+  return lastState || analyzeClaudeCodeState(await captureOutput(sessionName, 100));
 }
 
 /**
@@ -465,7 +705,7 @@ export async function restartClaude(sessionName: string): Promise<void> {
   await sleep(500);
 
   // Start Claude again
-  await sendCommand(sessionName, 'claude');
+  await sendCommand(sessionName, 'claude --dangerously-skip-permissions');
   await sendEnter(sessionName);
 
   // Update session
@@ -502,7 +742,9 @@ export default {
   getSessionInfo,
   getSessionByName,
   listSessions,
+  analyzeClaudeCodeState,
   waitForResponse,
+  waitForClaudeReady,
   extractClaudeResponse,
   sendCommandAndWait,
   clearScreen,

@@ -1,16 +1,105 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { View, StyleSheet, ActivityIndicator, Text } from 'react-native';
-import { WebView } from 'react-native-webview';
+import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import { colors, spacing, typography } from '../../theme';
+
+export interface ConsoleMessage {
+  type: 'log' | 'warn' | 'error' | 'info';
+  message: string;
+  timestamp: Date;
+}
 
 interface PreviewFrameProps {
   url: string;
   onError?: (error: string) => void;
+  onConsoleMessage?: (message: ConsoleMessage) => void;
 }
 
-export function PreviewFrame({ url, onError }: PreviewFrameProps) {
+// Injected script to capture console messages
+const CONSOLE_CAPTURE_SCRIPT = `
+  (function() {
+    const originalConsole = {
+      log: console.log,
+      warn: console.warn,
+      error: console.error,
+      info: console.info
+    };
+
+    function sendToRN(type, args) {
+      try {
+        const message = Array.from(args).map(arg => {
+          if (typeof arg === 'object') {
+            try {
+              return JSON.stringify(arg, null, 2);
+            } catch (e) {
+              return String(arg);
+            }
+          }
+          return String(arg);
+        }).join(' ');
+
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'console',
+          level: type,
+          message: message
+        }));
+      } catch (e) {}
+    }
+
+    console.log = function() {
+      sendToRN('log', arguments);
+      originalConsole.log.apply(console, arguments);
+    };
+
+    console.warn = function() {
+      sendToRN('warn', arguments);
+      originalConsole.warn.apply(console, arguments);
+    };
+
+    console.error = function() {
+      sendToRN('error', arguments);
+      originalConsole.error.apply(console, arguments);
+    };
+
+    console.info = function() {
+      sendToRN('info', arguments);
+      originalConsole.info.apply(console, arguments);
+    };
+
+    // Capture unhandled errors
+    window.onerror = function(message, source, lineno, colno, error) {
+      sendToRN('error', ['Uncaught Error: ' + message + ' at ' + source + ':' + lineno + ':' + colno]);
+      return false;
+    };
+
+    // Capture unhandled promise rejections
+    window.onunhandledrejection = function(event) {
+      sendToRN('error', ['Unhandled Promise Rejection: ' + event.reason]);
+    };
+
+    true;
+  })();
+`;
+
+export function PreviewFrame({ url, onError, onConsoleMessage }: PreviewFrameProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const webViewRef = useRef<WebView>(null);
+
+  const handleMessage = (event: WebViewMessageEvent) => {
+    try {
+      const data = JSON.parse(event.nativeEvent.data);
+      if (data.type === 'console' && onConsoleMessage) {
+        onConsoleMessage({
+          type: data.level,
+          message: data.message,
+          timestamp: new Date(),
+        });
+      }
+    } catch (e) {
+      // Ignore parse errors
+    }
+  };
 
   if (!url) {
     return (
@@ -38,6 +127,7 @@ export function PreviewFrame({ url, onError }: PreviewFrameProps) {
         </View>
       )}
       <WebView
+        ref={webViewRef}
         source={{ uri: url }}
         style={styles.webview}
         onLoadStart={() => {
@@ -50,7 +140,14 @@ export function PreviewFrame({ url, onError }: PreviewFrameProps) {
           setError(errorMsg);
           setLoading(false);
           onError?.(errorMsg);
+          onConsoleMessage?.({
+            type: 'error',
+            message: `WebView Error: ${errorMsg}`,
+            timestamp: new Date(),
+          });
         }}
+        onMessage={handleMessage}
+        injectedJavaScript={CONSOLE_CAPTURE_SCRIPT}
         allowsInlineMediaPlayback
         mediaPlaybackRequiresUserAction={false}
         javaScriptEnabled

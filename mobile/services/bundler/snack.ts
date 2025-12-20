@@ -1,40 +1,97 @@
 import { Project, ProjectFile } from '../../types';
 
-const SNACK_API = 'https://snack.expo.dev/api/snacks';
 const SDK_VERSION = '52.0.0';
 
 interface SnackFile {
-  type: 'CODE';
+  type: 'CODE' | 'ASSET';
   contents: string;
 }
 
-interface SnackResponse {
-  id: string;
-  url: string;
-  fullName: string;
-}
-
-interface SnackConfig {
-  name: string;
-  description?: string;
-  files: Record<string, SnackFile>;
-  dependencies?: Record<string, string>;
-  sdkVersion: string;
-}
-
+/**
+ * Create a Snack preview URL by encoding files directly in the URL query parameter.
+ * This approach doesn't require an API call - the Snack platform reads the files
+ * from the URL parameters directly.
+ *
+ * Reference: https://github.com/expo/snack/blob/main/docs/url-query-parameters.md
+ */
 export async function createSnack(project: Project): Promise<string> {
+  console.log('[Snack] Creating snack for project:', project.name);
+  console.log('[Snack] Project files count:', project.files.length);
+  console.log('[Snack] Project files:', project.files.map(f => `${f.path} (${f.content?.length || 0} chars)`));
+
   const snackFiles: Record<string, SnackFile> = {};
+  let hasEntryPoint = false;
 
   // Convert project files to Snack format
   for (const file of project.files) {
-    snackFiles[file.path] = {
+    // Skip binary files and large files
+    if (file.path.match(/\.(png|jpg|jpeg|gif|ico|woff|ttf|mp3|mp4)$/i)) {
+      console.log('[Snack] Skipping binary file:', file.path);
+      continue;
+    }
+
+    // Skip files without content
+    if (!file.content || file.content.trim() === '') {
+      console.log('[Snack] Skipping empty file:', file.path);
+      continue;
+    }
+
+    // Normalize path - Snack expects paths without leading slashes
+    let filePath = file.path.replace(/^\/+/, '');
+
+    // Check for entry point - Snack looks for App.js or App.tsx
+    if (filePath === 'App.tsx' || filePath === 'App.js') {
+      hasEntryPoint = true;
+      console.log('[Snack] Found entry point:', filePath);
+    }
+
+    snackFiles[filePath] = {
       type: 'CODE',
-      contents: file.content || '',
+      contents: file.content,
     };
   }
 
-  // Add package.json if not present
+  // If no entry point found, create a minimal App.js
+  if (!hasEntryPoint) {
+    console.log('[Snack] No entry point found, creating default App.js');
+    snackFiles['App.js'] = {
+      type: 'CODE',
+      contents: `import React from 'react';
+import { View, Text, StyleSheet } from 'react-native';
+
+export default function App() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.text}>Hello from Lora!</Text>
+      <Text style={styles.subtext}>Add an App.tsx or App.js to your project</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#f5f5f5',
+  },
+  text: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#333',
+  },
+  subtext: {
+    fontSize: 14,
+    color: '#666',
+    marginTop: 8,
+  },
+});`,
+    };
+  }
+
+  // Add package.json if not present with minimal dependencies
   if (!snackFiles['package.json']) {
+    console.log('[Snack] Adding default package.json');
     snackFiles['package.json'] = {
       type: 'CODE',
       contents: JSON.stringify(
@@ -51,41 +108,27 @@ export async function createSnack(project: Project): Promise<string> {
     };
   }
 
-  const config: SnackConfig = {
-    name: project.name || 'Lora Preview',
-    description: project.description || 'Built with Lora',
-    files: snackFiles,
-    sdkVersion: SDK_VERSION,
-  };
+  console.log('[Snack] Final files to upload:', Object.keys(snackFiles));
 
-  try {
-    const response = await fetch(SNACK_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(config),
-    });
+  // Build URL with files parameter
+  const filesParam = encodeURIComponent(JSON.stringify(snackFiles));
+  const nameParam = encodeURIComponent(project.name || 'Lora Preview');
+  const descParam = encodeURIComponent(project.description || 'Built with Lora');
 
-    if (!response.ok) {
-      throw new Error(`Snack API error: ${response.status}`);
-    }
+  // Construct the Snack URL with embedded files
+  const snackUrl = `https://snack.expo.dev/?name=${nameParam}&description=${descParam}&files=${filesParam}`;
 
-    const data: SnackResponse = await response.json();
-    return `https://snack.expo.dev/${data.id}`;
-  } catch (err) {
-    console.error('[Snack] Failed to create snack:', err);
-    throw err;
-  }
+  console.log('[Snack] Created URL, length:', snackUrl.length);
+
+  return snackUrl;
 }
 
 export async function createEmbeddedSnackUrl(project: Project): Promise<string> {
-  // Create a local preview URL with embedded code
-  // This uses the Snack embed URL format
+  // Get the base snack URL with files embedded
   const snackUrl = await createSnack(project);
 
-  // Return embedded preview URL
-  return `${snackUrl}?embed=1&preview=true&platform=ios&theme=light`;
+  // Add embed parameters (snackUrl already has query params, so use &)
+  return `${snackUrl}&embed=1&preview=true&platform=ios&theme=light`;
 }
 
 export function generateSnackQRUrl(snackId: string): string {

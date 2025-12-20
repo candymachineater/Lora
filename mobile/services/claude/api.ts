@@ -288,6 +288,45 @@ class BridgeService {
           vtCallbacks?.onTranscription?.(response.transcription);
         }
         break;
+
+      // Preview responses
+      case 'preview_started':
+        const previewStartedResolver = this.pendingResolvers.get('preview_started');
+        if (previewStartedResolver) {
+          previewStartedResolver({ previewUrl: response.previewUrl, previewPort: response.previewPort });
+          this.pendingResolvers.delete('preview_started');
+        }
+        break;
+
+      case 'preview_stopped':
+        const previewStoppedResolver = this.pendingResolvers.get('preview_stopped');
+        if (previewStoppedResolver) {
+          previewStoppedResolver({ stopped: response.stopped });
+          this.pendingResolvers.delete('preview_stopped');
+        }
+        break;
+
+      case 'preview_status':
+        const previewStatusResolver = this.pendingResolvers.get('preview_status');
+        if (previewStatusResolver) {
+          previewStatusResolver({
+            previewRunning: response.previewRunning,
+            previewUrl: response.previewUrl,
+            previewPort: response.previewPort
+          });
+          this.pendingResolvers.delete('preview_status');
+        }
+        break;
+
+      case 'preview_error':
+        if (response.projectId && response.previewError) {
+          console.log(`[Bridge] Preview error for ${response.projectId}: ${response.previewError}`);
+          const errorCallback = this.previewErrorCallbacks.get(response.projectId);
+          if (errorCallback) {
+            errorCallback(response.previewError, response.previewErrorType || 'error');
+          }
+        }
+        break;
     }
   }
 
@@ -500,7 +539,8 @@ class BridgeService {
     },
     cols: number = 80,
     rows: number = 24,
-    sandbox: boolean = true
+    sandbox: boolean = true,
+    initialPrompt?: string  // Optional initial prompt to send to Claude on startup
   ): Promise<string> {
     return new Promise((resolve, reject) => {
       if (!this.isConnected()) {
@@ -519,7 +559,7 @@ class BridgeService {
         resolve(terminalId);
       });
 
-      this.send({ type: 'terminal_create', projectId, cols, rows, sandbox });
+      this.send({ type: 'terminal_create', projectId, cols, rows, sandbox, initialPrompt });
 
       setTimeout(() => {
         if (this.pendingResolvers.has('terminal_created')) {
@@ -708,6 +748,98 @@ class BridgeService {
       terminalId,
       audioData,
       audioMimeType: mimeType
+    });
+  }
+
+  // Preview server management
+  private previewCallbacks: Map<string, (response: { url?: string; port?: number; running?: boolean }) => void> = new Map();
+  private previewErrorCallbacks: Map<string, (error: string, errorType: 'error' | 'warn' | 'info') => void> = new Map();
+
+  async startPreview(
+    projectId: string,
+    onError?: (error: string, errorType: 'error' | 'warn' | 'info') => void
+  ): Promise<{ url: string; port: number }> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+
+      console.log(`[Bridge] Starting preview for project: ${projectId}`);
+
+      // Register error callback if provided
+      if (onError) {
+        this.previewErrorCallbacks.set(projectId, onError);
+      }
+
+      this.pendingResolvers.set('preview_started', (response: { previewUrl: string; previewPort: number }) => {
+        resolve({ url: response.previewUrl, port: response.previewPort });
+      });
+
+      this.send({ type: 'preview_start', projectId });
+
+      setTimeout(() => {
+        if (this.pendingResolvers.has('preview_started')) {
+          this.pendingResolvers.delete('preview_started');
+          this.previewErrorCallbacks.delete(projectId);
+          reject(new Error('Timeout starting preview'));
+        }
+      }, 60000); // 60 second timeout for npm install + expo start
+    });
+  }
+
+  // Unregister preview error callback (call when leaving preview or project changes)
+  clearPreviewErrorCallback(projectId: string): void {
+    this.previewErrorCallbacks.delete(projectId);
+  }
+
+  async stopPreview(projectId: string): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+
+      console.log(`[Bridge] Stopping preview for project: ${projectId}`);
+
+      this.pendingResolvers.set('preview_stopped', (response: { stopped: boolean }) => {
+        resolve(response.stopped);
+      });
+
+      this.send({ type: 'preview_stop', projectId });
+
+      setTimeout(() => {
+        if (this.pendingResolvers.has('preview_stopped')) {
+          this.pendingResolvers.delete('preview_stopped');
+          reject(new Error('Timeout stopping preview'));
+        }
+      }, 10000);
+    });
+  }
+
+  async getPreviewStatus(projectId: string): Promise<{ running: boolean; url?: string; port?: number }> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+
+      this.pendingResolvers.set('preview_status', (response: { previewRunning: boolean; previewUrl?: string; previewPort?: number }) => {
+        resolve({
+          running: response.previewRunning,
+          url: response.previewUrl,
+          port: response.previewPort
+        });
+      });
+
+      this.send({ type: 'preview_status', projectId });
+
+      setTimeout(() => {
+        if (this.pendingResolvers.has('preview_status')) {
+          this.pendingResolvers.delete('preview_status');
+          reject(new Error('Timeout getting preview status'));
+        }
+      }, 5000);
     });
   }
 

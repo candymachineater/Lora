@@ -56,7 +56,7 @@ export interface Message {
 
 // WebSocket message types
 export interface WSMessage {
-  type: 'ping' | 'cancel' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio';
+  type: 'ping' | 'cancel' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'preview_start' | 'preview_stop' | 'preview_status';
   projectName?: string;
   projectId?: string;
   filePath?: string;
@@ -67,6 +67,7 @@ export interface WSMessage {
   rows?: number;
   sandbox?: boolean; // true = sandboxed to project, false = full filesystem access
   autoStartClaude?: boolean; // Auto-start claude code on terminal creation
+  initialPrompt?: string; // Initial prompt to send to Claude Code on startup
   // Voice-related fields
   voiceSessionId?: string;
   audioData?: string; // Base64 encoded audio
@@ -75,7 +76,7 @@ export interface WSMessage {
 }
 
 export interface WSResponse {
-  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking';
+  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ServerProject[];
@@ -93,6 +94,13 @@ export interface WSResponse {
   audioMimeType?: string; // e.g., 'audio/mp3'
   voiceAvailable?: { stt: boolean; tts: boolean; agent: boolean }; // Service availability
   voiceEnabled?: boolean; // Voice mode status for terminal
+  // Preview-related fields
+  previewUrl?: string;
+  previewPort?: number;
+  previewRunning?: boolean;
+  stopped?: boolean;
+  previewError?: string; // Error message from preview server
+  previewErrorType?: 'error' | 'warn' | 'info'; // Severity of preview message
 }
 
 // Settings types

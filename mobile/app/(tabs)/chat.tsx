@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView, Animated } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Terminal as TerminalIcon, Plus, X, Mic, MicOff, Volume2, Square } from 'lucide-react-native';
 import { Audio, AVPlaybackStatus } from 'expo-av';
 import { useProjectStore, useSettingsStore } from '../../stores';
@@ -30,6 +30,7 @@ const stripAnsi = (str: string) => str.replace(/\x1b\[[0-9;]*m/g, '');
 
 export default function TerminalScreen() {
   const router = useRouter();
+  const params = useLocalSearchParams<{ pendingPrompt?: string; createNewTerminal?: string }>();
 
   const { currentProjectId, projects, currentProject } = useProjectStore();
   const { bridgeServerUrl, isConnected, setIsConnected } = useSettingsStore();
@@ -39,6 +40,10 @@ export default function TerminalScreen() {
   const [activeTerminalIndex, setActiveTerminalIndex] = useState(0);
   const lastProjectIdRef = useRef<string | null>(null);
   const terminalCounter = useRef(0);
+
+  // Pending prompt from preview (for sending console logs to Claude)
+  const pendingPromptRef = useRef<string | null>(null);
+  const pendingPromptSentRef = useRef(false);
 
   // Voice mode state - now integrated directly with terminal
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>('off');
@@ -124,6 +129,61 @@ export default function TerminalScreen() {
       stopMetering();
     };
   }, []);
+
+  // Handle pending prompt from preview (console logs to send to Claude)
+  useEffect(() => {
+    if (params.pendingPrompt && !pendingPromptSentRef.current) {
+      pendingPromptRef.current = params.pendingPrompt;
+      pendingPromptSentRef.current = false;
+
+      // If requested to create new terminal, do so
+      if (params.createNewTerminal === 'true') {
+        console.log('[Terminal] Creating new terminal for pending prompt');
+        createTerminalWithPrompt(params.pendingPrompt);
+      }
+    }
+  }, [params.pendingPrompt, params.createNewTerminal]);
+
+  // Create terminal with initial prompt passed directly to Claude Code
+  const createTerminalWithPrompt = async (prompt: string) => {
+    if (!currentProjectId) return;
+
+    try {
+      terminalCounter.current += 1;
+      pendingPromptSentRef.current = true; // Mark as sent since it's passed as initial prompt
+
+      // Create terminal with initial prompt - Claude will start with this prompt automatically
+      const id = await bridgeService.createTerminal(
+        currentProjectId,
+        {
+          onOutput: (data) => {
+            setTerminals((prev) =>
+              prev.map((t) => (t.id === id ? { ...t, output: t.output + data } : t))
+            );
+          },
+          onClose: () => {
+            setTerminals((prev) => {
+              const newTerminals = prev.filter((t) => t.id !== id);
+              setActiveTerminalIndex((idx) => Math.min(idx, Math.max(0, newTerminals.length - 1)));
+              return newTerminals;
+            });
+          },
+        },
+        80,
+        50,
+        projectSandbox,
+        prompt  // Pass the prompt directly to Claude Code startup
+      );
+
+      const newSession: TerminalSession = { id, output: '', sandbox: projectSandbox };
+      setTerminals((prev) => [...prev, newSession]);
+      setActiveTerminalIndex(terminals.length);
+      console.log('[Terminal] Created terminal with initial prompt:', id);
+
+    } catch (err) {
+      console.error('[Terminal] Failed to create terminal with prompt:', err);
+    }
+  };
 
   const stopMetering = () => {
     if (meteringIntervalRef.current) {

@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { WebSocketServer, WebSocket } from 'ws';
 import { networkInterfaces } from 'os';
+import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as pty from 'node-pty';
@@ -52,7 +53,7 @@ fs.writeFileSync(serverLogFile, `=== Bridge Server Started at ${getTimestamp()} 
 fs.writeFileSync(terminalLogFile, `=== Terminal Logs Started at ${getTimestamp()} ===\n`);
 
 interface Message {
-  type: 'ping' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio';
+  type: 'ping' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'preview_start' | 'preview_stop' | 'preview_status';
   projectName?: string;
   projectId?: string;
   filePath?: string;
@@ -64,6 +65,7 @@ interface Message {
   sandbox?: boolean; // true = sandboxed to project, false = full filesystem access
   autoStartClaude?: boolean; // Auto-start claude code on terminal creation
   killSession?: boolean; // For terminal_close - also kill tmux session (default: preserve)
+  initialPrompt?: string; // Initial prompt to send to Claude Code on startup
   // Voice-related fields
   voiceSessionId?: string;
   audioData?: string; // Base64 encoded audio
@@ -85,7 +87,7 @@ interface FileInfo {
 }
 
 interface StreamResponse {
-  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking';
+  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ProjectInfo[];
@@ -103,6 +105,13 @@ interface StreamResponse {
   audioMimeType?: string; // e.g., 'audio/mp3'
   voiceAvailable?: { stt: boolean; tts: boolean; agent: boolean }; // Service availability
   voiceEnabled?: boolean; // Voice mode status for terminal
+  // Preview-related fields
+  previewUrl?: string;
+  previewPort?: number;
+  previewRunning?: boolean;
+  stopped?: boolean;
+  previewError?: string; // Error message from preview server
+  previewErrorType?: 'error' | 'warn' | 'info'; // Severity of preview message
 }
 
 // Terminal session management (hybrid: tmux for commands, PTY for output)
@@ -199,6 +208,249 @@ async function getActiveClaudeSession(projectId: string): Promise<string | undef
   return undefined;
 }
 
+// ============================================================================
+// PREVIEW SERVER MANAGEMENT
+// ============================================================================
+
+interface PreviewServer {
+  projectId: string;
+  process: ChildProcess;
+  port: number;
+  url: string;
+  startedAt: number;
+  onError?: (error: string, errorType: 'error' | 'warn' | 'info') => void;
+}
+
+// Track running preview servers per project
+const previewServers: Map<string, PreviewServer> = new Map();
+
+// Base port for preview servers (each project gets a unique port)
+let nextPreviewPort = 19006;
+
+/**
+ * Check if a port is available
+ */
+async function isPortAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const net = require('net');
+    const server = net.createServer();
+    server.once('error', () => resolve(false));
+    server.once('listening', () => {
+      server.close();
+      resolve(true);
+    });
+    server.listen(port);
+  });
+}
+
+/**
+ * Find an available port starting from the given port
+ */
+async function findAvailablePort(startPort: number): Promise<number> {
+  let port = startPort;
+  while (port < startPort + 100) { // Try up to 100 ports
+    if (await isPortAvailable(port)) {
+      return port;
+    }
+    port++;
+  }
+  throw new Error(`Could not find available port in range ${startPort}-${startPort + 100}`);
+}
+
+/**
+ * Wait for a URL to respond
+ */
+async function waitForServer(url: string, timeoutMs: number = 30000): Promise<boolean> {
+  const http = require('http');
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const req = http.get(url, (res: any) => {
+          res.resume(); // Consume response
+          resolve();
+        });
+        req.on('error', reject);
+        req.setTimeout(2000, () => {
+          req.destroy();
+          reject(new Error('timeout'));
+        });
+      });
+      return true;
+    } catch {
+      // Server not ready yet, wait and retry
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+  return false;
+}
+
+/**
+ * Start a preview server for a project
+ */
+async function startPreviewServer(
+  projectId: string,
+  onError?: (error: string, errorType: 'error' | 'warn' | 'info') => void
+): Promise<{ url: string; port: number }> {
+  // Check if already running
+  const existing = previewServers.get(projectId);
+  if (existing) {
+    serverLog(`🔄 Preview server already running for ${projectId} at ${existing.url}`);
+    return { url: existing.url, port: existing.port };
+  }
+
+  const projectPath = getProjectPath(projectId);
+  if (!fs.existsSync(projectPath)) {
+    throw new Error(`Project not found: ${projectId}`);
+  }
+
+  // Check if package.json exists (required for Expo)
+  const packageJsonPath = path.join(projectPath, 'package.json');
+  if (!fs.existsSync(packageJsonPath)) {
+    throw new Error(`No package.json found in project. Please create an Expo project first.`);
+  }
+
+  // Check if node_modules exists, if not run npm install first
+  const nodeModulesPath = path.join(projectPath, 'node_modules');
+  if (!fs.existsSync(nodeModulesPath)) {
+    serverLog(`📦 Installing dependencies for ${projectId}...`);
+    onError?.(`Installing dependencies... This may take a moment.`, 'info');
+    await new Promise<void>((resolve, reject) => {
+      const npmInstall = spawn('npm', ['install'], {
+        cwd: projectPath,
+        stdio: 'pipe'
+      });
+      npmInstall.on('close', (code) => {
+        if (code === 0) {
+          onError?.(`Dependencies installed successfully.`, 'info');
+          resolve();
+        } else {
+          onError?.(`npm install failed with code ${code}`, 'error');
+          reject(new Error(`npm install failed with code ${code}`));
+        }
+      });
+      npmInstall.on('error', (err) => {
+        onError?.(`npm install error: ${err.message}`, 'error');
+        reject(err);
+      });
+    });
+  }
+
+  // Find an available port
+  const port = await findAvailablePort(nextPreviewPort);
+  nextPreviewPort = port + 1; // Update for next time
+
+  serverLog(`🚀 Starting preview server for ${projectId} on port ${port}`);
+
+  // Start expo web server with explicit port
+  const expoProcess = spawn('npx', ['expo', 'start', '--web', '--port', port.toString()], {
+    cwd: projectPath,
+    stdio: 'pipe',
+    env: { ...process.env, BROWSER: 'none', CI: '1' }  // Don't open browser, run non-interactive
+  });
+
+  // Use network IP so mobile app can access it
+  const networkIP = getLocalIP();
+  const url = `http://${networkIP}:${port}`;
+
+  const server: PreviewServer = {
+    projectId,
+    process: expoProcess,
+    port,
+    url,
+    startedAt: Date.now(),
+    onError
+  };
+
+  previewServers.set(projectId, server);
+
+  let serverFailed = false;
+  let failureReason = '';
+
+  expoProcess.stdout?.on('data', (data) => {
+    const output = data.toString().trim();
+    serverLog(`[Preview ${projectId}] ${output}`);
+  });
+
+  expoProcess.stderr?.on('data', (data) => {
+    const output = data.toString().trim();
+    serverError(`[Preview ${projectId}] ${output}`);
+
+    // Determine error type and forward to client
+    let errorType: 'error' | 'warn' | 'info' = 'error';
+    if (output.includes('warning') || output.includes('deprecated')) {
+      errorType = 'warn';
+    }
+
+    // Forward significant errors to client console
+    if (output.includes('CommandError') || output.includes('Error:') ||
+        output.includes('not installed') || output.includes('not found') ||
+        output.includes('failed') || output.includes('EADDRINUSE') ||
+        output.includes('Input is required')) {
+      onError?.(output, errorType);
+      serverFailed = true;
+      failureReason = output;
+    } else if (output.includes('warning')) {
+      onError?.(output, 'warn');
+    }
+  });
+
+  expoProcess.on('close', (code) => {
+    serverLog(`[Preview ${projectId}] Server exited with code ${code}`);
+    previewServers.delete(projectId);
+    if (code !== 0) {
+      serverFailed = true;
+      onError?.(`Preview server exited with code ${code}`, 'error');
+    }
+  });
+
+  // Wait for the server to actually respond (use localhost for local check)
+  const localUrl = `http://localhost:${port}`;
+  serverLog(`[Preview ${projectId}] Waiting for server to be ready...`);
+  const serverReady = await waitForServer(localUrl, 30000);
+
+  if (!serverReady || serverFailed) {
+    // Clean up if server failed to start
+    previewServers.delete(projectId);
+    expoProcess.kill();
+    throw new Error(failureReason || `Preview server failed to start on port ${port}`);
+  }
+
+  serverLog(`✅ Preview server started for ${projectId} at ${url}`);
+  return { url, port };
+}
+
+/**
+ * Stop a preview server for a project
+ */
+function stopPreviewServer(projectId: string): boolean {
+  const server = previewServers.get(projectId);
+  if (!server) {
+    return false;
+  }
+
+  serverLog(`🛑 Stopping preview server for ${projectId}`);
+  server.process.kill();
+  previewServers.delete(projectId);
+  return true;
+}
+
+/**
+ * Get preview server status for a project
+ */
+function getPreviewStatus(projectId: string): { running: boolean; url?: string; port?: number } {
+  const server = previewServers.get(projectId);
+  if (server) {
+    return { running: true, url: server.url, port: server.port };
+  }
+  return { running: false };
+}
+
+// ============================================================================
+// VOICE PROCESSING
+// ============================================================================
+
 /**
  * Process terminal output and generate voice response
  * Used when voice mode is enabled on a terminal
@@ -246,14 +498,24 @@ async function processTerminalVoiceResponse(ws: WebSocket, terminalId: string, r
 
 function getLocalIP(): string {
   const interfaces = networkInterfaces();
+  const candidates: { address: string; priority: number }[] = [];
+
   for (const name of Object.keys(interfaces)) {
     for (const iface of interfaces[name] || []) {
       if (iface.family === 'IPv4' && !iface.internal) {
-        return iface.address;
+        // Prioritize: Tailscale (100.x), LAN (192.168.x), then others
+        let priority = 0;
+        if (iface.address.startsWith('100.')) priority = 3; // Tailscale (highest)
+        else if (iface.address.startsWith('192.168.')) priority = 2; // LAN
+        else if (iface.address.startsWith('10.') && !iface.address.startsWith('10.255.')) priority = 1; // Other private
+        candidates.push({ address: iface.address, priority });
       }
     }
   }
-  return 'localhost';
+
+  // Sort by priority (highest first) and return best match
+  candidates.sort((a, b) => b.priority - a.priority);
+  return candidates.length > 0 ? candidates[0].address : 'localhost';
 }
 
 const wss = new WebSocketServer({ port: PORT });
@@ -392,7 +654,7 @@ function createProjectWithTemplate(projectId: string, projectName: string): void
   const packageJson = {
     name: projectId,
     version: '1.0.0',
-    main: 'App.tsx',
+    main: 'index.js',
     scripts: {
       start: 'expo start',
       android: 'expo start --android',
@@ -403,12 +665,15 @@ function createProjectWithTemplate(projectId: string, projectName: string): void
       'expo': '~54.0.0',
       'expo-status-bar': '~3.0.0',
       'react': '19.1.0',
+      'react-dom': '19.1.0',
       'react-native': '0.81.5',
+      'react-native-web': '^0.21.0',
       'react-native-safe-area-context': '^5.0.0',
       '@react-navigation/native': '^7.0.0'
     },
     devDependencies: {
       '@types/react': '~19.1.0',
+      'babel-preset-expo': '^54.0.0',
       'typescript': '~5.9.0'
     }
   };
@@ -497,6 +762,14 @@ const styles = StyleSheet.create({
 `;
   fs.writeFileSync(path.join(projectPath, 'App.tsx'), appTsx);
 
+  // Create index.js entry point (required for Expo Go)
+  const indexJs = `import { registerRootComponent } from 'expo';
+import App from './App';
+
+registerRootComponent(App);
+`;
+  fs.writeFileSync(path.join(projectPath, 'index.js'), indexJs);
+
   // Create .gitignore
   const gitignore = `node_modules/
 .expo/
@@ -505,7 +778,30 @@ dist/
 `;
   fs.writeFileSync(path.join(projectPath, '.gitignore'), gitignore);
 
+  // Set up sandbox configuration for Claude Code isolation
+  tmuxService.setupProjectSandbox(projectPath);
+
   serverLog(`📁 Created project with template: ${projectName} (${projectId})`);
+
+  // Run npm install in background to install dependencies
+  serverLog(`📦 Installing dependencies for ${projectId}...`);
+  const npmInstall = spawn('npm', ['install'], {
+    cwd: projectPath,
+    stdio: 'pipe',
+    shell: true
+  });
+
+  npmInstall.on('close', (code) => {
+    if (code === 0) {
+      serverLog(`✅ Dependencies installed for ${projectId}`);
+    } else {
+      serverLog(`⚠️ npm install exited with code ${code} for ${projectId}`);
+    }
+  });
+
+  npmInstall.on('error', (err) => {
+    serverLog(`❌ npm install failed for ${projectId}: ${err.message}`);
+  });
 }
 
 wss.on('connection', (ws: WebSocket) => {
@@ -738,14 +1034,47 @@ wss.on('connection', (ws: WebSocket) => {
           setTimeout(async () => {
             if (message.autoStartClaude !== false && !isReusingSession) {
               serverLog(`🤖 Starting Claude Code in terminal ${terminalId}`);
-              await tmuxService.sendCommand(tmuxSessionName, 'claude');
-              await tmuxService.sendEnter(tmuxSessionName);
+
+              // If there's an initial prompt, include it in the command
+              if (message.initialPrompt) {
+                // Prepare prompt for shell command:
+                // 1. Replace newlines with literal \n (Claude CLI interprets these)
+                // 2. Escape double quotes (since we wrap in double quotes)
+                // 3. Escape backticks and $ (shell special chars within double quotes)
+                const cleanPrompt = message.initialPrompt
+                  .replace(/\\/g, '\\\\')  // Escape backslashes first
+                  .replace(/"/g, '\\"')    // Escape double quotes
+                  .replace(/\$/g, '\\$')   // Escape dollar signs
+                  .replace(/`/g, '\\`')    // Escape backticks
+                  .replace(/\n/g, '\\n')   // Convert newlines to literal \n
+                  .replace(/\r/g, '');     // Remove carriage returns
+
+                const claudeCommand = `claude --dangerously-skip-permissions "${cleanPrompt}"`;
+                serverLog(`📝 With initial prompt: "${message.initialPrompt.substring(0, 50)}${message.initialPrompt.length > 50 ? '...' : ''}"`);
+                await tmuxService.sendCommand(tmuxSessionName, claudeCommand);
+                await tmuxService.sendEnter(tmuxSessionName);
+              } else {
+                await tmuxService.sendCommand(tmuxSessionName, 'claude --dangerously-skip-permissions');
+                await tmuxService.sendEnter(tmuxSessionName);
+              }
               // Register this session so we can reconnect later
               registerClaudeSession(projectId, tmuxSessionName);
             } else if (isReusingSession) {
               serverLog(`♻️  Reusing existing Claude Code session in terminal ${terminalId}`);
-              // Send Enter to refresh the prompt
-              await tmuxService.sendEnter(tmuxSessionName);
+              // If there's an initial prompt for a reused session, send it after a delay
+              if (message.initialPrompt) {
+                // Replace newlines with literal \n for existing session too
+                const cleanPrompt = message.initialPrompt
+                  .replace(/\n/g, '\\n')
+                  .replace(/\r/g, '');
+                serverLog(`📝 Sending prompt to existing session: "${message.initialPrompt.substring(0, 50)}..."`);
+                await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for prompt to be ready
+                await tmuxService.sendCommand(tmuxSessionName, cleanPrompt);
+                await tmuxService.sendEnter(tmuxSessionName);
+              } else {
+                // Send Enter to refresh the prompt
+                await tmuxService.sendEnter(tmuxSessionName);
+              }
             }
           }, 500);
 
@@ -1008,22 +1337,43 @@ wss.on('connection', (ws: WebSocket) => {
           await tmuxService.sendEnter(session.tmuxSessionName);
 
           console.log('   ✓ Command sent with Enter key');
-          console.log('\n⏳ WAITING FOR CLAUDE CODE RESPONSE...');
+          console.log('\n⏳ WAITING FOR CLAUDE CODE TO COMPLETE...');
 
-          // Wait for Claude's response using polling
-          const claudeResponse = await tmuxService.waitForResponse(session.tmuxSessionName, {
-            timeoutMs: 30000,
-            stabilityMs: 2000,
+          // Wait for Claude Code to be truly ready using smart state detection
+          const claudeState = await tmuxService.waitForClaudeReady(session.tmuxSessionName, {
+            timeoutMs: 180000,  // 3 minutes for long tasks
             pollIntervalMs: 500
           });
 
           session.voiceAwaitingResponse = false;
 
-          if (claudeResponse && claudeResponse.length > 50) {
-            console.log('\n' + '='.repeat(60));
-            console.log('📤 CLAUDE CODE RESPONSE DETECTED');
-            console.log('='.repeat(60));
-            console.log(`   Length: ${claudeResponse.length} chars`);
+          // Extract the response from the raw output
+          const claudeResponse = tmuxService.extractClaudeResponse(claudeState.rawOutput);
+
+          console.log('\n' + '='.repeat(60));
+          console.log('📤 CLAUDE CODE RESPONSE DETECTED');
+          console.log('='.repeat(60));
+          console.log(`   Ready: ${claudeState.isReady}`);
+          console.log(`   Processing: ${claudeState.isProcessing}`);
+          console.log(`   Waiting confirm: ${claudeState.isWaitingConfirm}`);
+          console.log(`   Response length: ${claudeResponse.length} chars`);
+
+          if (claudeState.isWaitingConfirm) {
+            // Claude is asking for confirmation - need to tell user
+            console.log('\n❓ CLAUDE IS ASKING FOR CONFIRMATION');
+            const confirmText = 'Claude is asking for confirmation. Please say yes or no.';
+            const ttsAudio = await voiceService.textToSpeech(confirmText);
+            const confirmResponse: StreamResponse = {
+              type: 'voice_terminal_speaking',
+              terminalId: message.terminalId,
+              responseText: confirmText,
+              audioData: ttsAudio.toString('base64'),
+              audioMimeType: 'audio/mp3'
+            };
+            ws.send(JSON.stringify(confirmResponse));
+            session.voiceLastTTSTime = Date.now();
+            session.voiceIdleWaiting = true;
+          } else if (claudeResponse && claudeResponse.length > 50) {
             console.log(`   Content preview:`);
             console.log('   ' + claudeResponse.substring(0, 300).replace(/\n/g, '\n   '));
             console.log('\n🔄 SUMMARIZING FOR VOICE...');
@@ -1036,7 +1386,18 @@ wss.on('connection', (ws: WebSocket) => {
             console.log('   🛋️ Entering idle state - waiting for user input');
           } else {
             console.log('\n⚠️ No substantial response from Claude Code');
-            // Still enter idle state
+            // Provide feedback that task completed
+            const doneText = 'Done. What would you like me to do next?';
+            const ttsAudio = await voiceService.textToSpeech(doneText);
+            const doneResponse: StreamResponse = {
+              type: 'voice_terminal_speaking',
+              terminalId: message.terminalId,
+              responseText: doneText,
+              audioData: ttsAudio.toString('base64'),
+              audioMimeType: 'audio/mp3'
+            };
+            ws.send(JSON.stringify(doneResponse));
+            session.voiceLastTTSTime = Date.now();
             session.voiceIdleWaiting = true;
           }
 
@@ -1124,6 +1485,66 @@ wss.on('connection', (ws: WebSocket) => {
           };
           ws.send(JSON.stringify(response));
         }
+        return;
+      }
+
+      // Preview server management
+      if (message.type === 'preview_start' && message.projectId) {
+        try {
+          // Create error callback to forward preview errors to client
+          const onPreviewError = (error: string, errorType: 'error' | 'warn' | 'info') => {
+            const errorResponse: StreamResponse = {
+              type: 'preview_error',
+              projectId: message.projectId,
+              previewError: error,
+              previewErrorType: errorType
+            };
+            try {
+              ws.send(JSON.stringify(errorResponse));
+            } catch {
+              // WebSocket may be closed
+            }
+          };
+
+          const { url, port } = await startPreviewServer(message.projectId, onPreviewError);
+          const response: StreamResponse = {
+            type: 'preview_started',
+            projectId: message.projectId,
+            previewUrl: url,
+            previewPort: port
+          };
+          ws.send(JSON.stringify(response));
+        } catch (err) {
+          const response: StreamResponse = {
+            type: 'error',
+            error: `Failed to start preview: ${err instanceof Error ? err.message : 'Unknown error'}`
+          };
+          ws.send(JSON.stringify(response));
+        }
+        return;
+      }
+
+      if (message.type === 'preview_stop' && message.projectId) {
+        const stopped = stopPreviewServer(message.projectId);
+        const response: StreamResponse = {
+          type: 'preview_stopped',
+          projectId: message.projectId,
+          stopped
+        };
+        ws.send(JSON.stringify(response));
+        return;
+      }
+
+      if (message.type === 'preview_status' && message.projectId) {
+        const status = getPreviewStatus(message.projectId);
+        const response: StreamResponse = {
+          type: 'preview_status',
+          projectId: message.projectId,
+          previewRunning: status.running,
+          previewUrl: status.url,
+          previewPort: status.port
+        };
+        ws.send(JSON.stringify(response));
         return;
       }
 
