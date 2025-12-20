@@ -1,6 +1,7 @@
 import { Tabs } from 'expo-router';
-import { FolderOpen, Terminal, Code2, Play } from 'lucide-react-native';
+import { Terminal, Code2, Play } from 'lucide-react-native';
 import { colors } from '../../theme';
+import { ProjectSelector } from '../../components/common';
 
 export default function TabLayout() {
   return (
@@ -22,17 +23,19 @@ export default function TabLayout() {
         },
         headerStyle: {
           backgroundColor: colors.background,
+          borderBottomWidth: 1,
+          borderBottomColor: colors.border,
         },
         headerTintColor: colors.foreground,
+        headerTitle: () => <ProjectSelector />,
+        headerTitleAlign: 'center',
       }}
     >
+      {/* Projects tab hidden - now accessible via dropdown in header */}
       <Tabs.Screen
         name="index"
         options={{
-          title: 'Projects',
-          tabBarIcon: ({ color, size }) => (
-            <FolderOpen color={color} size={size} />
-          ),
+          href: null, // Hide from tab bar
         }}
       />
       <Tabs.Screen

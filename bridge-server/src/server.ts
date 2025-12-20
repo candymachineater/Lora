@@ -1049,12 +1049,14 @@ wss.on('connection', (ws: WebSocket) => {
                   .replace(/\n/g, '\\n')   // Convert newlines to literal \n
                   .replace(/\r/g, '');     // Remove carriage returns
 
-                const claudeCommand = `claude --dangerously-skip-permissions "${cleanPrompt}"`;
+                // Start Claude with sandbox settings respected (no --dangerously-skip-permissions)
+                const claudeCommand = `claude "${cleanPrompt}"`;
                 serverLog(`📝 With initial prompt: "${message.initialPrompt.substring(0, 50)}${message.initialPrompt.length > 50 ? '...' : ''}"`);
                 await tmuxService.sendCommand(tmuxSessionName, claudeCommand);
                 await tmuxService.sendEnter(tmuxSessionName);
               } else {
-                await tmuxService.sendCommand(tmuxSessionName, 'claude --dangerously-skip-permissions');
+                // Start Claude with sandbox settings respected
+                await tmuxService.sendCommand(tmuxSessionName, 'claude');
                 await tmuxService.sendEnter(tmuxSessionName);
               }
               // Register this session so we can reconnect later
@@ -1210,6 +1212,88 @@ wss.on('connection', (ws: WebSocket) => {
           };
           ws.send(JSON.stringify(transcriptionResponse));
 
+          // Get Claude's current state from hooks for context
+          const currentHookState = tmuxService.getClaudeHookState(session.tmuxSessionName);
+          const stateDescription = currentHookState.state === 'idle' ? 'ready for input' :
+                                   currentHookState.state === 'permission' ? 'waiting for confirmation (y/n)' :
+                                   currentHookState.state === 'processing' ? 'still processing' :
+                                   currentHookState.state === 'stopped' ? 'session ended' : 'unknown';
+
+          console.log(`   Claude state (hooks): ${currentHookState.state} (${stateDescription})`);
+
+          // Smart handling based on Claude's current state
+          // If Claude is waiting for confirmation and user says yes/no, handle directly
+          if (currentHookState.state === 'permission') {
+            const lowerTranscript = transcription.toLowerCase().trim();
+            const isYes = /^(yes|yeah|yep|sure|ok|okay|do it|go ahead|proceed|confirm|affirmative)/.test(lowerTranscript);
+            const isNo = /^(no|nope|nah|cancel|don't|stop|abort|negative)/.test(lowerTranscript);
+
+            if (isYes || isNo) {
+              const response = isYes ? 'y' : 'n';
+              console.log(`\n⚡ DIRECT CONFIRMATION: User said "${transcription}" → sending "${response}"`);
+
+              // Capture output before sending confirmation
+              const outputBeforeConfirm = await tmuxService.captureOutput(session.tmuxSessionName, 100);
+
+              await tmuxService.sendCommand(session.tmuxSessionName, response);
+              await tmuxService.sendEnter(session.tmuxSessionName);
+
+              // Wait for Claude to process the confirmation
+              const confirmState = await tmuxService.waitForClaudeReadyWithHooks(session.tmuxSessionName, {
+                timeoutMs: 60000,
+                pollIntervalMs: 300,
+                previousOutput: outputBeforeConfirm  // Filter out old content
+              });
+
+              const confirmResponse = tmuxService.extractClaudeResponse(confirmState.rawOutput);
+
+              // Generate voice response
+              const voiceText = isYes ? 'Got it, proceeding.' : 'Okay, cancelled.';
+              const ttsAudio = await voiceService.textToSpeech(voiceText);
+              const audioResponse: StreamResponse = {
+                type: 'voice_terminal_speaking',
+                terminalId: message.terminalId,
+                responseText: voiceText,
+                audioData: ttsAudio.toString('base64'),
+                audioMimeType: 'audio/mp3'
+              };
+              ws.send(JSON.stringify(audioResponse));
+              session.voiceLastTTSTime = Date.now();
+              session.voiceIdleWaiting = true;
+
+              console.log('='.repeat(60) + '\n');
+              return;
+            }
+          }
+
+          // If Claude is still processing and user wants to interrupt
+          if (currentHookState.state === 'processing') {
+            const lowerTranscript = transcription.toLowerCase().trim();
+            const wantsInterrupt = /^(stop|cancel|interrupt|abort|ctrl.?c|nevermind|never mind)/.test(lowerTranscript);
+
+            if (wantsInterrupt) {
+              console.log(`\n⚡ INTERRUPT REQUEST: User said "${transcription}" → sending Ctrl+C`);
+
+              await tmuxService.sendControlKey(session.tmuxSessionName, 'c');
+
+              const interruptText = 'Interrupted. The operation has been cancelled.';
+              const ttsAudio = await voiceService.textToSpeech(interruptText);
+              const audioResponse: StreamResponse = {
+                type: 'voice_terminal_speaking',
+                terminalId: message.terminalId,
+                responseText: interruptText,
+                audioData: ttsAudio.toString('base64'),
+                audioMimeType: 'audio/mp3'
+              };
+              ws.send(JSON.stringify(audioResponse));
+              session.voiceLastTTSTime = Date.now();
+              session.voiceIdleWaiting = true;
+
+              console.log('='.repeat(60) + '\n');
+              return;
+            }
+          }
+
           // Process with Voice Agent LLM - it decides what to do
           const projectMeta = listProjects().find(p => p.id === session.projectId);
           const agentResponse = await voiceService.processVoiceInput(
@@ -1217,7 +1301,8 @@ wss.on('connection', (ws: WebSocket) => {
             message.terminalId,  // sessionId for conversation memory
             {
               projectName: projectMeta?.name,
-              recentOutput: session.voiceAccumulatedOutput.slice(-500)
+              recentOutput: session.voiceAccumulatedOutput.slice(-500),
+              claudeCodeState: stateDescription
             }
           );
 
@@ -1326,6 +1411,9 @@ wss.on('connection', (ws: WebSocket) => {
           // Set up to capture Claude's response
           session.voiceAwaitingResponse = true;
 
+          // Capture terminal output BEFORE sending command so we can filter it out later
+          const outputBeforeCommand = await tmuxService.captureOutput(session.tmuxSessionName, 100);
+
           // Send the translated command to Claude Code via tmux
           console.log('\n⌨️ SENDING TO TMUX:');
           console.log(`   Session: ${session.tmuxSessionName}`);
@@ -1337,12 +1425,14 @@ wss.on('connection', (ws: WebSocket) => {
           await tmuxService.sendEnter(session.tmuxSessionName);
 
           console.log('   ✓ Command sent with Enter key');
-          console.log('\n⏳ WAITING FOR CLAUDE CODE TO COMPLETE...');
+          console.log('\n⏳ WAITING FOR CLAUDE CODE TO COMPLETE (using hooks)...');
 
-          // Wait for Claude Code to be truly ready using smart state detection
-          const claudeState = await tmuxService.waitForClaudeReady(session.tmuxSessionName, {
+          // Wait for Claude Code using hook-based state detection
+          // Pass previousOutput so we can filter out old content from the response
+          const claudeState = await tmuxService.waitForClaudeReadyWithHooks(session.tmuxSessionName, {
             timeoutMs: 180000,  // 3 minutes for long tasks
-            pollIntervalMs: 500
+            pollIntervalMs: 300,
+            previousOutput: outputBeforeCommand  // Filter out old content
           });
 
           session.voiceAwaitingResponse = false;
@@ -1356,6 +1446,8 @@ wss.on('connection', (ws: WebSocket) => {
           console.log(`   Ready: ${claudeState.isReady}`);
           console.log(`   Processing: ${claudeState.isProcessing}`);
           console.log(`   Waiting confirm: ${claudeState.isWaitingConfirm}`);
+          console.log(`   Hook state: ${claudeState.state}`);
+          console.log(`   Used hooks: ${claudeState.usedHooks}`);
           console.log(`   Response length: ${claudeResponse.length} chars`);
 
           if (claudeState.isWaitingConfirm) {

@@ -461,6 +461,9 @@ class BridgeService {
     });
   }
 
+  private filesRequestId = 0;
+  private filesTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
   async getFiles(projectId: string, subPath?: string): Promise<ProjectFile[]> {
     return new Promise((resolve, reject) => {
       console.log(`[Bridge] getFiles called: projectId=${projectId}, subPath=${subPath || '(root)'}`);
@@ -469,24 +472,40 @@ class BridgeService {
         reject(new Error('Not connected'));
         return;
       }
-      // Cancel any existing pending files request (project may have changed)
+
+      // Cancel any existing pending files request AND its timeout
       if (this.pendingResolvers.has('files')) {
         console.log('[Bridge] getFiles: cancelling previous pending request');
         this.pendingResolvers.delete('files');
       }
+      if (this.filesTimeoutId) {
+        clearTimeout(this.filesTimeoutId);
+        this.filesTimeoutId = null;
+      }
+
+      // Generate unique request ID to prevent stale timeout issues
+      const requestId = ++this.filesRequestId;
+
       console.log('[Bridge] Sending get_files message...');
       this.pendingResolvers.set('files', (files) => {
         console.log(`[Bridge] getFiles response received: ${files?.length || 0} files`);
+        if (this.filesTimeoutId) {
+          clearTimeout(this.filesTimeoutId);
+          this.filesTimeoutId = null;
+        }
         resolve(files);
       });
       this.send({ type: 'get_files', projectId, filePath: subPath });
-      setTimeout(() => {
-        if (this.pendingResolvers.has('files')) {
+
+      this.filesTimeoutId = setTimeout(() => {
+        // Only timeout if this is still the current request
+        if (requestId === this.filesRequestId && this.pendingResolvers.has('files')) {
           console.log('[Bridge] getFiles timeout - no response received after 30s');
           this.pendingResolvers.delete('files');
           reject(new Error('Timeout getting files'));
         }
-      }, 30000); // Increased timeout - messages can be delayed behind terminal output
+        this.filesTimeoutId = null;
+      }, 30000);
     });
   }
 

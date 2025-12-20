@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -39,6 +39,7 @@ const MAX_CONSOLE_MESSAGES = 100;
 export default function PreviewScreen() {
   const router = useRouter();
   const { currentProject } = useProjectStore();
+  const lastProjectIdRef = useRef<string | null>(null);
 
   const [snackUrl, setSnackUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -178,9 +179,24 @@ export default function PreviewScreen() {
     }
   };
 
-  const handleRefresh = () => {
+  const handleRefresh = async () => {
+    if (!project) return;
+
+    setLoading(true);
     setSnackUrl(null);
     setConsoleMessages([]);
+
+    try {
+      // Stop existing preview server first
+      console.log('[Preview] Stopping existing preview server...');
+      await bridgeService.stopPreview(project.id);
+    } catch (err) {
+      // Ignore errors if server wasn't running
+      console.log('[Preview] No existing server to stop or error stopping:', err);
+    }
+
+    setLoading(false);
+    // Now start fresh
     handleGeneratePreview();
   };
 
@@ -205,12 +221,32 @@ export default function PreviewScreen() {
     }
   };
 
-  // Auto-generate preview when project changes
+  // Reset and regenerate preview when project changes
+  useEffect(() => {
+    const projectChanged = lastProjectIdRef.current !== project?.id;
+
+    if (projectChanged && lastProjectIdRef.current) {
+      // Stop old preview server
+      bridgeService.stopPreview(lastProjectIdRef.current).catch(() => {
+        // Ignore errors if server wasn't running
+      });
+    }
+
+    lastProjectIdRef.current = project?.id || null;
+
+    // Reset state when project changes
+    setSnackUrl(null);
+    setConsoleMessages([]);
+    setError(null);
+    setLoading(false);
+  }, [project?.id]);
+
+  // Auto-generate preview after reset
   useEffect(() => {
     if (project && !snackUrl && !loading) {
       handleGeneratePreview();
     }
-  }, [project?.id]);
+  }, [project?.id, snackUrl]);
 
   const getMessageIcon = (type: ConsoleMessage['type']) => {
     switch (type) {

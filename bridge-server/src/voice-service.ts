@@ -70,13 +70,168 @@ interface ConversationMemory {
   turns: ConversationTurn[];
   startedAt: number;
   lastActivity: number;
+  // Context management
+  compactedSummary?: string;  // Summary of older conversation when compacted
+  totalTokensUsed: number;    // Approximate token count
+  compactionCount: number;    // How many times we've compacted
+  importantInfo: string[];    // Key information extracted from conversation
 }
 
 // Memory store - keyed by terminal session
 const conversationMemory: Map<string, ConversationMemory> = new Map();
 
-// Max turns to keep in memory (for efficiency)
-const MAX_MEMORY_TURNS = 10;
+// Token limits for context management
+// ~4 characters per token is a rough approximation
+const CHARS_PER_TOKEN = 4;
+const MAX_CONTEXT_TOKENS = 200000;  // 200k tokens max before compaction
+const TARGET_COMPACT_TOKENS = 25000; // Target 25k tokens after compaction
+const MIN_TURNS_BEFORE_COMPACT = 5;  // Keep at least 5 recent turns after compaction
+
+/**
+ * Estimate token count from text
+ */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / CHARS_PER_TOKEN);
+}
+
+/**
+ * Calculate total tokens in memory
+ */
+function calculateMemoryTokens(memory: ConversationMemory): number {
+  let tokens = 0;
+
+  // Count compacted summary
+  if (memory.compactedSummary) {
+    tokens += estimateTokens(memory.compactedSummary);
+  }
+
+  // Count important info
+  for (const info of memory.importantInfo) {
+    tokens += estimateTokens(info);
+  }
+
+  // Count all turns
+  for (const turn of memory.turns) {
+    tokens += estimateTokens(turn.userSaid);
+    tokens += estimateTokens(JSON.stringify(turn.agentAction));
+    if (turn.claudeCodeResponse) {
+      tokens += estimateTokens(turn.claudeCodeResponse);
+    }
+    if (turn.voiceResponse) {
+      tokens += estimateTokens(turn.voiceResponse);
+    }
+  }
+
+  return tokens;
+}
+
+/**
+ * Compact the conversation memory when it exceeds the token limit
+ * Creates a summary of older turns and keeps only recent ones
+ */
+async function compactMemory(sessionId: string): Promise<void> {
+  const memory = conversationMemory.get(sessionId);
+  if (!memory || memory.turns.length <= MIN_TURNS_BEFORE_COMPACT) {
+    return;
+  }
+
+  voiceLog('INFO', 'Memory', `Starting memory compaction for ${sessionId} (${memory.turns.length} turns, ~${memory.totalTokensUsed} tokens)`);
+
+  // Keep the most recent turns
+  const turnsToKeep = memory.turns.slice(-MIN_TURNS_BEFORE_COMPACT);
+  const turnsToCompact = memory.turns.slice(0, -MIN_TURNS_BEFORE_COMPACT);
+
+  if (turnsToCompact.length === 0) {
+    return;
+  }
+
+  // Format the turns to compact into a summary request
+  let conversationToSummarize = memory.compactedSummary
+    ? `Previous Summary:\n${memory.compactedSummary}\n\n`
+    : '';
+
+  conversationToSummarize += 'Recent Conversation to Summarize:\n';
+  for (const turn of turnsToCompact) {
+    conversationToSummarize += `User: "${turn.userSaid}"\n`;
+    if (turn.agentAction.type === 'prompt') {
+      conversationToSummarize += `→ Sent to Claude: "${turn.agentAction.content}"\n`;
+    } else if (turn.agentAction.type === 'conversational') {
+      conversationToSummarize += `→ Response: "${turn.agentAction.content}"\n`;
+    }
+    if (turn.voiceResponse) {
+      conversationToSummarize += `→ Voice summary: "${turn.voiceResponse.substring(0, 200)}..."\n`;
+    }
+    conversationToSummarize += '\n';
+  }
+
+  // Use Claude to create a compact summary
+  if (!anthropic) {
+    voiceLog('ERROR', 'Memory', 'Anthropic client not available for compaction');
+    memory.turns = turnsToKeep;
+    memory.totalTokensUsed = calculateMemoryTokens(memory);
+    return;
+  }
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2000,
+      temperature: 0.3,
+      system: `You are summarizing a voice conversation with an AI coding assistant. Create a concise but comprehensive summary that preserves:
+1. Key topics discussed
+2. Important user preferences or requirements mentioned
+3. Significant decisions made
+4. Any code files, features, or projects mentioned
+5. The overall context and purpose of the conversation
+
+Keep the summary under 1500 words. Format as bullet points for easy scanning.`,
+      messages: [{
+        role: 'user',
+        content: conversationToSummarize
+      }]
+    });
+
+    const summary = response.content[0].type === 'text' ? response.content[0].text : '';
+
+    // Extract important information from the summary
+    const importantPatterns = [
+      /project[s]?\s*(?:called|named|about)?\s*[:"']?([^"'\n,]+)/gi,
+      /(?:file|files)\s*(?:called|named)?\s*[:"']?([^"'\n,]+)/gi,
+      /(?:feature|features)\s*[:"']?([^"'\n,]+)/gi,
+      /(?:preference|prefers?)\s*[:"']?([^"'\n,.]+)/gi,
+    ];
+
+    for (const pattern of importantPatterns) {
+      let match;
+      while ((match = pattern.exec(summary)) !== null) {
+        const info = match[1].trim();
+        if (info.length > 3 && !memory.importantInfo.includes(info)) {
+          memory.importantInfo.push(info);
+        }
+      }
+    }
+
+    // Keep only the most relevant important info (max 20 items)
+    if (memory.importantInfo.length > 20) {
+      memory.importantInfo = memory.importantInfo.slice(-20);
+    }
+
+    // Update memory with compacted state
+    memory.compactedSummary = summary;
+    memory.turns = turnsToKeep;
+    memory.compactionCount++;
+    memory.totalTokensUsed = calculateMemoryTokens(memory);
+
+    voiceLog('INFO', 'Memory', `Compaction complete: ${turnsToCompact.length} turns → summary, keeping ${turnsToKeep.length} recent turns`);
+    voiceLog('INFO', 'Memory', `New token count: ~${memory.totalTokensUsed}, important info: ${memory.importantInfo.length} items`);
+
+  } catch (error) {
+    voiceLog('ERROR', 'Memory', `Failed to compact memory: ${error}`);
+    // Fallback: just trim to recent turns without AI summary
+    memory.turns = turnsToKeep;
+    memory.totalTokensUsed = calculateMemoryTokens(memory);
+  }
+}
 
 /**
  * Get or create conversation memory for a session
@@ -89,7 +244,10 @@ export function getConversationMemory(sessionId: string, projectId?: string): Co
       projectId: projectId || 'unknown',
       turns: [],
       startedAt: Date.now(),
-      lastActivity: Date.now()
+      lastActivity: Date.now(),
+      totalTokensUsed: 0,
+      compactionCount: 0,
+      importantInfo: []
     };
     conversationMemory.set(sessionId, memory);
     voiceLog('INFO', 'Memory', `Created new conversation memory for session ${sessionId}`);
@@ -100,25 +258,30 @@ export function getConversationMemory(sessionId: string, projectId?: string): Co
 
 /**
  * Add a turn to conversation memory
+ * Triggers compaction if token limit is exceeded
  */
-export function addConversationTurn(
+export async function addConversationTurn(
   sessionId: string,
   turn: ConversationTurn
-): void {
+): Promise<void> {
   const memory = getConversationMemory(sessionId);
   memory.turns.push(turn);
   memory.lastActivity = Date.now();
 
-  // Trim old turns to keep memory efficient
-  if (memory.turns.length > MAX_MEMORY_TURNS) {
-    memory.turns = memory.turns.slice(-MAX_MEMORY_TURNS);
-    voiceLog('DEBUG', 'Memory', `Trimmed memory to ${MAX_MEMORY_TURNS} turns`);
-  }
+  // Recalculate token usage
+  memory.totalTokensUsed = calculateMemoryTokens(memory);
 
   voiceLog('INFO', 'Memory', `Added turn #${memory.turns.length}`, {
     userSaid: turn.userSaid.substring(0, 50),
-    action: turn.agentAction.type
+    action: turn.agentAction.type,
+    totalTokens: memory.totalTokensUsed
   });
+
+  // Check if we need to compact
+  if (memory.totalTokensUsed > MAX_CONTEXT_TOKENS) {
+    voiceLog('INFO', 'Memory', `Token limit exceeded (${memory.totalTokensUsed}/${MAX_CONTEXT_TOKENS}), triggering compaction`);
+    await compactMemory(sessionId);
+  }
 }
 
 /**
@@ -152,24 +315,46 @@ export function clearConversationMemory(sessionId: string): void {
 
 /**
  * Format conversation history for AI context
+ * Includes compacted summary, important info, and recent turns
  */
 function formatConversationHistory(memory: ConversationMemory): string {
-  if (memory.turns.length === 0) return '';
+  let history = '';
 
-  const recentTurns = memory.turns.slice(-5); // Last 5 turns for context
+  // Include compacted summary if we've had compaction
+  if (memory.compactedSummary) {
+    history += '\n## Previous Conversation Summary:\n';
+    history += memory.compactedSummary;
+    history += '\n';
+  }
 
-  let history = '\n## Recent Conversation:\n';
-  recentTurns.forEach((turn, i) => {
-    history += `${i + 1}. User: "${turn.userSaid}"\n`;
-    if (turn.agentAction.type === 'prompt') {
-      history += `   → Sent to Claude Code: "${turn.agentAction.content}"\n`;
-    } else if (turn.agentAction.type === 'control') {
-      history += `   → Control: ${turn.agentAction.content}\n`;
-    }
-    if (turn.voiceResponse) {
-      history += `   → Response: "${turn.voiceResponse.substring(0, 100)}..."\n`;
-    }
-  });
+  // Include important information extracted from conversation
+  if (memory.importantInfo.length > 0) {
+    history += '\n## Important Context from Conversation:\n';
+    memory.importantInfo.forEach(info => {
+      history += `- ${info}\n`;
+    });
+  }
+
+  // Include recent turns
+  if (memory.turns.length > 0) {
+    history += '\n## Recent Conversation:\n';
+    memory.turns.forEach((turn, i) => {
+      history += `${i + 1}. User: "${turn.userSaid}"\n`;
+      if (turn.agentAction.type === 'prompt') {
+        history += `   → Sent to Claude Code: "${turn.agentAction.content}"\n`;
+      } else if (turn.agentAction.type === 'control') {
+        history += `   → Control: ${turn.agentAction.content}\n`;
+      }
+      if (turn.voiceResponse) {
+        history += `   → Response: "${turn.voiceResponse.substring(0, 150)}..."\n`;
+      }
+    });
+  }
+
+  // Add memory stats for debugging
+  if (history) {
+    history += `\n[Memory: ${memory.turns.length} turns, ~${memory.totalTokensUsed} tokens, ${memory.compactionCount} compactions]\n`;
+  }
 
   return history;
 }
@@ -268,6 +453,16 @@ You have access to the recent conversation history. Use this context to:
 - Remember what was just discussed
 - Provide coherent multi-turn interactions
 
+## CLAUDE CODE STATE AWARENESS
+
+You will be given Claude Code's current state:
+- **ready for input**: Claude finished and is waiting for your next command. Send PROMPT.
+- **waiting for confirmation (y/n)**: Claude is asking a yes/no question.
+  - If user says "yes", "yeah", "sure", "do it", "go ahead" → PROMPT with "yes"
+  - If user says "no", "nope", "cancel", "don't" → PROMPT with "no"
+- **still processing**: Claude is working. Consider using CONTROL (CTRL_C to interrupt) or wait.
+- **session ended**: Claude session has ended. May need CONTROL (RESTART).
+
 ## RULES
 
 1. When in doubt, use PROMPT - Claude Code is smart
@@ -275,7 +470,9 @@ You have access to the recent conversation history. Use this context to:
 3. NEVER output shell commands yourself
 4. Only use CONVERSATIONAL for greetings
 5. Output ONLY valid JSON, nothing else
-6. Use conversation history for context`;
+6. Use conversation history for context
+7. When Claude is "waiting for confirmation", translate user's intent to "yes" or "no"
+8. If user wants to interrupt during processing, use CONTROL with CTRL_C`;
 
 // ============================================================================
 // SPEECH-TO-TEXT (Whisper)
@@ -486,9 +683,9 @@ Output JSON only:`
       voiceLog('AI', 'Agent', `│ Content: "${parsed.content}"`);
       voiceLog('AI', 'Agent', '└───────────────────────────────');
 
-      // Store in memory
+      // Store in memory (async - may trigger compaction if needed)
       if (sessionId) {
-        addConversationTurn(sessionId, {
+        await addConversationTurn(sessionId, {
           timestamp: Date.now(),
           userSaid: userSpeech,
           agentAction: parsed

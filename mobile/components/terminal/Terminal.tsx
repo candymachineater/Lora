@@ -47,7 +47,14 @@ const XTERM_HTML = `<!DOCTYPE html>
       padding: 2px;
     }
     .xterm-viewport {
-      overflow-y: auto !important;
+      overflow-y: hidden !important;
+    }
+    /* Disable native touch scrolling - we handle it via JS */
+    .xterm-screen {
+      touch-action: none;
+    }
+    #terminal {
+      touch-action: none;
     }
     .xterm-viewport::-webkit-scrollbar {
       width: 8px;
@@ -104,6 +111,12 @@ const XTERM_HTML = `<!DOCTYPE html>
       screenReaderMode: false
     });
 
+    // Touch scrolling is handled by React Native PanResponder
+    // which calls term.scrollLines() via injectJavaScript
+    function setupTouchScroll() {
+      // Nothing to set up - React Native handles touch gestures
+    }
+
     const fitAddon = new FitAddon.FitAddon();
     const webLinksAddon = new WebLinksAddon.WebLinksAddon();
 
@@ -112,6 +125,7 @@ const XTERM_HTML = `<!DOCTYPE html>
 
     term.open(document.getElementById('terminal'));
     fitAddon.fit();
+    setupTouchScroll();
 
     window.addEventListener('resize', () => {
       fitAddon.fit();
@@ -296,6 +310,35 @@ export function Terminal({
   const [shiftActive, setShiftActive] = useState(false);
   const isReadyRef = useRef<boolean>(false);
   const pendingOutputRef = useRef<string>('');
+
+  // Scroll terminal by lines
+  const scrollTerminal = useCallback((lines: number) => {
+    if (webViewRef.current && isReadyRef.current) {
+      const script = `term.scrollLines(${lines}); true;`;
+      webViewRef.current.injectJavaScript(script);
+    }
+  }, []);
+
+  // Scroll button handlers
+  const handleScrollUp = useCallback(() => {
+    scrollTerminal(-5); // Scroll up 5 lines
+  }, [scrollTerminal]);
+
+  const handleScrollDown = useCallback(() => {
+    scrollTerminal(5); // Scroll down 5 lines
+  }, [scrollTerminal]);
+
+  const handleScrollToTop = useCallback(() => {
+    if (webViewRef.current && isReadyRef.current) {
+      webViewRef.current.injectJavaScript('term.scrollToTop(); true;');
+    }
+  }, []);
+
+  const handleScrollToBottom = useCallback(() => {
+    if (webViewRef.current && isReadyRef.current) {
+      webViewRef.current.injectJavaScript('term.scrollToBottom(); true;');
+    }
+  }, []);
 
 
   // Send message to WebView
@@ -580,6 +623,21 @@ export function Terminal({
           contentMode="mobile"
           automaticallyAdjustContentInsets={false}
         />
+        {/* Scroll buttons on the right side */}
+        <View style={styles.scrollButtonsContainer}>
+          <TouchableOpacity style={styles.scrollButton} onPress={handleScrollToTop}>
+            <Text style={styles.scrollButtonText}>⏫</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.scrollButton} onPress={handleScrollUp}>
+            <Text style={styles.scrollButtonText}>▲</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.scrollButton} onPress={handleScrollDown}>
+            <Text style={styles.scrollButtonText}>▼</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.scrollButton} onPress={handleScrollToBottom}>
+            <Text style={styles.scrollButtonText}>⏬</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* Control buttons */}
@@ -700,10 +758,36 @@ const styles = StyleSheet.create({
   terminalContainer: {
     flex: 1,
     backgroundColor: '#0C0C0C',
+    position: 'relative',
   },
   webView: {
     flex: 1,
     backgroundColor: '#0C0C0C',
+  },
+  scrollButtonsContainer: {
+    position: 'absolute',
+    right: 4,
+    top: '50%',
+    transform: [{ translateY: -80 }],
+    flexDirection: 'column',
+    gap: 4,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    borderRadius: 8,
+    padding: 4,
+  },
+  scrollButton: {
+    width: 36,
+    height: 36,
+    backgroundColor: '#2D2D2D',
+    borderRadius: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#444',
+  },
+  scrollButtonText: {
+    fontSize: 16,
+    color: '#CCC',
   },
   controlBar: {
     backgroundColor: '#1A1A1A',

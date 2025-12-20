@@ -14,6 +14,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
+import { claudeStateService } from './claude-state-service';
 
 const execAsync = promisify(exec);
 
@@ -53,41 +54,178 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Set up sandbox configuration for a project directory.
- * Creates .claude/settings.local.json to restrict Claude Code's access
- * to only the project directory.
+ * Set up sandbox configuration and hooks for a project directory.
+ * Creates:
+ * - .claude/settings.json with hooks configuration
+ * - .claude/hooks/lora-state-hook.sh for state notifications
  */
-export function setupProjectSandbox(projectPath: string): void {
+export function setupProjectSandbox(projectPath: string, sessionName?: string): void {
   const claudeDir = path.join(projectPath, '.claude');
-  const settingsPath = path.join(claudeDir, 'settings.local.json');
+  const hooksDir = path.join(claudeDir, 'hooks');
+  const settingsPath = path.join(claudeDir, 'settings.json');
+  const hookScriptPath = path.join(hooksDir, 'lora-state-hook.sh');
 
-  // Create .claude directory if it doesn't exist
-  if (!fs.existsSync(claudeDir)) {
-    fs.mkdirSync(claudeDir, { recursive: true });
-    console.log(`[Sandbox] Created .claude directory in ${projectPath}`);
+  // Create .claude and .claude/hooks directories if they don't exist
+  if (!fs.existsSync(hooksDir)) {
+    fs.mkdirSync(hooksDir, { recursive: true });
+    console.log(`[Sandbox] Created .claude/hooks directory in ${projectPath}`);
   }
 
-  // Create/update settings.local.json with sandbox restrictions
+  // Remove any stale settings.local.json that might have old hook configurations
+  const localSettingsPath = path.join(claudeDir, 'settings.local.json');
+  if (fs.existsSync(localSettingsPath)) {
+    fs.unlinkSync(localSettingsPath);
+    console.log(`[Sandbox] Removed stale settings.local.json`);
+  }
+
+  // Create the hook script that receives JSON via stdin and writes state
+  // Handles both Stop hooks (immediate) and Notification hooks (delayed)
+  // Uses grep/sed instead of jq for portability
+  // Includes debug logging to /tmp/lora-hook-debug.log
+  const hookScript = `#!/bin/bash
+# Lora Claude Code State Hook
+# Receives events via stdin and writes state to a file
+# Handles both Stop hooks (fires immediately when Claude finishes) and
+# Notification hooks (fires on idle_prompt, permission_prompt)
+
+DEBUG_LOG="/tmp/lora-hook-debug.log"
+HOOK_TYPE="\${LORA_HOOK_TYPE:-notification}"
+echo "$(date): Hook called (type=$HOOK_TYPE)" >> "$DEBUG_LOG"
+
+INPUT=$(cat)
+echo "$(date): Input received: $INPUT" >> "$DEBUG_LOG"
+echo "$(date): LORA_SESSION=$LORA_SESSION" >> "$DEBUG_LOG"
+
+# Only process if we have a LORA_SESSION (set by bridge server in tmux)
+if [ -z "$LORA_SESSION" ]; then
+  echo "$(date): LORA_SESSION not set, exiting" >> "$DEBUG_LOG"
+  exit 0
+fi
+
+STATE_FILE="/tmp/lora-claude-state-$LORA_SESSION.json"
+TIMESTAMP=$(date +%s000)
+
+# Handle Stop hook (fires immediately when Claude finishes)
+if [ "$HOOK_TYPE" = "stop" ]; then
+  echo "{\\"state\\":\\"idle\\",\\"timestamp\\":$TIMESTAMP}" > "$STATE_FILE"
+  echo "$(date): Stop hook - wrote idle state to $STATE_FILE" >> "$DEBUG_LOG"
+  exit 0
+fi
+
+# Handle Notification hooks
+# Extract notification_type using grep/sed (no jq dependency)
+NOTIFICATION_TYPE=$(echo "$INPUT" | grep -o '"notification_type":"[^"]*"' | sed 's/"notification_type":"\\([^"]*\\)"/\\1/')
+echo "$(date): notification_type=$NOTIFICATION_TYPE" >> "$DEBUG_LOG"
+
+case "$NOTIFICATION_TYPE" in
+  "permission_prompt")
+    echo "{\\"state\\":\\"permission\\",\\"timestamp\\":$TIMESTAMP}" > "$STATE_FILE"
+    echo "$(date): Wrote permission state to $STATE_FILE" >> "$DEBUG_LOG"
+    ;;
+  "idle_prompt")
+    echo "{\\"state\\":\\"idle\\",\\"timestamp\\":$TIMESTAMP}" > "$STATE_FILE"
+    echo "$(date): Wrote idle state to $STATE_FILE" >> "$DEBUG_LOG"
+    ;;
+  *)
+    echo "$(date): Unknown notification_type: $NOTIFICATION_TYPE" >> "$DEBUG_LOG"
+    ;;
+esac
+
+exit 0
+`;
+
+  fs.writeFileSync(hookScriptPath, hookScript);
+  fs.chmodSync(hookScriptPath, '755');
+  console.log(`[Sandbox] Created hook script at ${hookScriptPath}`);
+
+  // Create .claude/settings.json with sandbox and hooks configuration
+  // Sandbox settings provide filesystem and network isolation per project
+  // Stop hook fires IMMEDIATELY when Claude finishes - this is the primary detection method
+  // Notification hooks are backup for permission prompts and 60-second idle detection
+  const stopHookCommand = `LORA_HOOK_TYPE=stop bash "$CLAUDE_PROJECT_DIR/.claude/hooks/lora-state-hook.sh"`;
+  const notificationHookCommand = `LORA_HOOK_TYPE=notification bash "$CLAUDE_PROJECT_DIR/.claude/hooks/lora-state-hook.sh"`;
   const settings = {
-    // Restrict file access to only this project directory
-    permissions: {
-      allow: [
-        projectPath,  // Allow access to project directory
+    // Sandbox configuration - isolates Claude Code to this project directory
+    sandbox: {
+      // Enable OS-level sandbox (Linux: bubblewrap, macOS: Seatbelt)
+      enabled: true,
+      // Auto-allow bash commands that run inside the sandbox without prompting
+      autoAllowBashIfSandboxed: true,
+      // Commands that should run outside sandbox (need full system access)
+      excludedCommands: [
+        "docker",       // Docker needs socket access
+        "git"           // Git may need SSH/GPG keys
       ],
+      // Allow binding to localhost ports for Expo dev server
+      network: {
+        allowLocalBinding: true
+      }
+    },
+    // Permission rules for filesystem access
+    permissions: {
+      // Deny access to sensitive directories and parent paths
       deny: [
-        path.dirname(projectPath),  // Deny access to parent (projects folder)
-        path.join(path.dirname(projectPath), '*'),  // Deny access to sibling projects
+        "Read(../**)",           // No access to parent directories
+        "Read(~/.ssh/**)",       // No SSH keys
+        "Read(~/.aws/**)",       // No AWS credentials
+        "Read(~/.config/**)",    // No general config
+        "Read(~/.gnupg/**)",     // No GPG keys
+        "Read(/etc/**)",         // No system config
+        "Edit(../**)",           // No editing parent directories
+        "Bash(rm -rf /)",        // No dangerous rm commands
+        "Bash(rm -rf ~)"         // No dangerous rm on home
       ]
     },
-    // Additional safety settings
-    sandbox: {
-      enabled: true,
-      rootDirectory: projectPath,
+    hooks: {
+      // Stop hook fires immediately when Claude Code finishes processing
+      Stop: [
+        {
+          hooks: [
+            {
+              type: "command",
+              command: stopHookCommand,
+              timeout: 5
+            }
+          ]
+        }
+      ],
+      // Notification hooks for permission prompts (immediate) and idle detection (60s delay)
+      Notification: [
+        {
+          matcher: "idle_prompt",
+          hooks: [
+            {
+              type: "command",
+              command: notificationHookCommand,
+              timeout: 5
+            }
+          ]
+        },
+        {
+          matcher: "permission_prompt",
+          hooks: [
+            {
+              type: "command",
+              command: notificationHookCommand,
+              timeout: 5
+            }
+          ]
+        }
+      ]
     }
   };
 
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-  console.log(`[Sandbox] Created settings.local.json for project sandbox`);
+
+  // Force sync to ensure Claude Code sees the settings on startup
+  const hookFd = fs.openSync(hookScriptPath, 'r');
+  fs.fsyncSync(hookFd);
+  fs.closeSync(hookFd);
+  const settingsFd = fs.openSync(settingsPath, 'r');
+  fs.fsyncSync(settingsFd);
+  fs.closeSync(settingsFd);
+
+  console.log(`[Sandbox] Created settings.json with hooks configuration`);
 
   // Also create a CLAUDE.md in the project to reinforce sandbox rules
   const claudeMdPath = path.join(projectPath, 'CLAUDE.md');
@@ -173,14 +311,20 @@ export async function createSession(
     return session;
   }
 
-  // Set up sandbox configuration for the project
-  setupProjectSandbox(projectPath);
+  // Set up sandbox configuration for the project (includes hook configuration)
+  setupProjectSandbox(projectPath, sessionName);
 
-  // Create new detached session
+  // Create new detached session with LORA_SESSION environment variable
+  // This allows Claude Code hooks to know which session they're in
   console.log(`[Tmux] Creating new session ${sessionName} in ${projectPath}`);
+
+  // Set LORA_SESSION as a tmux environment variable that will be inherited by all processes
   await execAsync(
-    `tmux new-session -d -s ${shellEscape(sessionName)} -c ${shellEscape(projectPath)}`
+    `tmux new-session -d -s ${shellEscape(sessionName)} -c ${shellEscape(projectPath)} -e LORA_SESSION=${shellEscape(sessionName)}`
   );
+
+  // Start watching for Claude state changes via hooks
+  claudeStateService.startWatching(sessionName);
 
   // Set up session info
   const session: TmuxSession = {
@@ -197,7 +341,8 @@ export async function createSession(
 
   // Auto-start Claude Code if requested
   if (options?.autoStartClaude !== false) {
-    await sleep(500); // Wait for shell to initialize
+    // Wait longer to ensure shell initializes and settings.json is visible
+    await sleep(1500);
     console.log(`[Tmux] Auto-starting Claude Code in ${sessionName}`);
     await sendCommand(sessionName, 'claude --dangerously-skip-permissions');
     await sendEnter(sessionName);
@@ -214,6 +359,9 @@ export async function killSession(sessionName: string): Promise<void> {
   try {
     console.log(`[Tmux] Killing session ${sessionName}`);
     await execAsync(`tmux kill-session -t ${shellEscape(sessionName)}`);
+
+    // Clean up state service
+    claudeStateService.cleanupSession(sessionName);
 
     // Remove from registry
     for (const [projectId, session] of sessionRegistry) {
@@ -306,6 +454,66 @@ export async function captureOutput(
     console.error(`[Tmux] Failed to capture output from ${sessionName}:`, error);
     return '';
   }
+}
+
+/**
+ * Extract only the NEW output by removing content that existed before the command
+ * Uses a simple heuristic: find where the command was echoed and return everything after
+ */
+export function extractNewOutput(fullOutput: string, previousOutput: string): string {
+  if (!previousOutput || !previousOutput.trim()) {
+    return fullOutput;
+  }
+
+  // Split into lines for comparison
+  const fullLines = fullOutput.split('\n');
+  const prevLines = previousOutput.split('\n');
+
+  // Find the last significant line from previous output
+  // Skip empty lines and find a unique line to use as marker
+  let markerLine = '';
+  for (let i = prevLines.length - 1; i >= 0; i--) {
+    const line = prevLines[i].trim();
+    if (line.length > 10 && !line.startsWith('>')) {
+      markerLine = line;
+      break;
+    }
+  }
+
+  if (!markerLine) {
+    // No good marker found, return full output minus the first N lines
+    // This is a fallback heuristic
+    const skipLines = Math.min(prevLines.length - 5, fullLines.length / 2);
+    if (skipLines > 0) {
+      return fullLines.slice(skipLines).join('\n');
+    }
+    return fullOutput;
+  }
+
+  // Find where the marker appears in the full output
+  let markerIndex = -1;
+  for (let i = 0; i < fullLines.length; i++) {
+    if (fullLines[i].trim() === markerLine) {
+      markerIndex = i;
+      // Continue to find the LAST occurrence (in case of repeats)
+    }
+  }
+
+  if (markerIndex >= 0 && markerIndex < fullLines.length - 1) {
+    // Return everything after the marker
+    return fullLines.slice(markerIndex + 1).join('\n');
+  }
+
+  // If marker not found, try to find where new content starts by looking for command echo
+  // Commands are echoed with "> " prefix
+  for (let i = fullLines.length - 1; i >= 0; i--) {
+    if (fullLines[i].trim().startsWith('>') && fullLines[i].length > 5) {
+      // Found command echo, return from here
+      return fullLines.slice(i).join('\n');
+    }
+  }
+
+  return fullOutput;
 }
 
 /**
@@ -588,6 +796,18 @@ export async function waitForClaudeReady(
   console.log(`[Tmux] Waiting for Claude Code to be ready in ${sessionName}...`);
 
   while (Date.now() - startTime < timeoutMs) {
+    // Also check hook state - if hooks report idle, trust that immediately
+    const hookState = claudeStateService.readState(sessionName);
+    if (hookState.state === 'idle' || hookState.state === 'permission') {
+      console.log(`[Tmux] Hook reports ${hookState.state} during pattern matching - exiting early`);
+      const output = await captureOutput(sessionName, 100);
+      const state = analyzeClaudeCodeState(output);
+      state.isReady = true;
+      state.isProcessing = false;
+      state.isWaitingConfirm = hookState.state === 'permission';
+      return state;
+    }
+
     const output = await captureOutput(sessionName, 100);
     const state = analyzeClaudeCodeState(output);
 
@@ -729,6 +949,167 @@ export async function cleanupStaleSessions(maxAgeMs: number = 24 * 60 * 60 * 100
   }
 }
 
+/**
+ * HOOK-BASED: Wait for Claude Code to be ready using the hooks system
+ *
+ * This is more reliable than pattern matching because Claude Code's hooks
+ * notify us directly when state changes occur. Falls back to pattern matching
+ * if hooks aren't responding (older Claude Code versions).
+ */
+export interface HookBasedClaudeState {
+  isReady: boolean;
+  isProcessing: boolean;
+  isWaitingConfirm: boolean;  // permission_prompt
+  state: 'idle' | 'permission' | 'processing' | 'stopped' | 'unknown';
+  rawOutput: string;
+  usedHooks: boolean;  // true if we used hooks, false if we fell back to pattern matching
+}
+
+export async function waitForClaudeReadyWithHooks(
+  sessionName: string,
+  options?: {
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    useHooksOnly?: boolean;  // if true, don't fall back to pattern matching
+    previousOutput?: string;  // output before command was sent, to filter out old content
+  }
+): Promise<HookBasedClaudeState> {
+  const {
+    timeoutMs = 180000,   // 3 minutes max
+    pollIntervalMs = 300,
+    useHooksOnly = false,
+    previousOutput = ''
+  } = options || {};
+
+  const startTime = Date.now();
+  let lastHookCheck = 0;
+  const HOOK_CHECK_INTERVAL = 1000;  // Check hooks every second
+  let hookResponded = false;
+
+  console.log(`[Tmux] Waiting for Claude Code (hooks+fallback) in ${sessionName}...`);
+  console.log(`[Tmux] Hook detection: timeoutMs=${timeoutMs}, pollInterval=${pollIntervalMs}, useHooksOnly=${useHooksOnly}`);
+
+  // Ensure we're watching this session
+  if (!claudeStateService.getWatchedSessions().includes(sessionName)) {
+    console.log(`[Tmux] Starting to watch session: ${sessionName}`);
+    claudeStateService.startWatching(sessionName);
+  }
+
+  // Check initial state before marking as processing
+  const initialState = claudeStateService.readState(sessionName, true);
+  console.log(`[Tmux] Initial hook state: ${initialState.state} (timestamp: ${initialState.timestamp})`);
+
+  // Mark as processing when we start waiting
+  claudeStateService.markProcessing(sessionName);
+  console.log(`[Tmux] Marked session as processing`);
+
+  while (Date.now() - startTime < timeoutMs) {
+    const elapsed = Date.now() - startTime;
+
+    // Check hook-based state periodically
+    if (Date.now() - lastHookCheck >= HOOK_CHECK_INTERVAL) {
+      // Use verbose logging every 5 seconds
+      const isVerboseCheck = elapsed > 0 && elapsed % 5000 < HOOK_CHECK_INTERVAL;
+      const hookState = claudeStateService.readState(sessionName, isVerboseCheck);
+      lastHookCheck = Date.now();
+
+      // If hooks have reported something other than 'unknown' and 'processing', they've responded
+      if (hookState.state !== 'unknown' && hookState.state !== 'processing') {
+        if (!hookResponded) {
+          console.log(`[Tmux] Hook responded! State: ${hookState.state} at ${elapsed}ms`);
+        }
+        hookResponded = true;
+
+        // Check if we're in a ready state
+        if (claudeStateService.isReadyState(hookState.state)) {
+          const output = await captureOutput(sessionName, 100);
+          // Filter out old content if previousOutput was provided
+          const newOutput = extractNewOutput(output, previousOutput);
+
+          console.log(`[Tmux] Hook reports ready: ${hookState.state} after ${elapsed}ms`);
+
+          return {
+            isReady: true,
+            isProcessing: false,
+            isWaitingConfirm: hookState.state === 'permission',
+            state: hookState.state,
+            rawOutput: newOutput,
+            usedHooks: true
+          };
+        }
+      }
+
+      // Log progress every 5 seconds
+      if (isVerboseCheck) {
+        console.log(`[Tmux] Waiting... hookState=${hookState.state}, hookResponded=${hookResponded}, elapsed=${elapsed}ms`);
+      }
+    }
+
+    // If hooks haven't responded after 15 seconds and we're allowed to fall back,
+    // use pattern matching as a fallback
+    // Claude's idle_prompt notification can take a few seconds to fire after processing completes
+    if (!useHooksOnly && !hookResponded && elapsed > 15000) {
+      console.log(`[Tmux] Hooks not responding after ${elapsed}ms, falling back to pattern matching`);
+
+      // Use the old pattern matching approach
+      const patternState = await waitForClaudeReady(sessionName, {
+        timeoutMs: timeoutMs - elapsed,
+        pollIntervalMs
+      });
+
+      // Filter out old content if previousOutput was provided
+      const filteredOutput = extractNewOutput(patternState.rawOutput, previousOutput);
+
+      return {
+        isReady: patternState.isReady,
+        isProcessing: patternState.isProcessing,
+        isWaitingConfirm: patternState.isWaitingConfirm,
+        state: patternState.isReady
+          ? (patternState.isWaitingConfirm ? 'permission' : 'idle')
+          : (patternState.isProcessing ? 'processing' : 'unknown'),
+        rawOutput: filteredOutput,
+        usedHooks: false
+      };
+    }
+
+    await sleep(pollIntervalMs);
+  }
+
+  // Timeout - return current state
+  const finalOutput = await captureOutput(sessionName, 100);
+  const hookState = claudeStateService.readState(sessionName);
+  // Filter out old content if previousOutput was provided
+  const filteredFinalOutput = extractNewOutput(finalOutput, previousOutput);
+
+  console.log(`[Tmux] Timeout after ${timeoutMs}ms, final hookState=${hookState.state}`);
+
+  return {
+    isReady: claudeStateService.isReadyState(hookState.state),
+    isProcessing: hookState.state === 'processing',
+    isWaitingConfirm: hookState.state === 'permission',
+    state: hookState.state,
+    rawOutput: filteredFinalOutput,
+    usedHooks: hookResponded
+  };
+}
+
+/**
+ * Mark a session as processing (call before sending a command)
+ */
+export function markSessionProcessing(sessionName: string): void {
+  claudeStateService.markProcessing(sessionName);
+}
+
+/**
+ * Get current Claude state from hooks
+ */
+export function getClaudeHookState(sessionName: string): { state: string; timestamp: number } {
+  return claudeStateService.readState(sessionName);
+}
+
+// Re-export the state service for direct access if needed
+export { claudeStateService };
+
 export default {
   isTmuxAvailable,
   sessionExists,
@@ -745,9 +1126,12 @@ export default {
   analyzeClaudeCodeState,
   waitForResponse,
   waitForClaudeReady,
+  waitForClaudeReadyWithHooks,
   extractClaudeResponse,
   sendCommandAndWait,
   clearScreen,
   restartClaude,
-  cleanupStaleSessions
+  cleanupStaleSessions,
+  markSessionProcessing,
+  getClaudeHookState
 };
