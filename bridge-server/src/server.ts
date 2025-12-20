@@ -1891,21 +1891,30 @@ wss.on('connection', (ws: WebSocket) => {
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', async () => {
     serverLog('❌ Lora iOS app disconnected');
-    // Kill PTY connections but KEEP tmux sessions alive (session persistence)
+    // Kill ALL terminal sessions including tmux sessions when app disconnects
+    // This ensures no orphaned terminals run in the background
     for (const [id, session] of terminals) {
-      serverLog(`🖥️  Disconnecting from terminal ${id} (tmux session preserved: ${session.tmuxSessionName})`);
-      terminalLog(id, 'DISCONNECTED');
+      serverLog(`🖥️  Cleaning up terminal ${id} and tmux session ${session.tmuxSessionName}`);
+      terminalLog(id, 'CLOSED_ON_DISCONNECT');
 
-      // Kill the PTY (which detaches from tmux) but keep tmux session
+      // Kill the PTY
       if (session.pty) {
         session.pty.kill();
       }
+
+      // Kill the tmux session
+      try {
+        await tmuxService.killSession(session.tmuxSessionName);
+        // Mark session as inactive in registry
+        markSessionInactive(session.projectId, session.tmuxSessionName);
+      } catch (err) {
+        serverError(`Failed to kill tmux session ${session.tmuxSessionName}:`, err);
+      }
     }
     terminals.clear();
-    // Note: tmux sessions remain alive for reconnection
-    serverLog('💾 Tmux sessions preserved for reconnection');
+    serverLog('🧹 All terminal sessions cleaned up');
   });
 
   ws.on('error', (err: Error) => {

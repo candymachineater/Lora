@@ -89,6 +89,7 @@ const styles = StyleSheet.create({
   },
   ghost: {
     backgroundColor: 'transparent',
+    paddingHorizontal: spacing.sm,
   },
   destructive: {
     backgroundColor: colors.destructive,

@@ -4,13 +4,14 @@
   "private": true,
   "description": "Lora - Personal AI Mobile App Builder",
   "scripts": {
-    "dev": "concurrently -k -n bridge,expo -c blue,magenta \"npm run bridge\" \"npm run expo\"",
+    "dev": "npm run cleanup && concurrently -k -n bridge,expo -c blue,magenta \"npm run bridge\" \"npm run expo\"",
     "bridge": "cd bridge-server && npm run build && npm start",
-    "expo": "cd mobile && npx expo start --tunnel --clear",
+    "expo": "cd mobile && npx expo start --tunnel --clear --port 19006",
     "bridge:dev": "cd bridge-server && npm run dev",
-    "expo:local": "cd mobile && npx expo start",
+    "expo:local": "cd mobile && npx expo start --port 19006",
     "install:all": "npm install && cd bridge-server && npm install && cd ../mobile && npm install",
-    "build:bridge": "cd bridge-server && npm run build"
+    "build:bridge": "cd bridge-server && npm run build",
+    "cleanup": "lsof -ti:19006 | xargs -r kill -9 2>/dev/null || true; lsof -ti:8081 | xargs -r kill -9 2>/dev/null || true; lsof -ti:8765 | xargs -r kill -9 2>/dev/null || true; echo 'Cleanup complete'"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"

@@ -7,7 +7,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import { Send, X } from 'lucide-react-native';
-import { colors, spacing, radius } from '../../theme';
+import { colors, spacing, radius, shadows } from '../../theme';
 
 interface ChatInputProps {
   onSend: (message: string) => void;
@@ -87,6 +87,7 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
+    ...shadows.sm,
   },
   input: {
     flex: 1,

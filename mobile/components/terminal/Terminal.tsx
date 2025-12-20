@@ -579,7 +579,7 @@ export function Terminal({
           <View
             style={[
               styles.statusDot,
-              { backgroundColor: isConnected ? '#16C60C' : '#E74856' },
+              { backgroundColor: isConnected ? '#22C55E' : '#D10808' },
             ]}
           />
           <Text style={styles.statusText}>
@@ -590,10 +590,10 @@ export function Terminal({
           <View
             style={[
               styles.sandboxBadge,
-              { backgroundColor: sandbox ? '#16C60C' : '#F9F1A5' },
+              { backgroundColor: sandbox ? '#22C55E' : '#F59E0B' },
             ]}
           >
-            <Text style={[styles.sandboxText, !sandbox && { color: '#000' }]}>
+            <Text style={[styles.sandboxText, !sandbox && { color: '#1C1C1C' }]}>
               {sandbox ? 'Sandbox' : 'Full Access'}
             </Text>
           </View>
@@ -720,11 +720,11 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: '#1A1A1A',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    backgroundColor: '#161616',
     borderBottomWidth: 1,
-    borderBottomColor: '#333',
+    borderBottomColor: '#2A2A2A',
   },
   statusLeft: {
     flexDirection: 'row',
@@ -737,7 +737,7 @@ const styles = StyleSheet.create({
     marginRight: 8,
   },
   statusText: {
-    color: '#888',
+    color: '#999',
     fontSize: 12,
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
@@ -747,9 +747,9 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   sandboxBadge: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 12,
   },
   sandboxText: {
     color: '#FFF',
@@ -767,60 +767,64 @@ const styles = StyleSheet.create({
   },
   scrollButtonsContainer: {
     position: 'absolute',
-    right: 4,
+    right: 8,
     top: '50%',
     transform: [{ translateY: -80 }],
     flexDirection: 'column',
-    gap: 4,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
-    borderRadius: 8,
-    padding: 4,
+    gap: 6,
+    backgroundColor: 'rgba(22, 22, 22, 0.9)',
+    borderRadius: 12,
+    padding: 6,
+    borderWidth: 1,
+    borderColor: '#333',
   },
   scrollButton: {
-    width: 36,
-    height: 36,
-    backgroundColor: '#2D2D2D',
-    borderRadius: 6,
+    width: 38,
+    height: 38,
+    backgroundColor: '#252525',
+    borderRadius: 8,
     justifyContent: 'center',
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#444',
+    borderColor: '#3A3A3A',
   },
   scrollButtonText: {
     fontSize: 16,
-    color: '#CCC',
+    color: '#AAA',
   },
   controlBar: {
-    backgroundColor: '#1A1A1A',
-    maxHeight: 50,
+    backgroundColor: '#161616',
+    maxHeight: 52,
+    borderTopWidth: 1,
+    borderTopColor: '#2A2A2A',
   },
   controlBarContent: {
     flexDirection: 'row',
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    gap: 8,
     alignItems: 'center',
   },
   controlButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: '#2D2D2D',
-    borderRadius: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    backgroundColor: '#252525',
+    borderRadius: 8,
     borderWidth: 1,
-    borderColor: '#444',
+    borderColor: '#3A3A3A',
   },
   controlButtonActive: {
-    backgroundColor: '#16C60C',
-    borderColor: '#16C60C',
+    backgroundColor: '#C53307',
+    borderColor: '#C53307',
   },
   controlButtonText: {
-    color: '#CCC',
+    color: '#BBB',
     fontSize: 12,
     fontWeight: '500',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
   controlButtonTextActive: {
-    color: '#0C0C0C',
-    fontWeight: '700',
+    color: '#FFF',
+    fontWeight: '600',
   },
 });

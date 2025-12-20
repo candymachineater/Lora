@@ -1,6 +1,8 @@
 import { Tabs } from 'expo-router';
 import { Terminal, Code2, Play } from 'lucide-react-native';
-import { colors } from '../../theme';
+import { Platform } from 'react-native';
+import * as Haptics from 'expo-haptics';
+import { colors, shadows } from '../../theme';
 import { ProjectSelector } from '../../components/common';
 
 export default function TabLayout() {
@@ -13,22 +15,49 @@ export default function TabLayout() {
           backgroundColor: colors.background,
           borderTopColor: colors.border,
           borderTopWidth: 1,
-          paddingTop: 8,
+          paddingTop: 6,
           paddingBottom: 8,
-          height: 80,
+          height: 70,
+          // Add subtle shadow for depth
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: -2 },
+          shadowOpacity: 0.05,
+          shadowRadius: 8,
+          elevation: 4,
         },
         tabBarLabelStyle: {
-          fontSize: 12,
-          fontWeight: '600' as const,
+          fontSize: 11,
+          fontWeight: '500' as const,
+          marginTop: 2,
+        },
+        tabBarIconStyle: {
+          marginTop: 2,
+        },
+        tabBarItemStyle: {
+          paddingVertical: 4,
         },
         headerStyle: {
           backgroundColor: colors.background,
           borderBottomWidth: 1,
           borderBottomColor: colors.border,
+          // Subtle header shadow
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 1 },
+          shadowOpacity: 0.03,
+          shadowRadius: 4,
+          elevation: 2,
         },
         headerTintColor: colors.foreground,
         headerTitle: () => <ProjectSelector />,
         headerTitleAlign: 'center',
+      }}
+      screenListeners={{
+        tabPress: () => {
+          // Haptic feedback on tab press (iOS)
+          if (Platform.OS === 'ios') {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          }
+        },
       }}
     >
       {/* Projects tab hidden - now accessible via dropdown in header */}

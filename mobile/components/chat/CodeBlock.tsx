@@ -74,7 +74,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
     borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,255,255,0.1)',
+    borderBottomColor: 'rgba(255,255,255,0.15)',
   },
   fileInfo: {
     flexDirection: 'row',

@@ -16,6 +16,11 @@ export const typography: Record<string, TextStyle> = {
     fontWeight: '500',
     lineHeight: 27,
   },
+  h4: {
+    fontSize: 16,
+    fontWeight: '600',
+    lineHeight: 24,
+  },
   body: {
     fontSize: 16,
     fontWeight: '400',
@@ -29,6 +34,7 @@ export const typography: Record<string, TextStyle> = {
   button: {
     fontSize: 14,
     fontWeight: '500',
+    lineHeight: 18,
   },
   caption: {
     fontSize: 12,

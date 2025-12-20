@@ -201,7 +201,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
-    gap: spacing.xs,
+    gap: spacing.sm,
   },
   fileItemActive: {
     backgroundColor: colors.secondary,
@@ -212,12 +212,15 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   fileName: {
-    ...typography.caption,
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: '400',
     color: colors.foreground,
     flex: 1,
   },
   fileNameActive: {
-    fontWeight: '500',
+    fontWeight: '600',
+    color: colors.brandTiger,
   },
   directoryName: {
     fontWeight: '500',

@@ -16,7 +16,7 @@ import { bridgeService } from '../../services/claude/api';
 import { FileTree, CodeEditor, TabBar } from '../../components/editor';
 import { EmptyState, Button } from '../../components/common';
 import { ProjectFile } from '../../types';
-import { colors, spacing, radius, typography } from '../../theme';
+import { colors, spacing, radius, typography, shadows } from '../../theme';
 
 const { width: screenWidth } = Dimensions.get('window');
 const FILE_TREE_WIDTH = screenWidth < 600 ? 150 : 200; // Smaller on mobile
@@ -440,6 +440,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.cardBackground,
     borderBottomWidth: 1,
     borderBottomColor: colors.border,
+    ...shadows.sm,
   },
   headerLeft: {
     flexDirection: 'row',
@@ -451,7 +452,7 @@ const styles = StyleSheet.create({
     color: colors.foreground,
   },
   toggleButton: {
-    padding: spacing.xs,
+    padding: spacing.sm,
   },
   headerRight: {
     flexDirection: 'row',
@@ -510,6 +511,7 @@ const styles = StyleSheet.create({
     padding: spacing.xl,
     width: '100%',
     maxWidth: 400,
+    ...shadows.lg,
   },
   modalTitle: {
     ...typography.h3,

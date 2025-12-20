@@ -4,7 +4,7 @@ import { User, Bot } from 'lucide-react-native';
 import { Message, CodeBlock } from '../../types';
 import { CodeBlockComponent } from './CodeBlock';
 import { parseCodeBlocks, extractTextContent } from '../../utils';
-import { colors, spacing, radius, typography } from '../../theme';
+import { colors, spacing, radius, typography, shadows } from '../../theme';
 
 interface MessageBubbleProps {
   message: Message;
@@ -80,6 +80,7 @@ const styles = StyleSheet.create({
     maxWidth: '80%',
     borderRadius: radius.xl,
     padding: spacing.md,
+    ...shadows.card,
   },
   userBubble: {
     backgroundColor: colors.userBubble,
@@ -88,6 +89,8 @@ const styles = StyleSheet.create({
   assistantBubble: {
     backgroundColor: colors.assistantBubble,
     borderBottomLeftRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
   },
   text: {
     ...typography.body,

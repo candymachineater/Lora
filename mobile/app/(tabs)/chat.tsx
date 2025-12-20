@@ -1,14 +1,15 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView, Animated } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView, Animated, Easing } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Terminal as TerminalIcon, Plus, X, Mic, MicOff, Volume2, Square } from 'lucide-react-native';
 import { Audio, AVPlaybackStatus } from 'expo-av';
 import ViewShot from 'react-native-view-shot';
+import * as Haptics from 'expo-haptics';
 import { useProjectStore, useSettingsStore } from '../../stores';
 import { bridgeService } from '../../services/claude/api';
 import { Terminal } from '../../components/terminal';
 import { EmptyState, Button } from '../../components/common';
-import { colors, spacing } from '../../theme';
+import { colors, spacing, shadows } from '../../theme';
 
 interface TerminalSession {
   id: string;
@@ -65,26 +66,115 @@ export default function TerminalScreen() {
   const meteringIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const silenceStartRef = useRef<number | null>(null);
   const recordingStartRef = useRef<number | null>(null);
+  // Multiple orb animations for ChatGPT-style effect
   const pulseAnim = useRef(new Animated.Value(1)).current;
+  const ring1Anim = useRef(new Animated.Value(1)).current;
+  const ring2Anim = useRef(new Animated.Value(1)).current;
+  const ring3Anim = useRef(new Animated.Value(1)).current;
+  const ring1Opacity = useRef(new Animated.Value(0.3)).current;
+  const ring2Opacity = useRef(new Animated.Value(0.2)).current;
+  const ring3Opacity = useRef(new Animated.Value(0.1)).current;
+  const glowAnim = useRef(new Animated.Value(0)).current;
   const viewShotRef = useRef<ViewShot>(null);
 
   const project = currentProject();
   const activeTerminal = terminals[activeTerminalIndex];
   const projectSandbox = project?.sandbox ?? true;
 
-  // Pulse animation for listening
+  // Enhanced orb animations for voice mode (ChatGPT-style)
   useEffect(() => {
     if (voiceStatus === 'listening') {
-      const pulse = Animated.loop(
+      // Main pulse
+      const mainPulse = Animated.loop(
         Animated.sequence([
-          Animated.timing(pulseAnim, { toValue: 1.2, duration: 500, useNativeDriver: true }),
-          Animated.timing(pulseAnim, { toValue: 1, duration: 500, useNativeDriver: true }),
+          Animated.timing(pulseAnim, { toValue: 1.15, duration: 600, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
+          Animated.timing(pulseAnim, { toValue: 1, duration: 600, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
         ])
       );
-      pulse.start();
-      return () => pulse.stop();
+
+      // Concentric ring animations with staggered timing
+      const ring1Pulse = Animated.loop(
+        Animated.sequence([
+          Animated.parallel([
+            Animated.timing(ring1Anim, { toValue: 1.8, duration: 1500, useNativeDriver: true, easing: Easing.out(Easing.ease) }),
+            Animated.timing(ring1Opacity, { toValue: 0, duration: 1500, useNativeDriver: true }),
+          ]),
+          Animated.parallel([
+            Animated.timing(ring1Anim, { toValue: 1, duration: 0, useNativeDriver: true }),
+            Animated.timing(ring1Opacity, { toValue: 0.3, duration: 0, useNativeDriver: true }),
+          ]),
+        ])
+      );
+
+      const ring2Pulse = Animated.loop(
+        Animated.sequence([
+          Animated.delay(500),
+          Animated.parallel([
+            Animated.timing(ring2Anim, { toValue: 2.2, duration: 1500, useNativeDriver: true, easing: Easing.out(Easing.ease) }),
+            Animated.timing(ring2Opacity, { toValue: 0, duration: 1500, useNativeDriver: true }),
+          ]),
+          Animated.parallel([
+            Animated.timing(ring2Anim, { toValue: 1, duration: 0, useNativeDriver: true }),
+            Animated.timing(ring2Opacity, { toValue: 0.2, duration: 0, useNativeDriver: true }),
+          ]),
+        ])
+      );
+
+      const ring3Pulse = Animated.loop(
+        Animated.sequence([
+          Animated.delay(1000),
+          Animated.parallel([
+            Animated.timing(ring3Anim, { toValue: 2.6, duration: 1500, useNativeDriver: true, easing: Easing.out(Easing.ease) }),
+            Animated.timing(ring3Opacity, { toValue: 0, duration: 1500, useNativeDriver: true }),
+          ]),
+          Animated.parallel([
+            Animated.timing(ring3Anim, { toValue: 1, duration: 0, useNativeDriver: true }),
+            Animated.timing(ring3Opacity, { toValue: 0.1, duration: 0, useNativeDriver: true }),
+          ]),
+        ])
+      );
+
+      mainPulse.start();
+      ring1Pulse.start();
+      ring2Pulse.start();
+      ring3Pulse.start();
+
+      return () => {
+        mainPulse.stop();
+        ring1Pulse.stop();
+        ring2Pulse.stop();
+        ring3Pulse.stop();
+      };
+    } else if (voiceStatus === 'speaking') {
+      // Gentle breathing animation when speaking
+      const breathe = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, { toValue: 1.08, duration: 800, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
+          Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
+        ])
+      );
+      // Glow effect
+      const glow = Animated.loop(
+        Animated.sequence([
+          Animated.timing(glowAnim, { toValue: 1, duration: 1000, useNativeDriver: false }),
+          Animated.timing(glowAnim, { toValue: 0.5, duration: 1000, useNativeDriver: false }),
+        ])
+      );
+      breathe.start();
+      glow.start();
+      return () => {
+        breathe.stop();
+        glow.stop();
+      };
     } else {
       pulseAnim.setValue(1);
+      ring1Anim.setValue(1);
+      ring2Anim.setValue(1);
+      ring3Anim.setValue(1);
+      ring1Opacity.setValue(0.3);
+      ring2Opacity.setValue(0.2);
+      ring3Opacity.setValue(0.1);
+      glowAnim.setValue(0);
     }
   }, [voiceStatus]);
 
@@ -337,7 +427,6 @@ export default function TerminalScreen() {
     } else {
       // Turn off voice mode
       // Set status to 'off' IMMEDIATELY to prevent double-taps during async cleanup
-      if (voiceStatus === 'off') return; // Already off, prevent re-entry
       setVoiceStatus('off');
       setVoiceTranscript('');
 
@@ -559,6 +648,9 @@ export default function TerminalScreen() {
   };
 
   const handleVoiceMicPress = () => {
+    // Haptic feedback
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+
     if (voiceStatus === 'listening') {
       stopListening();
     } else if (voiceStatus === 'idle' || voiceStatus === 'speaking') {
@@ -630,19 +722,15 @@ export default function TerminalScreen() {
         </View>
       </View>
 
-      {/* Voice Mode Overlay - Now integrated with terminal */}
+      {/* Voice Mode Overlay - ChatGPT-style with orb animations */}
       {voiceStatus !== 'off' && (
         <View style={styles.voiceOverlay}>
-          {/* Audio Level Bar */}
-          {voiceStatus === 'listening' && (
-            <View style={styles.levelBar}>
-              <View style={[styles.levelFill, { width: `${audioLevel * 100}%` }]} />
-            </View>
-          )}
-
           {/* Show transcription */}
           {voiceTranscript && (
-            <Text style={styles.transcriptText}>You: "{voiceTranscript}"</Text>
+            <View style={styles.transcriptContainer}>
+              <Text style={styles.transcriptLabel}>You said:</Text>
+              <Text style={styles.transcriptText}>"{voiceTranscript}"</Text>
+            </View>
           )}
 
           {/* Show progress (command being sent) */}
@@ -651,24 +739,67 @@ export default function TerminalScreen() {
           )}
 
           <View style={styles.voiceControls}>
+            {/* Status text */}
             <Text style={styles.voiceStatusText}>
-              {voiceStatus === 'idle' ? 'Tap mic to speak to Claude Code' :
-               voiceStatus === 'listening' ? 'Listening... (auto-stops on silence)' :
-               voiceStatus === 'processing' ? 'Sending to Claude Code...' :
-               'Claude speaking... (tap to interrupt)'}
+              {voiceStatus === 'idle' ? 'Tap to speak' :
+               voiceStatus === 'listening' ? 'Listening...' :
+               voiceStatus === 'processing' ? 'Processing...' :
+               'Speaking...'}
             </Text>
 
-            <View style={styles.voiceButtons}>
-              {/* Stop All Button */}
-              <TouchableOpacity
-                style={styles.stopButton}
-                onPress={toggleVoiceMode}
-              >
-                <Square size={18} color="#FF6B6B" fill="#FF6B6B" />
-              </TouchableOpacity>
+            {/* Orb container with rings */}
+            <View style={styles.orbContainer}>
+              {/* Concentric rings - only show when listening */}
+              {voiceStatus === 'listening' && (
+                <>
+                  <Animated.View style={[
+                    styles.orbRing,
+                    styles.orbRing3,
+                    {
+                      transform: [{ scale: ring3Anim }],
+                      opacity: ring3Opacity,
+                    }
+                  ]} />
+                  <Animated.View style={[
+                    styles.orbRing,
+                    styles.orbRing2,
+                    {
+                      transform: [{ scale: ring2Anim }],
+                      opacity: ring2Opacity,
+                    }
+                  ]} />
+                  <Animated.View style={[
+                    styles.orbRing,
+                    styles.orbRing1,
+                    {
+                      transform: [{ scale: ring1Anim }],
+                      opacity: ring1Opacity,
+                    }
+                  ]} />
+                </>
+              )}
 
-              {/* Mic Button */}
-              <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
+              {/* Audio level ring - reacts to voice */}
+              {voiceStatus === 'listening' && (
+                <View style={[
+                  styles.audioLevelRing,
+                  {
+                    transform: [{ scale: 1 + audioLevel * 0.3 }],
+                    opacity: 0.4 + audioLevel * 0.4,
+                  }
+                ]} />
+              )}
+
+              {/* Main mic button with animation */}
+              <Animated.View style={[
+                styles.micButtonWrapper,
+                { transform: [{ scale: pulseAnim }] },
+                voiceStatus === 'speaking' && {
+                  shadowColor: '#22C55E',
+                  shadowOpacity: 0.6,
+                  shadowRadius: 20,
+                }
+              ]}>
                 <TouchableOpacity
                   style={[
                     styles.micButton,
@@ -678,19 +809,32 @@ export default function TerminalScreen() {
                   ]}
                   onPress={handleVoiceMicPress}
                   disabled={voiceStatus === 'processing'}
+                  activeOpacity={0.8}
                 >
                   {voiceStatus === 'listening' ? (
-                    <MicOff size={24} color="#FFF" />
+                    <MicOff size={28} color="#FFF" />
                   ) : voiceStatus === 'speaking' ? (
-                    <Volume2 size={24} color="#FFF" />
+                    <Volume2 size={28} color="#FFF" />
                   ) : (
-                    <Mic size={24} color="#FFF" />
+                    <Mic size={28} color="#FFF" />
                   )}
                 </TouchableOpacity>
               </Animated.View>
+            </View>
 
-              {/* Spacer */}
-              <View style={styles.stopButton} />
+            {/* Control buttons row */}
+            <View style={styles.voiceButtonsRow}>
+              {/* Stop/Exit button */}
+              <TouchableOpacity
+                style={styles.stopButton}
+                onPress={() => {
+                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                  toggleVoiceMode();
+                }}
+              >
+                <Square size={16} color="#FF6B6B" fill="#FF6B6B" />
+                <Text style={styles.stopButtonText}>Exit</Text>
+              </TouchableOpacity>
             </View>
           </View>
         </View>
@@ -802,65 +946,96 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   voiceOverlay: {
-    backgroundColor: '#252525',
+    backgroundColor: '#1A1A1A',
     borderBottomWidth: 1,
-    borderBottomColor: '#3D3D3D',
-    paddingVertical: spacing.sm,
+    borderBottomColor: '#2A2A2A',
+    paddingVertical: spacing.lg,
     paddingHorizontal: spacing.md,
-  },
-  levelBar: {
-    height: 4,
-    backgroundColor: '#3D3D3D',
-    borderRadius: 2,
-    marginBottom: spacing.sm,
-    overflow: 'hidden',
-  },
-  levelFill: {
-    height: '100%',
-    backgroundColor: '#4CAF50',
-    borderRadius: 2,
   },
   voiceControls: {
     alignItems: 'center',
   },
   voiceStatusText: {
-    color: '#AAA',
-    fontSize: 12,
-    marginBottom: spacing.sm,
+    color: '#888',
+    fontSize: 13,
+    fontWeight: '500',
+    marginBottom: spacing.lg,
+    letterSpacing: 0.5,
+  },
+  transcriptContainer: {
+    backgroundColor: 'rgba(34, 197, 94, 0.1)',
+    borderRadius: 12,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+    borderWidth: 1,
+    borderColor: 'rgba(34, 197, 94, 0.2)',
+  },
+  transcriptLabel: {
+    color: '#22C55E',
+    fontSize: 11,
+    fontWeight: '600',
+    marginBottom: 4,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
   },
   transcriptText: {
-    color: '#4CAF50',
-    fontSize: 14,
-    fontStyle: 'italic',
-    textAlign: 'center',
-    marginBottom: spacing.xs,
-    paddingHorizontal: spacing.md,
+    color: '#FFF',
+    fontSize: 15,
+    lineHeight: 22,
   },
   progressText: {
-    color: '#FF9800',
-    fontSize: 12,
+    color: colors.brandTiger,
+    fontSize: 13,
     textAlign: 'center',
-    marginBottom: spacing.sm,
+    marginBottom: spacing.md,
     paddingHorizontal: spacing.md,
+    fontWeight: '500',
   },
-  voiceButtons: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 16,
-  },
-  stopButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: 'rgba(255,107,107,0.2)',
+  orbContainer: {
+    width: 160,
+    height: 160,
     justifyContent: 'center',
     alignItems: 'center',
+    marginBottom: spacing.lg,
+  },
+  orbRing: {
+    position: 'absolute',
+    borderRadius: 100,
+    borderWidth: 2,
+  },
+  orbRing1: {
+    width: 80,
+    height: 80,
+    borderColor: colors.brandTiger,
+  },
+  orbRing2: {
+    width: 80,
+    height: 80,
+    borderColor: colors.brandTiger,
+  },
+  orbRing3: {
+    width: 80,
+    height: 80,
+    borderColor: colors.brandTiger,
+  },
+  audioLevelRing: {
+    position: 'absolute',
+    width: 90,
+    height: 90,
+    borderRadius: 45,
+    backgroundColor: 'rgba(255, 107, 107, 0.3)',
+  },
+  micButtonWrapper: {
+    shadowColor: colors.brandTiger,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.4,
+    shadowRadius: 15,
+    elevation: 8,
   },
   micButton: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
+    width: 72,
+    height: 72,
+    borderRadius: 36,
     backgroundColor: colors.brandTiger,
     justifyContent: 'center',
     alignItems: 'center',
@@ -869,10 +1044,32 @@ const styles = StyleSheet.create({
     backgroundColor: '#FF6B6B',
   },
   micButtonSpeaking: {
-    backgroundColor: '#4CAF50',
+    backgroundColor: '#22C55E',
   },
   micButtonProcessing: {
-    backgroundColor: '#666',
+    backgroundColor: '#555',
+  },
+  voiceButtonsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 16,
+  },
+  stopButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255,107,107,0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,107,107,0.3)',
+    gap: 6,
+  },
+  stopButtonText: {
+    color: '#FF6B6B',
+    fontSize: 13,
+    fontWeight: '600',
   },
   tabsContainer: {
     backgroundColor: '#252525',

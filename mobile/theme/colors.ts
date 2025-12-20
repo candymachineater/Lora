@@ -3,9 +3,9 @@ export const colors = {
   // Primary Colors
   background: '#FFFFFF',
   foreground: '#1C1C1C',
-  cardBackground: '#F8F8F8',
+  cardBackground: '#F5F5F5',
   cardForeground: '#1C1C1C',
-  card: '#F8F8F8',
+  card: '#F5F5F5',
   primary: '#C53307',
   primaryLight: 'rgba(197, 51, 7, 0.1)',
 
@@ -13,11 +13,11 @@ export const colors = {
   secondary: '#F0F0F0',
   secondaryForeground: '#1C1C1C',
   muted: '#F5F5F5',
-  mutedForeground: '#888888',
+  mutedForeground: '#666666',
   textMuted: '#888888',
 
   // Borders & Inputs
-  border: '#E5E5E5',
+  border: '#E0E0E0',
   inputBorder: '#D0D0D0',
   ring: 'rgba(28, 28, 28, 0.1)',
 
@@ -69,4 +69,43 @@ export const radius = {
   lg: 12,
   xl: 16,
   full: 9999,
+};
+
+// Shadow presets for iOS
+export const shadows = {
+  sm: {
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    elevation: 1,
+  },
+  md: {
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+  lg: {
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.15,
+    shadowRadius: 16,
+    elevation: 5,
+  },
+  card: {
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.08,
+    shadowRadius: 12,
+    elevation: 3,
+  },
+  glow: (color: string, opacity = 0.4) => ({
+    shadowColor: color,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: opacity,
+    shadowRadius: 12,
+    elevation: 0,
+  }),
 };
