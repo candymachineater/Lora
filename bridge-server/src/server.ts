@@ -1049,14 +1049,14 @@ wss.on('connection', (ws: WebSocket) => {
                   .replace(/\n/g, '\\n')   // Convert newlines to literal \n
                   .replace(/\r/g, '');     // Remove carriage returns
 
-                // Start Claude with sandbox settings respected (no --dangerously-skip-permissions)
-                const claudeCommand = `claude "${cleanPrompt}"`;
+                // Start Claude with --dangerously-skip-permissions to avoid permission prompts
+                const claudeCommand = `claude --dangerously-skip-permissions "${cleanPrompt}"`;
                 serverLog(`📝 With initial prompt: "${message.initialPrompt.substring(0, 50)}${message.initialPrompt.length > 50 ? '...' : ''}"`);
                 await tmuxService.sendCommand(tmuxSessionName, claudeCommand);
                 await tmuxService.sendEnter(tmuxSessionName);
               } else {
-                // Start Claude with sandbox settings respected
-                await tmuxService.sendCommand(tmuxSessionName, 'claude');
+                // Start Claude with --dangerously-skip-permissions
+                await tmuxService.sendCommand(tmuxSessionName, 'claude --dangerously-skip-permissions');
                 await tmuxService.sendEnter(tmuxSessionName);
               }
               // Register this session so we can reconnect later

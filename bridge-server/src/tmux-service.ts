@@ -189,20 +189,11 @@ exit 0
           ]
         }
       ],
-      // Notification hooks for permission prompts (immediate) and idle detection (60s delay)
+      // Notification hook for idle detection (fires after 60s of waiting for any input)
+      // This covers both regular prompts AND permission prompts that go unanswered
       Notification: [
         {
           matcher: "idle_prompt",
-          hooks: [
-            {
-              type: "command",
-              command: notificationHookCommand,
-              timeout: 5
-            }
-          ]
-        },
-        {
-          matcher: "permission_prompt",
           hooks: [
             {
               type: "command",
@@ -461,58 +452,96 @@ export async function captureOutput(
  * Uses a simple heuristic: find where the command was echoed and return everything after
  */
 export function extractNewOutput(fullOutput: string, previousOutput: string): string {
+  console.log(`[Tmux] extractNewOutput: fullOutput=${fullOutput.length} chars, previousOutput=${previousOutput?.length || 0} chars`);
+
   if (!previousOutput || !previousOutput.trim()) {
+    console.log(`[Tmux] extractNewOutput: No previousOutput, returning full output`);
     return fullOutput;
   }
 
-  // Split into lines for comparison
+  // If outputs are identical, return empty (no new content)
+  if (fullOutput.trim() === previousOutput.trim()) {
+    console.log(`[Tmux] extractNewOutput: Outputs identical, returning empty`);
+    return '';
+  }
+
   const fullLines = fullOutput.split('\n');
   const prevLines = previousOutput.split('\n');
 
-  // Find the last significant line from previous output
-  // Skip empty lines and find a unique line to use as marker
-  let markerLine = '';
-  for (let i = prevLines.length - 1; i >= 0; i--) {
-    const line = prevLines[i].trim();
-    if (line.length > 10 && !line.startsWith('>')) {
-      markerLine = line;
-      break;
-    }
-  }
+  console.log(`[Tmux] extractNewOutput: fullLines=${fullLines.length}, prevLines=${prevLines.length}`);
 
-  if (!markerLine) {
-    // No good marker found, return full output minus the first N lines
-    // This is a fallback heuristic
-    const skipLines = Math.min(prevLines.length - 5, fullLines.length / 2);
-    if (skipLines > 0) {
-      return fullLines.slice(skipLines).join('\n');
-    }
-    return fullOutput;
-  }
-
-  // Find where the marker appears in the full output
-  let markerIndex = -1;
+  // Strategy 1: Find the last command echo ("> ") in full output
+  // Everything after the command echo is the response
+  let lastCommandEchoIdx = -1;
   for (let i = 0; i < fullLines.length; i++) {
-    if (fullLines[i].trim() === markerLine) {
-      markerIndex = i;
-      // Continue to find the LAST occurrence (in case of repeats)
+    const line = fullLines[i].trim();
+    // Look for command echo pattern: starts with ">" followed by the prompt
+    if (line.startsWith('>') && line.length > 3) {
+      lastCommandEchoIdx = i;
     }
   }
 
-  if (markerIndex >= 0 && markerIndex < fullLines.length - 1) {
-    // Return everything after the marker
-    return fullLines.slice(markerIndex + 1).join('\n');
-  }
-
-  // If marker not found, try to find where new content starts by looking for command echo
-  // Commands are echoed with "> " prefix
-  for (let i = fullLines.length - 1; i >= 0; i--) {
-    if (fullLines[i].trim().startsWith('>') && fullLines[i].length > 5) {
-      // Found command echo, return from here
-      return fullLines.slice(i).join('\n');
+  if (lastCommandEchoIdx >= 0 && lastCommandEchoIdx < fullLines.length - 1) {
+    const newContent = fullLines.slice(lastCommandEchoIdx + 1).join('\n').trim();
+    if (newContent.length > 10) {
+      console.log(`[Tmux] extractNewOutput: Found command echo at line ${lastCommandEchoIdx}, returning ${newContent.length} chars`);
+      return newContent;
     }
   }
 
+  // Strategy 2: Compare line by line from the end to find where content diverges
+  // Start from the end of previousOutput and find where it appears in fullOutput
+  const prevLastLines = prevLines.slice(-10).map(l => l.trim()).filter(l => l.length > 5);
+
+  if (prevLastLines.length > 0) {
+    const markerLine = prevLastLines[prevLastLines.length - 1];
+
+    // Find the LAST occurrence of this marker in fullOutput
+    let markerIdx = -1;
+    for (let i = 0; i < fullLines.length; i++) {
+      if (fullLines[i].trim() === markerLine) {
+        markerIdx = i;
+      }
+    }
+
+    if (markerIdx >= 0 && markerIdx < fullLines.length - 1) {
+      const newContent = fullLines.slice(markerIdx + 1).join('\n').trim();
+      if (newContent.length > 10) {
+        console.log(`[Tmux] extractNewOutput: Found marker at line ${markerIdx}, returning ${newContent.length} chars`);
+        return newContent;
+      }
+    }
+  }
+
+  // Strategy 3: Simple line count difference
+  // If fullOutput has more lines than previousOutput, return the extra lines
+  if (fullLines.length > prevLines.length + 2) {
+    const newContent = fullLines.slice(prevLines.length - 5).join('\n').trim();
+    if (newContent.length > 10) {
+      console.log(`[Tmux] extractNewOutput: Line count difference, returning ${newContent.length} chars`);
+      return newContent;
+    }
+  }
+
+  // Strategy 4: Return everything after the input prompt ">"
+  // Look for the most recent prompt-like line
+  for (let i = fullLines.length - 1; i >= Math.max(0, fullLines.length - 50); i--) {
+    const line = fullLines[i];
+    // Check for Claude Code input prompt (empty ">" or with minimal content)
+    if (/^>\s*$/.test(line.trim()) || line.includes('╭─')) {
+      if (i < fullLines.length - 1) {
+        const newContent = fullLines.slice(i + 1).join('\n').trim();
+        if (newContent.length > 10) {
+          console.log(`[Tmux] extractNewOutput: Found prompt at line ${i}, returning ${newContent.length} chars`);
+          return newContent;
+        }
+      }
+    }
+  }
+
+  // Fallback: Return full output rather than nothing
+  // This ensures we always have something to summarize
+  console.log(`[Tmux] extractNewOutput: No extraction strategy worked, returning full output (${fullOutput.length} chars)`);
   return fullOutput;
 }
 
