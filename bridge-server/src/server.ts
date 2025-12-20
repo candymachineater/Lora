@@ -71,6 +71,7 @@ interface Message {
   audioData?: string; // Base64 encoded audio
   audioMimeType?: string; // e.g., 'audio/wav', 'audio/m4a'
   text?: string; // For voice_text (text input instead of audio)
+  screenCapture?: string; // Base64 encoded PNG screenshot of the phone screen
 }
 
 interface ProjectInfo {
@@ -87,7 +88,7 @@ interface FileInfo {
 }
 
 interface StreamResponse {
-  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
+  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ProjectInfo[];
@@ -105,6 +106,12 @@ interface StreamResponse {
   audioMimeType?: string; // e.g., 'audio/mp3'
   voiceAvailable?: { stt: boolean; tts: boolean; agent: boolean }; // Service availability
   voiceEnabled?: boolean; // Voice mode status for terminal
+  // App control from voice agent
+  appControl?: {
+    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot';
+    target?: string; // tab name, button id, etc.
+    params?: Record<string, unknown>;
+  };
   // Preview-related fields
   previewUrl?: string;
   previewPort?: number;
@@ -460,15 +467,9 @@ async function processTerminalVoiceResponse(ws: WebSocket, terminalId: string, r
     // Summarize for voice with session context
     const voiceText = await voiceService.summarizeForVoice(response, terminalId, 'brief');
 
-    console.log('\n💬 VOICE RESPONSE:');
-    console.log(`   "${voiceText}"`);
-
     if (voiceText && voiceText.length > 10) {
       // Generate TTS
       const audioBuffer = await voiceService.textToSpeech(voiceText);
-
-      console.log(`\n🔊 TTS GENERATED: ${audioBuffer.length} bytes`);
-      console.log('   Sending audio to mobile app...');
 
       // Send to client
       const audioResponse: StreamResponse = {
@@ -484,14 +485,8 @@ async function processTerminalVoiceResponse(ws: WebSocket, terminalId: string, r
       if (session) {
         session.voiceLastTTSTime = Date.now();
       }
-
-      console.log('✅ RESPONSE SENT TO USER');
-      console.log('='.repeat(60) + '\n');
-    } else {
-      console.log('   ⚠️ Response too short for TTS, skipping');
     }
   } catch (err) {
-    console.log(`\n❌ TTS ERROR: ${err instanceof Error ? err.message : 'Unknown error'}`);
     serverError('[Voice-Terminal] TTS error:', err);
   }
 }
@@ -875,9 +870,7 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       if (message.type === 'get_files' && message.projectId) {
-        serverLog(`📂 get_files request: projectId=${message.projectId}, subPath=${message.filePath || '(root)'}`);
         const files = getProjectFiles(message.projectId, message.filePath);
-        serverLog(`📂 get_files response: ${files.length} files found`);
         const response: StreamResponse = {
           type: 'files',
           files
@@ -1012,10 +1005,6 @@ wss.on('connection', (ws: WebSocket) => {
               session.voiceAccumulatedOutput += data;
               session.voiceLastOutputTime = Date.now();
             }
-
-            // Log output (truncated)
-            const truncated = data.length > 200 ? data.substring(0, 200) + '...' : data;
-            terminalLog(terminalId, 'OUTPUT', { length: data.length, preview: truncated.replace(/\n/g, '\\n') });
           });
 
           shell.onExit(({ exitCode }) => {
@@ -1073,10 +1062,9 @@ wss.on('connection', (ws: WebSocket) => {
                 await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for prompt to be ready
                 await tmuxService.sendCommand(tmuxSessionName, cleanPrompt);
                 await tmuxService.sendEnter(tmuxSessionName);
-              } else {
-                // Send Enter to refresh the prompt
-                await tmuxService.sendEnter(tmuxSessionName);
               }
+              // Note: Do NOT send any input when reconnecting without an initial prompt.
+              // The PTY will display whatever is already on screen from the tmux session.
             }
           }, 500);
 
@@ -1118,6 +1106,7 @@ wss.on('connection', (ws: WebSocket) => {
         } else {
           const response: StreamResponse = {
             type: 'error',
+            terminalId: message.terminalId,
             error: `Terminal not found: ${message.terminalId}`
           };
           ws.send(JSON.stringify(response));
@@ -1148,6 +1137,7 @@ wss.on('connection', (ws: WebSocket) => {
         if (!session) {
           const response: StreamResponse = {
             type: 'error',
+            terminalId: message.terminalId,
             error: `Terminal not found: ${message.terminalId}`
           };
           ws.send(JSON.stringify(response));
@@ -1159,20 +1149,12 @@ wss.on('connection', (ws: WebSocket) => {
           const audioBuffer = Buffer.from(message.audioData, 'base64');
           const mimeType = message.audioMimeType || 'audio/wav';
 
-          console.log('\n' + '='.repeat(60));
-          console.log('📥 VOICE INPUT RECEIVED');
-          console.log('='.repeat(60));
-          console.log(`   Audio size: ${audioBuffer.length} bytes`);
-          console.log(`   MIME type: ${mimeType}`);
-          console.log(`   Idle waiting: ${session.voiceIdleWaiting}`);
 
           // Cooldown check - ignore audio that comes too soon after we sent TTS
           // This prevents picking up our own audio playback
           const TTS_COOLDOWN_MS = 3000; // 3 seconds after TTS before accepting new audio
           const timeSinceTTS = Date.now() - session.voiceLastTTSTime;
           if (session.voiceLastTTSTime > 0 && timeSinceTTS < TTS_COOLDOWN_MS) {
-            console.log(`   ⏳ Cooldown active (${timeSinceTTS}ms < ${TTS_COOLDOWN_MS}ms), waiting for user...`);
-            console.log('='.repeat(60) + '\n');
             return;
           }
 
@@ -1180,27 +1162,49 @@ wss.on('connection', (ws: WebSocket) => {
           // M4A typically needs at least ~20KB for a second of speech
           const MIN_AUDIO_SIZE = 15000; // 15KB minimum
           if (audioBuffer.length < MIN_AUDIO_SIZE) {
-            console.log(`   ⚠️ Audio too small (${audioBuffer.length} < ${MIN_AUDIO_SIZE}), likely noise`);
-            console.log('='.repeat(60) + '\n');
             return;
           }
 
           const transcription = await voiceService.transcribeAudio(audioBuffer, mimeType);
 
-          console.log('\n📝 TRANSCRIPTION:');
-          console.log(`   "${transcription}"`);
-
           if (!transcription || !transcription.trim()) {
-            console.log('   ⚠️ Empty transcription, ignoring');
+            serverLog('[Voice] Empty transcription, ignoring');
             return;
           }
 
-          // If the transcription is very short (1-2 words) and we're in idle waiting,
-          // require more substantial input
+          // Filter out common Whisper hallucinations on silence/noise
+          const WHISPER_HALLUCINATIONS = [
+            'thank you for watching',
+            'thanks for watching',
+            'subscribe',
+            'like and subscribe',
+            'see you next time',
+            'goodbye',
+            'thank you',
+            'you',
+            'bye',
+            'the end',
+            '...',
+            'hmm',
+            'um',
+            'uh',
+          ];
+          const lowerTrim = transcription.toLowerCase().trim();
+          if (WHISPER_HALLUCINATIONS.some(h => lowerTrim === h || lowerTrim === h + '.')) {
+            serverLog(`[Voice] Filtered Whisper hallucination: "${transcription}"`);
+            return;
+          }
+
+          // Require minimum word count for meaningful input (at least 2 words)
           const wordCount = transcription.trim().split(/\s+/).length;
-          if (session.voiceIdleWaiting && wordCount <= 2) {
-            console.log(`   ⚠️ Short input while idle (${wordCount} words), waiting for more speech`);
-            console.log('='.repeat(60) + '\n');
+          if (wordCount < 2) {
+            serverLog(`[Voice] Too short (${wordCount} word): "${transcription}"`);
+            return;
+          }
+
+          // If we're in idle waiting after TTS, require more substantial input (3+ words)
+          if (session.voiceIdleWaiting && wordCount < 3) {
+            serverLog(`[Voice] Waiting for more substantial input (got ${wordCount} words)`);
             return;
           }
 
@@ -1219,8 +1223,6 @@ wss.on('connection', (ws: WebSocket) => {
                                    currentHookState.state === 'processing' ? 'still processing' :
                                    currentHookState.state === 'stopped' ? 'session ended' : 'unknown';
 
-          console.log(`   Claude state (hooks): ${currentHookState.state} (${stateDescription})`);
-
           // Smart handling based on Claude's current state
           // If Claude is waiting for confirmation and user says yes/no, handle directly
           if (currentHookState.state === 'permission') {
@@ -1230,7 +1232,6 @@ wss.on('connection', (ws: WebSocket) => {
 
             if (isYes || isNo) {
               const response = isYes ? 'y' : 'n';
-              console.log(`\n⚡ DIRECT CONFIRMATION: User said "${transcription}" → sending "${response}"`);
 
               // Capture output before sending confirmation
               const outputBeforeConfirm = await tmuxService.captureOutput(session.tmuxSessionName, 100);
@@ -1260,8 +1261,6 @@ wss.on('connection', (ws: WebSocket) => {
               ws.send(JSON.stringify(audioResponse));
               session.voiceLastTTSTime = Date.now();
               session.voiceIdleWaiting = true;
-
-              console.log('='.repeat(60) + '\n');
               return;
             }
           }
@@ -1272,7 +1271,6 @@ wss.on('connection', (ws: WebSocket) => {
             const wantsInterrupt = /^(stop|cancel|interrupt|abort|ctrl.?c|nevermind|never mind)/.test(lowerTranscript);
 
             if (wantsInterrupt) {
-              console.log(`\n⚡ INTERRUPT REQUEST: User said "${transcription}" → sending Ctrl+C`);
 
               await tmuxService.sendControlKey(session.tmuxSessionName, 'c');
 
@@ -1288,8 +1286,6 @@ wss.on('connection', (ws: WebSocket) => {
               ws.send(JSON.stringify(audioResponse));
               session.voiceLastTTSTime = Date.now();
               session.voiceIdleWaiting = true;
-
-              console.log('='.repeat(60) + '\n');
               return;
             }
           }
@@ -1302,27 +1298,20 @@ wss.on('connection', (ws: WebSocket) => {
             {
               projectName: projectMeta?.name,
               recentOutput: session.voiceAccumulatedOutput.slice(-500),
-              claudeCodeState: stateDescription
+              claudeCodeState: stateDescription,
+              screenCapture: message.screenCapture  // Phone screenshot if provided
             }
           );
 
-          console.log(`\n🤖 VOICE AGENT: ${agentResponse.type}`);
-          console.log(`   Content: "${agentResponse.content}"`);
-
           // Handle IGNORE - transcription artifacts, noise
           if (agentResponse.type === 'ignore') {
-            console.log('   ⚠️ Voice agent says ignore (artifact/noise)');
-            console.log('='.repeat(60) + '\n');
             return;
           }
 
           // Handle CONVERSATIONAL - greetings, thanks, etc.
           if (agentResponse.type === 'conversational') {
-            console.log('\n💬 CONVERSATIONAL RESPONSE:');
-            console.log(`   "${agentResponse.content}"`);
 
             const ttsAudioBuffer = await voiceService.textToSpeech(agentResponse.content);
-            console.log(`\n🔊 TTS GENERATED: ${ttsAudioBuffer.length} bytes`);
 
             const audioResponse: StreamResponse = {
               type: 'voice_terminal_speaking',
@@ -1336,44 +1325,127 @@ wss.on('connection', (ws: WebSocket) => {
             // Set TTS cooldown and enter idle state
             session.voiceLastTTSTime = Date.now();
             session.voiceIdleWaiting = true;
-            console.log('   🛋️ Entering idle state - waiting for user input');
-            console.log('='.repeat(60) + '\n');
             return;
           }
 
           // Handle CONTROL - terminal/Claude Code control commands
           if (agentResponse.type === 'control') {
-            const controlAction = agentResponse.content;
-            console.log(`\n🎮 CONTROL COMMAND: ${controlAction}`);
+            const tmuxName = session.tmuxSessionName;
 
-            let responseText = '';
+            // Helper function to execute a single control action
+            async function executeControl(action: string): Promise<string> {
+              let controlAction = action.trim();
+              let repeatCount = 1;
 
-            switch (controlAction) {
-              case 'CTRL_C':
-                await tmuxService.sendControlKey(session.tmuxSessionName, 'c');
-                responseText = 'Interrupted. The current operation has been cancelled.';
-                break;
-              case 'ESCAPE':
-                await tmuxService.sendSpecialKey(session.tmuxSessionName, 'Escape');
-                responseText = 'Cancelled.';
-                break;
-              case 'SLASH_CLEAR':
-                await tmuxService.sendCommand(session.tmuxSessionName, '/clear');
-                await tmuxService.sendEnter(session.tmuxSessionName);
-                responseText = 'Conversation cleared. Starting fresh.';
-                break;
-              case 'SLASH_HELP':
-                await tmuxService.sendCommand(session.tmuxSessionName, '/help');
-                await tmuxService.sendEnter(session.tmuxSessionName);
-                responseText = 'Showing help.';
-                break;
-              case 'RESTART':
-                await tmuxService.restartClaude(session.tmuxSessionName);
-                responseText = 'Restarting Claude Code.';
-                break;
-              default:
-                responseText = `Control action: ${controlAction}`;
+              // Parse repeat count (e.g., "DOWN:3" means press down 3 times)
+              if (controlAction.includes(':') && !controlAction.startsWith('/')) {
+                const parts = controlAction.split(':');
+                controlAction = parts[0];
+                const count = parseInt(parts[1], 10);
+                if (!isNaN(count)) {
+                  repeatCount = Math.min(count, 10); // Cap at 10 to prevent abuse
+                }
+              }
+
+              // Handle WAIT command
+              if (controlAction === 'WAIT') {
+                const waitSeconds = Math.min(repeatCount, 10); // Cap at 10 seconds
+                await new Promise(r => setTimeout(r, waitSeconds * 1000));
+                return `Waited ${waitSeconds} second${waitSeconds > 1 ? 's' : ''}.`;
+              }
+
+              // Handle slash commands directly (agent may send them as /command)
+              if (controlAction.startsWith('/')) {
+                await tmuxService.sendCommand(tmuxName, controlAction);
+                await tmuxService.sendEnter(tmuxName);
+                return `Sent ${controlAction}.`;
+              }
+
+              switch (controlAction) {
+                case 'CTRL_C':
+                  await tmuxService.sendControlKey(tmuxName, 'c');
+                  return 'Interrupted.';
+                case 'ESCAPE':
+                  await tmuxService.sendSpecialKey(tmuxName, 'Escape');
+                  return 'Escaped.';
+                case 'ESCAPE_ESCAPE':
+                  await tmuxService.sendSpecialKey(tmuxName, 'Escape');
+                  await new Promise(resolve => setTimeout(resolve, 100));
+                  await tmuxService.sendSpecialKey(tmuxName, 'Escape');
+                  return 'Opening rewind menu.';
+                case 'YES':
+                  await tmuxService.sendCommand(tmuxName, 'y');
+                  await tmuxService.sendEnter(tmuxName);
+                  return 'Confirmed.';
+                case 'NO':
+                  await tmuxService.sendCommand(tmuxName, 'n');
+                  await tmuxService.sendEnter(tmuxName);
+                  return 'Declined.';
+                case 'SLASH_CLEAR':
+                  await tmuxService.sendCommand(tmuxName, '/clear');
+                  await tmuxService.sendEnter(tmuxName);
+                  return 'Cleared.';
+                case 'SLASH_HELP':
+                  await tmuxService.sendCommand(tmuxName, '/help');
+                  await tmuxService.sendEnter(tmuxName);
+                  return 'Showing help.';
+                case 'RESTART':
+                  await tmuxService.restartClaude(tmuxName);
+                  return 'Restarting.';
+                case 'UP':
+                case 'ARROW_UP':
+                  for (let i = 0; i < repeatCount; i++) {
+                    await tmuxService.sendSpecialKey(tmuxName, 'Up');
+                    if (repeatCount > 1) await new Promise(r => setTimeout(r, 50));
+                  }
+                  return repeatCount > 1 ? `Up ${repeatCount}x.` : 'Up.';
+                case 'DOWN':
+                case 'ARROW_DOWN':
+                  for (let i = 0; i < repeatCount; i++) {
+                    await tmuxService.sendSpecialKey(tmuxName, 'Down');
+                    if (repeatCount > 1) await new Promise(r => setTimeout(r, 50));
+                  }
+                  return repeatCount > 1 ? `Down ${repeatCount}x.` : 'Down.';
+                case 'LEFT':
+                case 'ARROW_LEFT':
+                  for (let i = 0; i < repeatCount; i++) {
+                    await tmuxService.sendSpecialKey(tmuxName, 'Left');
+                    if (repeatCount > 1) await new Promise(r => setTimeout(r, 50));
+                  }
+                  return repeatCount > 1 ? `Left ${repeatCount}x.` : 'Left.';
+                case 'RIGHT':
+                case 'ARROW_RIGHT':
+                  for (let i = 0; i < repeatCount; i++) {
+                    await tmuxService.sendSpecialKey(tmuxName, 'Right');
+                    if (repeatCount > 1) await new Promise(r => setTimeout(r, 50));
+                  }
+                  return repeatCount > 1 ? `Right ${repeatCount}x.` : 'Right.';
+                case 'ENTER':
+                  await tmuxService.sendEnter(tmuxName);
+                  return 'Enter.';
+                case 'TAB':
+                  for (let i = 0; i < repeatCount; i++) {
+                    await tmuxService.sendSpecialKey(tmuxName, 'Tab');
+                    if (repeatCount > 1) await new Promise(r => setTimeout(r, 50));
+                  }
+                  return repeatCount > 1 ? `Tab ${repeatCount}x.` : 'Tab.';
+                default:
+                  return `Unknown: ${controlAction}`;
+              }
             }
+
+            // Parse and execute multiple commands separated by commas
+            const commands = agentResponse.content.split(',').map(c => c.trim()).filter(c => c);
+            const results: string[] = [];
+
+            for (const cmd of commands) {
+              const result = await executeControl(cmd);
+              results.push(result);
+            }
+
+            const responseText = results.length > 1
+              ? `Done: ${results.join(' ')}`
+              : results[0] || 'Done.';
 
             // Generate voice response for control action
             const ttsAudio = await voiceService.textToSpeech(responseText);
@@ -1389,9 +1461,34 @@ wss.on('connection', (ws: WebSocket) => {
             // Set TTS cooldown and enter idle state
             session.voiceLastTTSTime = Date.now();
             session.voiceIdleWaiting = true;
-            console.log(`   ✓ Control action executed: ${responseText}`);
-            console.log('   🛋️ Entering idle state - waiting for user input');
-            console.log('='.repeat(60) + '\n');
+            return;
+          }
+
+          // Handle APP_CONTROL - control the mobile app UI
+          if (agentResponse.type === 'app_control' && agentResponse.appAction) {
+            // Send app control command to mobile app
+            const appControlResponse: StreamResponse = {
+              type: 'voice_app_control',
+              terminalId: message.terminalId,
+              responseText: agentResponse.content,
+              appControl: agentResponse.appAction
+            };
+            ws.send(JSON.stringify(appControlResponse));
+
+            // Also send voice response
+            const ttsAudio = await voiceService.textToSpeech(agentResponse.content);
+            const audioResponse: StreamResponse = {
+              type: 'voice_terminal_speaking',
+              terminalId: message.terminalId,
+              responseText: agentResponse.content,
+              audioData: ttsAudio.toString('base64'),
+              audioMimeType: 'audio/mp3'
+            };
+            ws.send(JSON.stringify(audioResponse));
+
+            // Set TTS cooldown
+            session.voiceLastTTSTime = Date.now();
+            session.voiceIdleWaiting = true;
             return;
           }
 
@@ -1415,17 +1512,10 @@ wss.on('connection', (ws: WebSocket) => {
           const outputBeforeCommand = await tmuxService.captureOutput(session.tmuxSessionName, 100);
 
           // Send the translated command to Claude Code via tmux
-          console.log('\n⌨️ SENDING TO TMUX:');
-          console.log(`   Session: ${session.tmuxSessionName}`);
-          console.log(`   Prompt: "${promptText}"`);
-
           // Use tmux send-keys for reliable command execution
           await tmuxService.sendCommand(session.tmuxSessionName, promptText);
           await new Promise(resolve => setTimeout(resolve, 50)); // Small delay
           await tmuxService.sendEnter(session.tmuxSessionName);
-
-          console.log('   ✓ Command sent with Enter key');
-          console.log('\n⏳ WAITING FOR CLAUDE CODE TO COMPLETE (using hooks)...');
 
           // Wait for Claude Code using hook-based state detection
           // Pass previousOutput so we can filter out old content from the response
@@ -1440,19 +1530,8 @@ wss.on('connection', (ws: WebSocket) => {
           // Extract the response from the raw output
           const claudeResponse = tmuxService.extractClaudeResponse(claudeState.rawOutput);
 
-          console.log('\n' + '='.repeat(60));
-          console.log('📤 CLAUDE CODE RESPONSE DETECTED');
-          console.log('='.repeat(60));
-          console.log(`   Ready: ${claudeState.isReady}`);
-          console.log(`   Processing: ${claudeState.isProcessing}`);
-          console.log(`   Waiting confirm: ${claudeState.isWaitingConfirm}`);
-          console.log(`   Hook state: ${claudeState.state}`);
-          console.log(`   Used hooks: ${claudeState.usedHooks}`);
-          console.log(`   Response length: ${claudeResponse.length} chars`);
-
           if (claudeState.isWaitingConfirm) {
             // Claude is asking for confirmation - need to tell user
-            console.log('\n❓ CLAUDE IS ASKING FOR CONFIRMATION');
             const confirmText = 'Claude is asking for confirmation. Please say yes or no.';
             const ttsAudio = await voiceService.textToSpeech(confirmText);
             const confirmResponse: StreamResponse = {
@@ -1466,18 +1545,12 @@ wss.on('connection', (ws: WebSocket) => {
             session.voiceLastTTSTime = Date.now();
             session.voiceIdleWaiting = true;
           } else if (claudeResponse && claudeResponse.length > 50) {
-            console.log(`   Content preview:`);
-            console.log('   ' + claudeResponse.substring(0, 300).replace(/\n/g, '\n   '));
-            console.log('\n🔄 SUMMARIZING FOR VOICE...');
-
             // Generate voice response
             await processTerminalVoiceResponse(ws, message.terminalId, claudeResponse, session);
 
             // Enter idle state - wait for user to speak next
             session.voiceIdleWaiting = true;
-            console.log('   🛋️ Entering idle state - waiting for user input');
           } else {
-            console.log('\n⚠️ No substantial response from Claude Code');
             // Provide feedback that task completed
             const doneText = 'Done. What would you like me to do next?';
             const ttsAudio = await voiceService.textToSpeech(doneText);
@@ -1493,11 +1566,8 @@ wss.on('connection', (ws: WebSocket) => {
             session.voiceIdleWaiting = true;
           }
 
-          console.log('='.repeat(60) + '\n');
-
         } catch (err) {
           serverError('[Voice-Terminal] Processing error:', err);
-          console.log(`\n❌ ERROR: ${err instanceof Error ? err.message : 'Unknown error'}`);
           const response: StreamResponse = {
             type: 'error',
             error: `Voice processing failed: ${err instanceof Error ? err.message : 'Unknown error'}`
@@ -1641,7 +1711,6 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       // Voice session management
-      serverLog(`[DEBUG] Message type: ${message.type}, projectId: ${message.projectId}, voiceSessionId: ${message.voiceSessionId}`);
 
       if (message.type === 'voice_status') {
         const response: StreamResponse = {

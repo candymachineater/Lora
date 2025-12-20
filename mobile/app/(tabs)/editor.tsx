@@ -79,7 +79,6 @@ export default function EditorScreen() {
   // silent: when true, don't manage isRefreshing state (caller handles it)
   const fetchRootFiles = useCallback(async (silent: boolean = false) => {
     const rootFiles = await fetchFiles(undefined, false, silent);
-    console.log(`[Editor] fetchRootFiles received ${rootFiles.length} files:`, rootFiles.map(f => f.name));
     setFiles(rootFiles);
     return rootFiles;
   }, [fetchFiles]);

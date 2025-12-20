@@ -21,6 +21,7 @@ import { EventEmitter } from 'events';
 // State file location pattern
 const STATE_DIR = '/tmp';
 const STATE_FILE_PREFIX = 'lora-claude-state-';
+const HOOKS_READY_PREFIX = 'lora-hooks-ready-';
 
 /**
  * Claude Code state as reported by hooks
@@ -77,6 +78,55 @@ class ClaudeStateService extends EventEmitter {
    */
   getStateFilePath(sessionName: string): string {
     return path.join(STATE_DIR, `${STATE_FILE_PREFIX}${sessionName}.json`);
+  }
+
+  /**
+   * Get the hooks ready marker file path for a session
+   */
+  getHooksReadyFilePath(sessionName: string): string {
+    return path.join(STATE_DIR, `${HOOKS_READY_PREFIX}${sessionName}`);
+  }
+
+  /**
+   * Check if hooks are working for a session
+   * Returns true if SessionStart hook has fired (marker file exists)
+   */
+  areHooksWorking(sessionName: string): boolean {
+    const hooksReadyFile = this.getHooksReadyFilePath(sessionName);
+    const exists = fs.existsSync(hooksReadyFile);
+    console.log(`${this.logPrefix} [areHooksWorking] ${sessionName}: ${exists ? 'YES' : 'NO'} (file: ${hooksReadyFile})`);
+    return exists;
+  }
+
+  /**
+   * Get the timestamp when hooks became ready (for debugging)
+   */
+  getHooksReadyTimestamp(sessionName: string): number | null {
+    const hooksReadyFile = this.getHooksReadyFilePath(sessionName);
+    if (!fs.existsSync(hooksReadyFile)) {
+      return null;
+    }
+    try {
+      const content = fs.readFileSync(hooksReadyFile, 'utf-8').trim();
+      return parseInt(content, 10);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Clear the hooks ready marker (call when session ends)
+   */
+  clearHooksReadyMarker(sessionName: string): void {
+    const hooksReadyFile = this.getHooksReadyFilePath(sessionName);
+    if (fs.existsSync(hooksReadyFile)) {
+      try {
+        fs.unlinkSync(hooksReadyFile);
+        console.log(`${this.logPrefix} Cleared hooks ready marker for ${sessionName}`);
+      } catch (err) {
+        console.log(`${this.logPrefix} Failed to clear hooks ready marker:`, err);
+      }
+    }
   }
 
   /**
@@ -392,6 +442,9 @@ class ClaudeStateService extends EventEmitter {
         console.log(`${this.logPrefix} Failed to clean up state file:`, err);
       }
     }
+
+    // Also clean up hooks ready marker
+    this.clearHooksReadyMarker(sessionName);
   }
 
   /**

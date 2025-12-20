@@ -78,7 +78,14 @@ class BridgeService {
         this.ws.onmessage = (event) => {
           try {
             const response: WSResponse = JSON.parse(event.data);
-            console.log(`[Bridge] Received message type: ${response.type}`);
+            // Only log important messages to reduce noise (skip high-frequency polling responses)
+            if (response.type !== 'terminal_output' && response.type !== 'pong' && response.type !== 'files') {
+              if (response.type === 'error') {
+                console.error(`[Bridge] error: ${response.error || 'Unknown error'}`);
+              } else {
+                console.log(`[Bridge] ${response.type}`);
+              }
+            }
             this.handleResponse(response, resolve);
           } catch (err) {
             console.error('[Bridge] Failed to parse message:', err);
@@ -124,6 +131,13 @@ class BridgeService {
         break;
 
       case 'error':
+        // Route terminal-specific errors to voice terminal callbacks
+        if (response.terminalId) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          if (vtCallbacks?.onError) {
+            vtCallbacks.onError(response.error || 'Unknown error');
+          }
+        }
         this.onErrorCallback?.(response.error || 'Unknown error');
         break;
 
@@ -139,16 +153,12 @@ class BridgeService {
         break;
 
       case 'files':
-        console.log(`[Bridge] Received 'files' response: ${response.files?.length || 0} files`);
         if (response.files) {
           this.onFilesCallback?.(response.files);
           const resolver = this.pendingResolvers.get('files');
           if (resolver) {
-            console.log('[Bridge] Resolving pending files promise');
             resolver(response.files);
             this.pendingResolvers.delete('files');
-          } else {
-            console.log('[Bridge] No pending files resolver found');
           }
         }
         break;
@@ -160,7 +170,6 @@ class BridgeService {
         break;
 
       case 'file_saved':
-        console.log(`[Bridge] File saved: ${response.filePath}`);
         this.pendingResolvers.get('file_saved')?.(response.filePath);
         this.pendingResolvers.delete('file_saved');
         break;
@@ -267,6 +276,13 @@ class BridgeService {
         }
         break;
 
+      case 'voice_app_control':
+        if (response.terminalId && response.appControl) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          vtCallbacks?.onAppControl?.(response.appControl);
+        }
+        break;
+
       case 'voice_progress':
         // Handle progress for both voice sessions and voice-terminal
         if (response.voiceSessionId && response.responseText) {
@@ -320,7 +336,6 @@ class BridgeService {
 
       case 'preview_error':
         if (response.projectId && response.previewError) {
-          console.log(`[Bridge] Preview error for ${response.projectId}: ${response.previewError}`);
           const errorCallback = this.previewErrorCallbacks.get(response.projectId);
           if (errorCallback) {
             errorCallback(response.previewError, response.previewErrorType || 'error');
@@ -394,10 +409,7 @@ class BridgeService {
 
   private send(message: WSMessage) {
     if (this.isConnected()) {
-      console.log(`[Bridge] Sending message: ${message.type}`);
       this.ws?.send(JSON.stringify(message));
-    } else {
-      console.log(`[Bridge] Cannot send message ${message.type}: not connected (state=${this.ws?.readyState})`);
     }
   }
 
@@ -466,16 +478,13 @@ class BridgeService {
 
   async getFiles(projectId: string, subPath?: string): Promise<ProjectFile[]> {
     return new Promise((resolve, reject) => {
-      console.log(`[Bridge] getFiles called: projectId=${projectId}, subPath=${subPath || '(root)'}`);
       if (!this.isConnected()) {
-        console.log('[Bridge] getFiles failed: not connected');
         reject(new Error('Not connected'));
         return;
       }
 
       // Cancel any existing pending files request AND its timeout
       if (this.pendingResolvers.has('files')) {
-        console.log('[Bridge] getFiles: cancelling previous pending request');
         this.pendingResolvers.delete('files');
       }
       if (this.filesTimeoutId) {
@@ -486,9 +495,7 @@ class BridgeService {
       // Generate unique request ID to prevent stale timeout issues
       const requestId = ++this.filesRequestId;
 
-      console.log('[Bridge] Sending get_files message...');
       this.pendingResolvers.set('files', (files) => {
-        console.log(`[Bridge] getFiles response received: ${files?.length || 0} files`);
         if (this.filesTimeoutId) {
           clearTimeout(this.filesTimeoutId);
           this.filesTimeoutId = null;
@@ -500,7 +507,6 @@ class BridgeService {
       this.filesTimeoutId = setTimeout(() => {
         // Only timeout if this is still the current request
         if (requestId === this.filesRequestId && this.pendingResolvers.has('files')) {
-          console.log('[Bridge] getFiles timeout - no response received after 30s');
           this.pendingResolvers.delete('files');
           reject(new Error('Timeout getting files'));
         }
@@ -532,7 +538,6 @@ class BridgeService {
         reject(new Error('Not connected'));
         return;
       }
-      console.log(`[Bridge] Saving file: ${filePath}`);
       this.pendingResolvers.set('file_saved', resolve);
       this.send({ type: 'save_file', projectId, filePath, content });
       setTimeout(() => {
@@ -680,7 +685,6 @@ class BridgeService {
   }
 
   sendVoiceAudio(voiceSessionId: string, audioData: string, mimeType: string = 'audio/wav') {
-    console.log(`[Bridge] Sending voice audio: ${audioData.length} chars, type: ${mimeType}`);
     this.send({
       type: 'voice_audio',
       voiceSessionId,
@@ -690,7 +694,6 @@ class BridgeService {
   }
 
   sendVoiceText(voiceSessionId: string, text: string) {
-    console.log(`[Bridge] Sending voice text: "${text}"`);
     this.send({
       type: 'voice_text',
       voiceSessionId,
@@ -735,6 +738,7 @@ class BridgeService {
     onTranscription?: (text: string) => void;
     onProgress?: (text: string) => void;
     onSpeaking?: (text: string, audioData: string) => void;
+    onAppControl?: (control: { action: string; target?: string; params?: Record<string, unknown> }) => void;
     onEnabled?: () => void;
     onDisabled?: () => void;
     onError?: (error: string) => void;
@@ -746,6 +750,7 @@ class BridgeService {
       onTranscription?: (text: string) => void;
       onProgress?: (text: string) => void;
       onSpeaking?: (text: string, audioData: string) => void;
+      onAppControl?: (control: { action: string; target?: string; params?: Record<string, unknown> }) => void;
       onEnabled?: () => void;
       onDisabled?: () => void;
       onError?: (error: string) => void;
@@ -760,13 +765,13 @@ class BridgeService {
     this.voiceTerminalCallbacks.delete(terminalId);
   }
 
-  sendVoiceAudioToTerminal(terminalId: string, audioData: string, mimeType: string = 'audio/wav') {
-    console.log(`[Bridge] Sending voice audio to terminal: ${audioData.length} chars`);
+  sendVoiceAudioToTerminal(terminalId: string, audioData: string, mimeType: string = 'audio/wav', screenCapture?: string) {
     this.send({
       type: 'voice_terminal_audio',
       terminalId,
       audioData,
-      audioMimeType: mimeType
+      audioMimeType: mimeType,
+      screenCapture  // Base64 PNG of phone screen for vision
     });
   }
 
@@ -784,7 +789,6 @@ class BridgeService {
         return;
       }
 
-      console.log(`[Bridge] Starting preview for project: ${projectId}`);
 
       // Register error callback if provided
       if (onError) {
@@ -819,7 +823,6 @@ class BridgeService {
         return;
       }
 
-      console.log(`[Bridge] Stopping preview for project: ${projectId}`);
 
       this.pendingResolvers.set('preview_stopped', (response: { stopped: boolean }) => {
         resolve(response.stopped);

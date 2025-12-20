@@ -267,7 +267,21 @@ const XTERM_HTML = `<!DOCTYPE html>
             term.blur();
             break;
           case 'scrollToBottom':
+            console.log('[Terminal] scrollToBottom called');
+            sendToReactNative({ type: 'debug', msg: 'scrollToBottom executed' });
             term.scrollToBottom();
+            break;
+          case 'scrollToTop':
+            console.log('[Terminal] scrollToTop called');
+            sendToReactNative({ type: 'debug', msg: 'scrollToTop executed' });
+            term.scrollToTop();
+            break;
+          case 'scrollLines':
+            console.log('[Terminal] scrollLines called with:', data.lines);
+            sendToReactNative({ type: 'debug', msg: 'scrollLines: ' + data.lines + ', buffer length: ' + term.buffer.active.length });
+            if (typeof data.lines === 'number') {
+              term.scrollLines(data.lines);
+            }
             break;
           case 'paste':
             if (data.text) {
@@ -311,36 +325,6 @@ export function Terminal({
   const isReadyRef = useRef<boolean>(false);
   const pendingOutputRef = useRef<string>('');
 
-  // Scroll terminal by lines
-  const scrollTerminal = useCallback((lines: number) => {
-    if (webViewRef.current && isReadyRef.current) {
-      const script = `term.scrollLines(${lines}); true;`;
-      webViewRef.current.injectJavaScript(script);
-    }
-  }, []);
-
-  // Scroll button handlers
-  const handleScrollUp = useCallback(() => {
-    scrollTerminal(-5); // Scroll up 5 lines
-  }, [scrollTerminal]);
-
-  const handleScrollDown = useCallback(() => {
-    scrollTerminal(5); // Scroll down 5 lines
-  }, [scrollTerminal]);
-
-  const handleScrollToTop = useCallback(() => {
-    if (webViewRef.current && isReadyRef.current) {
-      webViewRef.current.injectJavaScript('term.scrollToTop(); true;');
-    }
-  }, []);
-
-  const handleScrollToBottom = useCallback(() => {
-    if (webViewRef.current && isReadyRef.current) {
-      webViewRef.current.injectJavaScript('term.scrollToBottom(); true;');
-    }
-  }, []);
-
-
   // Send message to WebView
   const sendToWebView = useCallback((message: object) => {
     if (webViewRef.current && isReadyRef.current) {
@@ -348,6 +332,23 @@ export function Terminal({
       webViewRef.current.injectJavaScript(script);
     }
   }, []);
+
+  // Scroll button handlers - use sendToWebView to route through handleReactNativeMessage
+  const handleScrollUp = useCallback(() => {
+    sendToWebView({ type: 'scrollLines', lines: -5 });
+  }, [sendToWebView]);
+
+  const handleScrollDown = useCallback(() => {
+    sendToWebView({ type: 'scrollLines', lines: 5 });
+  }, [sendToWebView]);
+
+  const handleScrollToTop = useCallback(() => {
+    sendToWebView({ type: 'scrollToTop' });
+  }, [sendToWebView]);
+
+  const handleScrollToBottom = useCallback(() => {
+    sendToWebView({ type: 'scrollToBottom' });
+  }, [sendToWebView]);
 
   // Handle new output - only send the delta, or clear if output is reset
   useEffect(() => {
@@ -408,7 +409,7 @@ export function Terminal({
           // Terminal is initialized, wait for ready
           break;
         case 'debug':
-          console.log('[XTERM Debug]', data.msg);
+          // Debug logging disabled to reduce noise
           break;
       }
     } catch (e) {

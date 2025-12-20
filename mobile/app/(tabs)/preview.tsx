@@ -26,7 +26,7 @@ import {
   AlertTriangle,
   Info,
 } from 'lucide-react-native';
-import { useProjectStore } from '../../stores';
+import { useProjectStore, useSettingsStore } from '../../stores';
 import { createSnack, createEmbeddedSnackUrl } from '../../services/bundler';
 import { bridgeService } from '../../services/claude';
 import { PreviewFrame, DeviceFrame, ConsoleMessage } from '../../components/preview';
@@ -39,6 +39,7 @@ const MAX_CONSOLE_MESSAGES = 100;
 export default function PreviewScreen() {
   const router = useRouter();
   const { currentProject } = useProjectStore();
+  const { isConnected } = useSettingsStore();
   const lastProjectIdRef = useRef<string | null>(null);
 
   const [snackUrl, setSnackUrl] = useState<string | null>(null);
@@ -113,6 +114,12 @@ export default function PreviewScreen() {
 
   const handleGeneratePreview = async () => {
     if (!project) return;
+
+    // Don't try to start preview if not connected
+    if (!bridgeService.isConnected()) {
+      console.log('[Preview] Not connected to bridge, skipping preview start');
+      return;
+    }
 
     setLoading(true);
     setError(null);
@@ -241,12 +248,12 @@ export default function PreviewScreen() {
     setLoading(false);
   }, [project?.id]);
 
-  // Auto-generate preview after reset
+  // Auto-generate preview after reset (only when connected)
   useEffect(() => {
-    if (project && !snackUrl && !loading) {
+    if (project && !snackUrl && !loading && isConnected) {
       handleGeneratePreview();
     }
-  }, [project?.id, snackUrl]);
+  }, [project?.id, snackUrl, isConnected]);
 
   const getMessageIcon = (type: ConsoleMessage['type']) => {
     switch (type) {

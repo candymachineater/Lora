@@ -73,10 +73,11 @@ export interface WSMessage {
   audioData?: string; // Base64 encoded audio
   audioMimeType?: string; // e.g., 'audio/wav', 'audio/m4a'
   text?: string; // For voice_text (text input instead of audio)
+  screenCapture?: string; // Base64 PNG screenshot of phone screen
 }
 
 export interface WSResponse {
-  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
+  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ServerProject[];
@@ -94,6 +95,12 @@ export interface WSResponse {
   audioMimeType?: string; // e.g., 'audio/mp3'
   voiceAvailable?: { stt: boolean; tts: boolean; agent: boolean }; // Service availability
   voiceEnabled?: boolean; // Voice mode status for terminal
+  // App control from voice agent
+  appControl?: {
+    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot';
+    target?: string; // tab name, button id, etc.
+    params?: Record<string, unknown>;
+  };
   // Preview-related fields
   previewUrl?: string;
   previewPort?: number;

@@ -14,6 +14,12 @@ Lora is a personal iOS app that provides a **terminal interface** to Claude Code
 
 ## Commands
 
+### Unified Development (from project root)
+```bash
+npm run dev              # Start both bridge server and Expo with tunnel (recommended)
+npm run install:all      # Install dependencies for all packages
+```
+
 ### Mobile App (mobile/)
 ```bash
 npm install              # Install dependencies
@@ -108,10 +114,26 @@ sudo ufw allow 8765/tcp
 
 **Voice Service** (`src/voice-service.ts`):
 - Speech-to-text via OpenAI Whisper API
-- Text-to-speech via OpenAI TTS API
-- Voice agent powered by Claude Sonnet for intent classification
-- Conversation memory for context-aware interactions
-- Four response types: `prompt`, `control`, `conversational`, `ignore`
+- Text-to-speech via OpenAI TTS API (nova voice)
+- Voice agent powered by Claude Haiku 4.5 for intent classification
+- Conversation memory with auto-compaction at 200k tokens
+- Screen capture support (receives phone screenshots for vision context)
+- Five response types: `prompt`, `control`, `conversational`, `ignore`, `app_control`
+- App control allows voice agent to navigate tabs and interact with mobile UI
+
+**Claude State Service** (`src/claude-state-service.ts`):
+- Hook-based Claude Code state detection (more reliable than pattern matching)
+- Watches `/tmp/lora-claude-state-{sessionName}.json` for state changes
+- States: `idle`, `permission`, `processing`, `stopped`, `unknown`
+- Falls back to pattern matching if hooks aren't working after 10 seconds
+
+### Claude Code Hooks Integration
+Each project gets `.claude/settings.json` with hooks that notify the bridge server of state changes:
+- `SessionStart`: Writes marker file to verify hooks are working
+- `Stop`: Fires immediately when Claude finishes (primary detection)
+- `Notification (idle_prompt)`: Backup for 60-second idle detection
+
+Hook state files are written to `/tmp/lora-claude-state-{sessionName}.json` and `/tmp/lora-hooks-ready-{sessionName}`.
 
 ### Session Persistence
 - **Tmux sessions persist** when mobile app disconnects
@@ -169,7 +191,7 @@ Messages between mobile app and bridge server use JSON with a `type` field:
 - `terminal_input` / `terminal_resize` / `terminal_close` - Terminal control
 - `voice_status` - Check voice service availability
 - `voice_terminal_enable` / `voice_terminal_disable` - Toggle voice mode on terminal
-- `voice_terminal_audio` - Send audio to voice-enabled terminal
+- `voice_terminal_audio` - Send audio to voice-enabled terminal (with optional `screenCapture` for vision)
 
 **Server → Client:**
 - `connected` - Initial connection with projects list
@@ -179,6 +201,7 @@ Messages between mobile app and bridge server use JSON with a `type` field:
 - `voice_terminal_enabled` / `voice_terminal_disabled` - Voice mode status
 - `voice_transcription` - STT result
 - `voice_terminal_speaking` - TTS audio response
+- `voice_app_control` - App UI control command (navigate tabs, press buttons)
 - `error` - Error messages
 
 ## Code Conventions
@@ -197,3 +220,26 @@ The terminal uses xterm.js loaded in a WebView:
 - iOS dictation deduplication logic (handles word-by-word replay)
 - Control button bar with Ctrl, Shift modifiers (toggleable)
 - Modifier combinations: Ctrl+arrows for word jump, etc.
+
+## Debugging
+
+### Hook Debug Logs
+All hook activity is logged to `/tmp/lora-hook-debug.log`:
+```bash
+tail -f /tmp/lora-hook-debug.log
+```
+
+### Bridge Server Logs
+```bash
+tail -f logs/bridge-server.log
+tail -f logs/terminal.log
+```
+
+### Check if Hooks are Working
+```bash
+# SessionStart marker (created when Claude Code starts with working hooks)
+ls -la /tmp/lora-hooks-ready-*
+
+# Current Claude state
+cat /tmp/lora-claude-state-lora-{projectId}.json
+```
