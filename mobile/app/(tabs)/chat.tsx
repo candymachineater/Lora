@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView, Animated }
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Terminal as TerminalIcon, Plus, X, Mic, MicOff, Volume2, Square } from 'lucide-react-native';
 import { Audio, AVPlaybackStatus } from 'expo-av';
+import ViewShot from 'react-native-view-shot';
 import { useProjectStore, useSettingsStore } from '../../stores';
 import { bridgeService } from '../../services/claude/api';
 import { Terminal } from '../../components/terminal';
@@ -17,12 +18,20 @@ interface TerminalSession {
 
 type VoiceStatus = 'off' | 'idle' | 'listening' | 'processing' | 'speaking';
 
-// VAD Configuration
+// VAD Configuration - Tuned for natural conversation flow
+// Based on OpenAI Realtime API best practices
 const VAD_CONFIG = {
-  SILENCE_THRESHOLD: -25, // dB level below which is considered silence (lower = more sensitive)
-  SILENCE_DURATION_MS: 2000, // 2 seconds of silence before auto-stop (increased for natural pauses)
-  MIN_RECORDING_MS: 800, // Minimum recording duration
+  // Audio level thresholds (dB)
+  SILENCE_THRESHOLD: -35, // dB level below which is considered silence (more negative = less sensitive)
+  SPEECH_THRESHOLD: -25, // dB level above which confirms speech is happening
+
+  // Timing settings
+  SILENCE_DURATION_MS: 2500, // 2.5s of silence after speech before stopping
+  SPEECH_START_MS: 300, // Must have 300ms of speech-level audio to confirm speaking
+  MIN_RECORDING_MS: 2000, // Minimum 2s recording before VAD kicks in (allows natural pauses)
+  MAX_RECORDING_MS: 60000, // Maximum 60s recording to prevent runaway
   METERING_INTERVAL_MS: 100, // How often to check audio levels
+  POST_TTS_DELAY_MS: 2000, // Wait 2s after TTS ends before listening (user thinking time)
 };
 
 // Helper to strip ANSI codes for display
@@ -57,6 +66,7 @@ export default function TerminalScreen() {
   const silenceStartRef = useRef<number | null>(null);
   const recordingStartRef = useRef<number | null>(null);
   const pulseAnim = useRef(new Animated.Value(1)).current;
+  const viewShotRef = useRef<ViewShot>(null);
 
   const project = currentProject();
   const activeTerminal = terminals[activeTerminalIndex];
@@ -286,6 +296,28 @@ export default function TerminalScreen() {
           setVoiceProgress('');
           playAudio(audioData);
         },
+        onAppControl: (control) => {
+          console.log('[Voice-Terminal] App control:', control);
+          // Handle app control actions from voice agent
+          if (control.action === 'navigate' && control.target) {
+            // Navigate to different tabs
+            const tabMap: Record<string, string> = {
+              'terminal': '/(tabs)/chat',
+              'chat': '/(tabs)/chat',
+              'preview': '/(tabs)/preview',
+              'projects': '/(tabs)',
+              'voice': '/(tabs)/voice',
+              'editor': '/(tabs)/editor',
+            };
+            const route = tabMap[control.target.toLowerCase()];
+            if (route) {
+              router.push(route as any);
+            }
+          } else if (control.action === 'take_screenshot') {
+            // Voice agent requested a fresh screenshot - will be sent with next audio
+            console.log('[Voice-Terminal] Screenshot requested by agent');
+          }
+        },
         onEnabled: () => {
           console.log('[Voice-Terminal] Voice mode enabled');
           setVoiceStatus('idle');
@@ -304,6 +336,12 @@ export default function TerminalScreen() {
       });
     } else {
       // Turn off voice mode
+      // Set status to 'off' IMMEDIATELY to prevent double-taps during async cleanup
+      if (voiceStatus === 'off') return; // Already off, prevent re-entry
+      setVoiceStatus('off');
+      setVoiceTranscript('');
+
+      // Now do async cleanup
       stopMetering();
       if (recordingRef.current) {
         await recordingRef.current.stopAndUnloadAsync();
@@ -315,8 +353,6 @@ export default function TerminalScreen() {
         soundRef.current = null;
       }
       bridgeService.disableVoiceOnTerminal(activeTerminal.id);
-      setVoiceStatus('off');
-      setVoiceTranscript('');
     }
   };
 
@@ -355,7 +391,11 @@ export default function TerminalScreen() {
       setVoiceStatus('listening');
       setAudioLevel(0);
 
-      // VAD monitoring
+      // Track if we've detected actual speech (not just noise)
+      let speechDetected = false;
+      let speechStartTime: number | null = null;
+
+      // VAD monitoring - Based on OpenAI Realtime best practices
       meteringIntervalRef.current = setInterval(async () => {
         if (!recordingRef.current) return;
 
@@ -369,18 +409,44 @@ export default function TerminalScreen() {
             const now = Date.now();
             const recordingDuration = now - (recordingStartRef.current || now);
 
-            if (level < VAD_CONFIG.SILENCE_THRESHOLD) {
-              if (!silenceStartRef.current) {
-                silenceStartRef.current = now;
-              } else if (
-                recordingDuration > VAD_CONFIG.MIN_RECORDING_MS &&
-                now - silenceStartRef.current > VAD_CONFIG.SILENCE_DURATION_MS
-              ) {
-                console.log('[Voice-Terminal] VAD: Silence detected');
-                stopListening();
+            // Check for max recording time
+            if (recordingDuration > VAD_CONFIG.MAX_RECORDING_MS) {
+              console.log('[Voice-Terminal] VAD: Max recording time reached');
+              stopListening();
+              return;
+            }
+
+            // Detect speech start (audio above speech threshold)
+            if (level >= VAD_CONFIG.SPEECH_THRESHOLD) {
+              if (!speechStartTime) {
+                speechStartTime = now;
+              } else if (!speechDetected && now - speechStartTime > VAD_CONFIG.SPEECH_START_MS) {
+                // Confirmed speech after sustained audio above threshold
+                speechDetected = true;
+                console.log('[Voice-Terminal] VAD: Speech confirmed');
               }
-            } else {
+              // Reset silence counter when speech detected
               silenceStartRef.current = null;
+            }
+            // Check for silence (only after speech has been detected)
+            else if (level < VAD_CONFIG.SILENCE_THRESHOLD) {
+              // Reset speech start if we go below silence threshold
+              speechStartTime = null;
+
+              // Only start counting silence after we've confirmed speech
+              if (speechDetected) {
+                if (!silenceStartRef.current) {
+                  silenceStartRef.current = now;
+                } else if (now - silenceStartRef.current > VAD_CONFIG.SILENCE_DURATION_MS) {
+                  console.log('[Voice-Terminal] VAD: End of speech detected');
+                  stopListening();
+                }
+              }
+            }
+            // Audio between thresholds - ambiguous, maintain current state
+            else {
+              speechStartTime = null; // Not clearly speech
+              // Don't reset silence timer for ambiguous levels
             }
           }
         } catch (err) {
@@ -422,11 +488,32 @@ export default function TerminalScreen() {
         const blob = await response.blob();
 
         const reader = new FileReader();
-        reader.onloadend = () => {
+        reader.onloadend = async () => {
           const base64 = (reader.result as string).split(',')[1];
           const mimeType = blob.type || 'audio/m4a';
-          // Send to terminal (will be transcribed and typed into Claude Code)
-          bridgeService.sendVoiceAudioToTerminal(activeTerminal.id, base64, mimeType);
+
+          // Capture screenshot of current screen for voice agent vision
+          let screenCapture: string | undefined;
+          try {
+            if (viewShotRef.current?.capture) {
+              const screenshotUri = await viewShotRef.current.capture();
+              const screenshotResponse = await fetch(screenshotUri);
+              const screenshotBlob = await screenshotResponse.blob();
+              const screenshotReader = new FileReader();
+              screenCapture = await new Promise<string>((resolve) => {
+                screenshotReader.onloadend = () => {
+                  const base64Screenshot = (screenshotReader.result as string).split(',')[1];
+                  resolve(base64Screenshot);
+                };
+                screenshotReader.readAsDataURL(screenshotBlob);
+              });
+            }
+          } catch (screenshotErr) {
+            console.log('[Voice-Terminal] Screenshot capture failed:', screenshotErr);
+          }
+
+          // Send to terminal with screenshot (will be transcribed and sent to voice agent)
+          bridgeService.sendVoiceAudioToTerminal(activeTerminal.id, base64, mimeType, screenCapture);
         };
         reader.readAsDataURL(blob);
       }
@@ -455,8 +542,14 @@ export default function TerminalScreen() {
       sound.setOnPlaybackStatusUpdate((playbackStatus: AVPlaybackStatus) => {
         if (playbackStatus.isLoaded && playbackStatus.didJustFinish) {
           soundRef.current = null;
-          // Auto-listen after speaking
-          startListening();
+          // Wait before auto-listening to give user time to think
+          setVoiceStatus('idle');
+          setTimeout(() => {
+            // Only start listening if we're still in idle (not manually triggered)
+            if (voiceStatus === 'idle' || voiceStatus === 'off') {
+              startListening();
+            }
+          }, VAD_CONFIG.POST_TTS_DELAY_MS);
         }
       });
     } catch (err) {
@@ -504,7 +597,7 @@ export default function TerminalScreen() {
   }
 
   return (
-    <View style={styles.container}>
+    <ViewShot ref={viewShotRef} style={styles.container} options={{ format: 'png', quality: 0.8 }}>
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
@@ -637,7 +730,7 @@ export default function TerminalScreen() {
         sandbox={activeTerminal?.sandbox ?? projectSandbox}
         onResize={handleResize}
       />
-    </View>
+    </ViewShot>
   );
 }
 

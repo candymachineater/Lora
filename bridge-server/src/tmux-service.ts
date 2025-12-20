@@ -79,14 +79,16 @@ export function setupProjectSandbox(projectPath: string, sessionName?: string): 
   }
 
   // Create the hook script that receives JSON via stdin and writes state
-  // Handles both Stop hooks (immediate) and Notification hooks (delayed)
+  // Handles SessionStart, Stop, and Notification hooks
   // Uses grep/sed instead of jq for portability
   // Includes debug logging to /tmp/lora-hook-debug.log
   const hookScript = `#!/bin/bash
 # Lora Claude Code State Hook
 # Receives events via stdin and writes state to a file
-# Handles both Stop hooks (fires immediately when Claude finishes) and
-# Notification hooks (fires on idle_prompt, permission_prompt)
+# Handles:
+# - SessionStart: Writes marker file to indicate hooks are working
+# - Stop: Fires immediately when Claude finishes
+# - Notification: Fires on idle_prompt, permission_prompt
 
 DEBUG_LOG="/tmp/lora-hook-debug.log"
 HOOK_TYPE="\${LORA_HOOK_TYPE:-notification}"
@@ -103,7 +105,15 @@ if [ -z "$LORA_SESSION" ]; then
 fi
 
 STATE_FILE="/tmp/lora-claude-state-$LORA_SESSION.json"
+HOOKS_READY_FILE="/tmp/lora-hooks-ready-$LORA_SESSION"
 TIMESTAMP=$(date +%s000)
+
+# Handle SessionStart hook (proves hooks are working)
+if [ "$HOOK_TYPE" = "session_start" ]; then
+  echo "$TIMESTAMP" > "$HOOKS_READY_FILE"
+  echo "$(date): SessionStart hook - wrote hooks ready marker to $HOOKS_READY_FILE" >> "$DEBUG_LOG"
+  exit 0
+fi
 
 # Handle Stop hook (fires immediately when Claude finishes)
 if [ "$HOOK_TYPE" = "stop" ]; then
@@ -140,8 +150,10 @@ exit 0
 
   // Create .claude/settings.json with sandbox and hooks configuration
   // Sandbox settings provide filesystem and network isolation per project
+  // SessionStart hook fires when Claude Code starts - used to verify hooks are working
   // Stop hook fires IMMEDIATELY when Claude finishes - this is the primary detection method
   // Notification hooks are backup for permission prompts and 60-second idle detection
+  const sessionStartHookCommand = `LORA_HOOK_TYPE=session_start bash "$CLAUDE_PROJECT_DIR/.claude/hooks/lora-state-hook.sh"`;
   const stopHookCommand = `LORA_HOOK_TYPE=stop bash "$CLAUDE_PROJECT_DIR/.claude/hooks/lora-state-hook.sh"`;
   const notificationHookCommand = `LORA_HOOK_TYPE=notification bash "$CLAUDE_PROJECT_DIR/.claude/hooks/lora-state-hook.sh"`;
   const settings = {
@@ -177,6 +189,18 @@ exit 0
       ]
     },
     hooks: {
+      // SessionStart hook fires when Claude Code starts - verifies hooks are functional
+      SessionStart: [
+        {
+          hooks: [
+            {
+              type: "command",
+              command: sessionStartHookCommand,
+              timeout: 5
+            }
+          ]
+        }
+      ],
       // Stop hook fires immediately when Claude Code finishes processing
       Stop: [
         {
@@ -1001,22 +1025,26 @@ export async function waitForClaudeReadyWithHooks(
     pollIntervalMs?: number;
     useHooksOnly?: boolean;  // if true, don't fall back to pattern matching
     previousOutput?: string;  // output before command was sent, to filter out old content
+    hooksCheckTimeoutMs?: number;  // time to wait before checking if hooks are working
   }
 ): Promise<HookBasedClaudeState> {
   const {
-    timeoutMs = 180000,   // 3 minutes max
+    timeoutMs = 180000,   // 3 minutes max (only applies when hooks aren't working)
     pollIntervalMs = 300,
     useHooksOnly = false,
-    previousOutput = ''
+    previousOutput = '',
+    hooksCheckTimeoutMs = 10000  // Check if hooks are working after 10s
   } = options || {};
 
   const startTime = Date.now();
   let lastHookCheck = 0;
   const HOOK_CHECK_INTERVAL = 1000;  // Check hooks every second
   let hookResponded = false;
+  let hooksWorkingChecked = false;
+  let hooksAreWorking = false;
 
   console.log(`[Tmux] Waiting for Claude Code (hooks+fallback) in ${sessionName}...`);
-  console.log(`[Tmux] Hook detection: timeoutMs=${timeoutMs}, pollInterval=${pollIntervalMs}, useHooksOnly=${useHooksOnly}`);
+  console.log(`[Tmux] Hook detection: timeoutMs=${timeoutMs}, pollInterval=${pollIntervalMs}, useHooksOnly=${useHooksOnly}, hooksCheckTimeout=${hooksCheckTimeoutMs}`);
 
   // Ensure we're watching this session
   if (!claudeStateService.getWatchedSessions().includes(sessionName)) {
@@ -1032,8 +1060,45 @@ export async function waitForClaudeReadyWithHooks(
   claudeStateService.markProcessing(sessionName);
   console.log(`[Tmux] Marked session as processing`);
 
-  while (Date.now() - startTime < timeoutMs) {
+  // When hooks are working and reporting 'processing', we DON'T timeout
+  // This allows Claude Code to run for 20+ minutes if needed
+  // Timeout only applies when hooks aren't working (fallback to pattern matching)
+  while (true) {
     const elapsed = Date.now() - startTime;
+
+    // After hooksCheckTimeoutMs, check if hooks are actually working
+    if (!hooksWorkingChecked && elapsed >= hooksCheckTimeoutMs) {
+      hooksWorkingChecked = true;
+      hooksAreWorking = claudeStateService.areHooksWorking(sessionName);
+
+      if (!hooksAreWorking && !hookResponded && !useHooksOnly) {
+        // Hooks aren't working - fall back to pattern matching
+        console.log(`[Tmux] ⚠️ Hooks not working after ${hooksCheckTimeoutMs}ms, falling back to pattern matching`);
+        console.log(`[Tmux] Switching to pattern-based detection...`);
+
+        // Use waitForClaudeReady which does pattern matching
+        const patternState = await waitForClaudeReady(sessionName, {
+          timeoutMs: timeoutMs - elapsed,
+          pollIntervalMs
+        });
+
+        const output = await captureOutput(sessionName, 100);
+        const newOutput = extractNewOutput(output, previousOutput);
+
+        return {
+          isReady: patternState.isReady,
+          isProcessing: patternState.isProcessing,
+          isWaitingConfirm: patternState.isWaitingConfirm,
+          state: patternState.isReady
+            ? (patternState.isWaitingConfirm ? 'permission' : 'idle')
+            : (patternState.isProcessing ? 'processing' : 'unknown'),
+          rawOutput: newOutput,
+          usedHooks: false  // Indicate we used pattern matching
+        };
+      } else if (hooksAreWorking) {
+        console.log(`[Tmux] ✓ Hooks are working (SessionStart marker found) - NO TIMEOUT will be applied`);
+      }
+    }
 
     // Check hook-based state periodically
     if (Date.now() - lastHookCheck >= HOOK_CHECK_INTERVAL) {
@@ -1068,58 +1133,38 @@ export async function waitForClaudeReadyWithHooks(
         }
       }
 
-      // Log progress every 5 seconds
-      if (isVerboseCheck) {
-        console.log(`[Tmux] Waiting... hookState=${hookState.state}, hookResponded=${hookResponded}, elapsed=${elapsed}ms`);
+      // Log progress every 5 seconds (reduced frequency for long-running tasks)
+      // After 5 minutes, only log every 30 seconds to reduce noise
+      const logInterval = elapsed > 300000 ? 30000 : 5000;
+      if (isVerboseCheck || (elapsed > 300000 && elapsed % logInterval < HOOK_CHECK_INTERVAL)) {
+        const hooksStatus = hooksWorkingChecked
+          ? (hooksAreWorking ? 'working' : 'NOT working')
+          : 'not yet checked';
+        console.log(`[Tmux] Waiting... hookState=${hookState.state}, hookResponded=${hookResponded}, hooksStatus=${hooksStatus}, elapsed=${Math.round(elapsed/1000)}s`);
       }
-    }
 
-    // If hooks haven't responded after 15 seconds and we're allowed to fall back,
-    // use pattern matching as a fallback
-    // Claude's idle_prompt notification can take a few seconds to fire after processing completes
-    if (!useHooksOnly && !hookResponded && elapsed > 15000) {
-      console.log(`[Tmux] Hooks not responding after ${elapsed}ms, falling back to pattern matching`);
+      // Only apply timeout if hooks are NOT working
+      // When hooks are working, we wait indefinitely for Claude to finish
+      if (!hooksAreWorking && elapsed >= timeoutMs) {
+        // Timeout only applies when hooks aren't working
+        const finalOutput = await captureOutput(sessionName, 100);
+        const filteredFinalOutput = extractNewOutput(finalOutput, previousOutput);
 
-      // Use the old pattern matching approach
-      const patternState = await waitForClaudeReady(sessionName, {
-        timeoutMs: timeoutMs - elapsed,
-        pollIntervalMs
-      });
+        console.log(`[Tmux] Timeout after ${timeoutMs}ms (hooks not working), final hookState=${hookState.state}`);
 
-      // Filter out old content if previousOutput was provided
-      const filteredOutput = extractNewOutput(patternState.rawOutput, previousOutput);
-
-      return {
-        isReady: patternState.isReady,
-        isProcessing: patternState.isProcessing,
-        isWaitingConfirm: patternState.isWaitingConfirm,
-        state: patternState.isReady
-          ? (patternState.isWaitingConfirm ? 'permission' : 'idle')
-          : (patternState.isProcessing ? 'processing' : 'unknown'),
-        rawOutput: filteredOutput,
-        usedHooks: false
-      };
+        return {
+          isReady: claudeStateService.isReadyState(hookState.state),
+          isProcessing: hookState.state === 'processing',
+          isWaitingConfirm: hookState.state === 'permission',
+          state: hookState.state,
+          rawOutput: filteredFinalOutput,
+          usedHooks: hookResponded
+        };
+      }
     }
 
     await sleep(pollIntervalMs);
   }
-
-  // Timeout - return current state
-  const finalOutput = await captureOutput(sessionName, 100);
-  const hookState = claudeStateService.readState(sessionName);
-  // Filter out old content if previousOutput was provided
-  const filteredFinalOutput = extractNewOutput(finalOutput, previousOutput);
-
-  console.log(`[Tmux] Timeout after ${timeoutMs}ms, final hookState=${hookState.state}`);
-
-  return {
-    isReady: claudeStateService.isReadyState(hookState.state),
-    isProcessing: hookState.state === 'processing',
-    isWaitingConfirm: hookState.state === 'permission',
-    state: hookState.state,
-    rawOutput: filteredFinalOutput,
-    usedHooks: hookResponded
-  };
 }
 
 /**
