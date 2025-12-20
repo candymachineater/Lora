@@ -5,12 +5,16 @@ export const colors = {
   foreground: '#1C1C1C',
   cardBackground: '#F8F8F8',
   cardForeground: '#1C1C1C',
+  card: '#F8F8F8',
+  primary: '#C53307',
+  primaryLight: 'rgba(197, 51, 7, 0.1)',
 
   // Secondary Colors
   secondary: '#F0F0F0',
   secondaryForeground: '#1C1C1C',
   muted: '#F5F5F5',
   mutedForeground: '#888888',
+  textMuted: '#888888',
 
   // Borders & Inputs
   border: '#E5E5E5',
@@ -28,6 +32,8 @@ export const colors = {
   destructive: '#D10808',
   success: '#22C55E',
   warning: '#F59E0B',
+  error: '#D10808',
+  errorLight: 'rgba(209, 8, 8, 0.1)',
 
   // Chat specific
   userBubble: '#1C1C1C',

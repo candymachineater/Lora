@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Lora Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #0C0C0C;
+    }
+    #terminal {
+      width: 100%;
+      height: 100%;
+    }
+    .xterm {
+      padding: 4px;
+    }
+    .xterm-viewport {
+      overflow-y: auto !important;
+    }
+    /* Custom scrollbar */
+    .xterm-viewport::-webkit-scrollbar {
+      width: 8px;
+    }
+    .xterm-viewport::-webkit-scrollbar-track {
+      background: #1A1A1A;
+    }
+    .xterm-viewport::-webkit-scrollbar-thumb {
+      background: #444;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+  <script>
+    // Initialize xterm.js terminal
+    const term = new Terminal({
+      cursorBlink: true,
+      cursorStyle: 'block',
+      fontSize: 14,
+      fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+      theme: {
+        background: '#0C0C0C',
+        foreground: '#CCCCCC',
+        cursor: '#16C60C',
+        cursorAccent: '#0C0C0C',
+        selectionBackground: 'rgba(255, 255, 255, 0.3)',
+        black: '#0C0C0C',
+        red: '#E74856',
+        green: '#16C60C',
+        yellow: '#F9F1A5',
+        blue: '#3B78FF',
+        magenta: '#B4009E',
+        cyan: '#61D6D6',
+        white: '#CCCCCC',
+        brightBlack: '#767676',
+        brightRed: '#E74856',
+        brightGreen: '#16C60C',
+        brightYellow: '#F9F1A5',
+        brightBlue: '#3B78FF',
+        brightMagenta: '#B4009E',
+        brightCyan: '#61D6D6',
+        brightWhite: '#F2F2F2'
+      },
+      allowTransparency: false,
+      scrollback: 10000,
+      tabStopWidth: 8,
+      convertEol: false,
+      screenReaderMode: false
+    });
+
+    // Load addons
+    const fitAddon = new FitAddon.FitAddon();
+    const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+
+    term.loadAddon(fitAddon);
+    term.loadAddon(webLinksAddon);
+
+    // Open terminal in container
+    term.open(document.getElementById('terminal'));
+
+    // Fit terminal to container
+    fitAddon.fit();
+
+    // Handle window resize
+    window.addEventListener('resize', () => {
+      fitAddon.fit();
+      sendToReactNative({ type: 'resize', cols: term.cols, rows: term.rows });
+    });
+
+    // Send message to React Native
+    function sendToReactNative(message) {
+      if (window.ReactNativeWebView) {
+        window.ReactNativeWebView.postMessage(JSON.stringify(message));
+      }
+    }
+
+    // Handle terminal input
+    term.onData(data => {
+      sendToReactNative({ type: 'input', data: data });
+    });
+
+    // Handle terminal resize
+    term.onResize(size => {
+      sendToReactNative({ type: 'resize', cols: size.cols, rows: size.rows });
+    });
+
+    // Initial size notification
+    setTimeout(() => {
+      fitAddon.fit();
+      sendToReactNative({
+        type: 'ready',
+        cols: term.cols,
+        rows: term.rows
+      });
+    }, 100);
+
+    // Handle messages from React Native
+    window.handleReactNativeMessage = function(message) {
+      try {
+        const data = typeof message === 'string' ? JSON.parse(message) : message;
+
+        switch (data.type) {
+          case 'output':
+            // Write terminal output
+            term.write(data.data);
+            break;
+          case 'clear':
+            // Clear terminal
+            term.clear();
+            break;
+          case 'reset':
+            // Reset terminal
+            term.reset();
+            break;
+          case 'resize':
+            // Resize terminal
+            if (data.cols && data.rows) {
+              term.resize(data.cols, data.rows);
+            }
+            break;
+          case 'focus':
+            // Focus terminal
+            term.focus();
+            break;
+          case 'blur':
+            // Blur terminal
+            term.blur();
+            break;
+          case 'scrollToBottom':
+            // Scroll to bottom
+            term.scrollToBottom();
+            break;
+          case 'paste':
+            // Paste text
+            if (data.text) {
+              term.paste(data.text);
+            }
+            break;
+          case 'sendInput':
+            // Send specific input (for control buttons)
+            sendToReactNative({ type: 'input', data: data.data });
+            break;
+        }
+      } catch (e) {
+        console.error('Error handling message:', e);
+      }
+    };
+
+    // Handle link clicks
+    term.attachCustomKeyEventHandler(e => {
+      // Allow default behavior for most keys
+      // Return true to let xterm handle it, false to prevent
+
+      // Prevent ctrl+c from being captured as copy when there's no selection
+      if (e.ctrlKey && e.key === 'c' && !term.hasSelection()) {
+        return true; // Let xterm handle Ctrl+C (SIGINT)
+      }
+
+      return true;
+    });
+
+    // Notify React Native that terminal is ready
+    sendToReactNative({ type: 'initialized' });
+  </script>
+</body>
+</html>

@@ -15,7 +15,9 @@ export function parseCodeBlocks(text: string): CodeBlock[] {
     blocks.push({
       language,
       filename,
+      path: filename,
       content,
+      type: getFileType(filename),
     });
   }
 
@@ -25,10 +27,17 @@ export function parseCodeBlocks(text: string): CodeBlock[] {
 // Convert code blocks to project files
 export function codeBlocksToProjectFiles(blocks: CodeBlock[]): ProjectFile[] {
   return blocks.map((block) => ({
-    path: block.filename,
+    path: block.path || block.filename || 'unknown',
+    name: getFileName(block.path || block.filename || 'unknown'),
+    isDirectory: false,
     content: block.content,
-    type: getFileType(block.filename),
+    type: block.type,
   }));
+}
+
+// Get file name from path
+function getFileName(filePath: string): string {
+  return filePath.split('/').pop() || filePath;
 }
 
 // Infer filename from language

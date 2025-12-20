@@ -12,6 +12,7 @@ import {
 } from 'lucide-react-native';
 import { useProjectStore } from '../../stores';
 import { exportProject } from '../../services/storage';
+import { bridgeService } from '../../services/claude';
 import { Button } from '../../components/common';
 import { colors, spacing, radius, typography } from '../../theme';
 
@@ -34,15 +35,27 @@ export default function ProjectDetailScreen() {
   const handleDelete = () => {
     Alert.alert(
       'Delete Project',
-      `Are you sure you want to delete "${project.name}"?`,
+      `Are you sure you want to delete "${project.name}"? This will also delete all project files on the server. This action cannot be undone.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Delete',
           style: 'destructive',
-          onPress: () => {
-            deleteProject(project.id);
-            router.back();
+          onPress: async () => {
+            try {
+              // Delete from server first
+              if (bridgeService.isConnected()) {
+                await bridgeService.deleteProject(project.id);
+              }
+              // Then delete from local store
+              deleteProject(project.id);
+              router.back();
+            } catch (err) {
+              console.error('[Project] Delete failed:', err);
+              Alert.alert('Error', 'Failed to delete project from server. Local copy removed.');
+              deleteProject(project.id);
+              router.back();
+            }
           },
         },
       ]
@@ -143,7 +156,7 @@ export default function ProjectDetailScreen() {
               <FileCode color={colors.brandSapphire} size={16} />
               <Text style={styles.fileName}>{file.path}</Text>
               <Text style={styles.fileSize}>
-                {Math.round(file.content.length / 100) * 100} chars
+                {Math.round((file.content?.length || 0) / 100) * 100} chars
               </Text>
             </View>
           ))}

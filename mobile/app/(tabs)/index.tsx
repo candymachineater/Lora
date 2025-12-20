@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
@@ -8,29 +8,120 @@ import {
   Alert,
   TextInput,
   Modal,
+  ActivityIndicator,
 } from 'react-native';
 import { useRouter } from 'expo-router';
-import { Plus, FolderOpen, Trash2, Settings, MoreVertical } from 'lucide-react-native';
-import { useProjectStore } from '../../stores';
-import { createNewProject } from '../../services/storage';
+import { Plus, FolderOpen, Trash2, Settings, RefreshCw, Wifi, WifiOff, Shield, ShieldOff } from 'lucide-react-native';
+import { useProjectStore, useSettingsStore } from '../../stores';
+import { bridgeService } from '../../services/claude/api';
 import { EmptyState, Button } from '../../components/common';
 import { colors, spacing, radius, typography } from '../../theme';
 
 export default function ProjectsScreen() {
   const router = useRouter();
-  const { projects, addProject, deleteProject, setCurrentProject } = useProjectStore();
+  const { projects, addProject, setProjects, deleteProject, setCurrentProject } = useProjectStore();
+  const { bridgeServerUrl, isConnected, setIsConnected } = useSettingsStore();
+
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
+  const [newProjectSandbox, setNewProjectSandbox] = useState(true); // Default to sandbox mode
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
 
-  const handleCreateProject = () => {
+  // Connect to bridge server and sync projects
+  const syncProjects = useCallback(async () => {
+    if (!bridgeServerUrl) return;
+
+    setIsSyncing(true);
+    try {
+      if (!bridgeService.isConnected()) {
+        const serverProjects = await bridgeService.connect(bridgeServerUrl);
+        setIsConnected(true);
+        // Sync projects from server (preserve sandbox setting from existing projects)
+        if (serverProjects && serverProjects.length > 0) {
+          const formattedProjects = serverProjects.map(p => {
+            const existing = projects.find(ep => ep.id === p.id);
+            return {
+              id: p.id,
+              name: p.name,
+              path: p.path,
+              files: [],
+              sandbox: existing?.sandbox ?? true, // Preserve existing or default to sandbox
+              createdAt: new Date(p.createdAt),
+              updatedAt: new Date(p.createdAt),
+            };
+          });
+          setProjects(formattedProjects);
+        }
+      } else {
+        // Already connected, just list projects
+        const serverProjects = await bridgeService.listProjects();
+        if (serverProjects && serverProjects.length > 0) {
+          const formattedProjects = serverProjects.map(p => {
+            const existing = projects.find(ep => ep.id === p.id);
+            return {
+              id: p.id,
+              name: p.name,
+              path: p.path,
+              files: [],
+              sandbox: existing?.sandbox ?? true, // Preserve existing or default to sandbox
+              createdAt: new Date(p.createdAt),
+              updatedAt: new Date(p.createdAt),
+            };
+          });
+          setProjects(formattedProjects);
+        }
+      }
+    } catch (err) {
+      console.error('[Projects] Sync failed:', err);
+      setIsConnected(false);
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [bridgeServerUrl, setIsConnected, setProjects]);
+
+  // Auto-connect on mount
+  useEffect(() => {
+    if (bridgeServerUrl && !bridgeService.isConnected()) {
+      syncProjects();
+    }
+  }, [bridgeServerUrl]);
+
+  const handleCreateProject = async () => {
     if (!newProjectName.trim()) return;
 
-    const project = createNewProject(newProjectName.trim());
-    addProject(project);
-    setNewProjectName('');
-    setShowNewProjectModal(false);
-    setCurrentProject(project.id);
-    router.push('/chat');
+    setIsLoading(true);
+    try {
+      if (bridgeService.isConnected()) {
+        // Create on bridge server
+        const serverProject = await bridgeService.createProject(newProjectName.trim());
+        const project = {
+          id: serverProject.id,
+          name: serverProject.name,
+          path: serverProject.path,
+          files: [],
+          sandbox: newProjectSandbox, // Use the selected sandbox mode
+          createdAt: new Date(serverProject.createdAt),
+          updatedAt: new Date(serverProject.createdAt),
+        };
+        addProject(project);
+        setCurrentProject(project.id);
+      } else {
+        Alert.alert('Not Connected', 'Connect to the bridge server first in Settings.');
+        setIsLoading(false);
+        return;
+      }
+
+      setNewProjectName('');
+      setNewProjectSandbox(true); // Reset to default
+      setShowNewProjectModal(false);
+      router.push('/chat');
+    } catch (err) {
+      console.error('[Projects] Create failed:', err);
+      Alert.alert('Error', 'Failed to create project. Check your connection.');
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleSelectProject = (projectId: string) => {
@@ -41,13 +132,26 @@ export default function ProjectsScreen() {
   const handleDeleteProject = (projectId: string, projectName: string) => {
     Alert.alert(
       'Delete Project',
-      `Are you sure you want to delete "${projectName}"? This action cannot be undone.`,
+      `Are you sure you want to delete "${projectName}"? This will also delete all project files on the server. This action cannot be undone.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Delete',
           style: 'destructive',
-          onPress: () => deleteProject(projectId),
+          onPress: async () => {
+            try {
+              // Delete from server first
+              if (bridgeService.isConnected()) {
+                await bridgeService.deleteProject(projectId);
+              }
+              // Then delete from local store
+              deleteProject(projectId);
+            } catch (err) {
+              console.error('[Projects] Delete failed:', err);
+              Alert.alert('Error', 'Failed to delete project from server. Local copy removed.');
+              deleteProject(projectId);
+            }
+          },
         },
       ]
     );
@@ -67,11 +171,32 @@ export default function ProjectsScreen() {
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>Projects</Text>
-          <Text style={styles.subtitle}>
-            {projects.length} {projects.length === 1 ? 'project' : 'projects'}
-          </Text>
+          <View style={styles.statusRow}>
+            {isConnected ? (
+              <Wifi color="#22C55E" size={14} />
+            ) : (
+              <WifiOff color="#EF4444" size={14} />
+            )}
+            <Text style={[styles.subtitle, { color: isConnected ? '#22C55E' : '#EF4444' }]}>
+              {isConnected ? 'Connected' : 'Disconnected'}
+            </Text>
+            <Text style={styles.subtitle}>
+              • {projects.length} {projects.length === 1 ? 'project' : 'projects'}
+            </Text>
+          </View>
         </View>
         <View style={styles.headerActions}>
+          <TouchableOpacity
+            onPress={syncProjects}
+            style={styles.iconButton}
+            disabled={isSyncing}
+          >
+            {isSyncing ? (
+              <ActivityIndicator size="small" color={colors.foreground} />
+            ) : (
+              <RefreshCw color={colors.foreground} size={22} />
+            )}
+          </TouchableOpacity>
           <TouchableOpacity
             onPress={() => router.push('/settings')}
             style={styles.iconButton}
@@ -111,8 +236,8 @@ export default function ProjectsScreen() {
               </View>
               <View style={styles.projectInfo}>
                 <Text style={styles.projectName}>{item.name}</Text>
-                <Text style={styles.projectMeta}>
-                  {item.files.length} files • Updated {formatDate(item.updatedAt)}
+                <Text style={styles.projectMeta} numberOfLines={1}>
+                  {item.path || `Updated ${formatDate(item.updatedAt)}`}
                 </Text>
               </View>
               <TouchableOpacity
@@ -153,12 +278,42 @@ export default function ProjectsScreen() {
               onChangeText={setNewProjectName}
               autoFocus
             />
+
+            {/* Sandbox Mode Toggle */}
+            <TouchableOpacity
+              style={styles.sandboxToggle}
+              onPress={() => setNewProjectSandbox(!newProjectSandbox)}
+            >
+              <View style={styles.sandboxIconContainer}>
+                {newProjectSandbox ? (
+                  <Shield color={colors.success} size={20} />
+                ) : (
+                  <ShieldOff color={colors.warning} size={20} />
+                )}
+              </View>
+              <View style={styles.sandboxTextContainer}>
+                <Text style={styles.sandboxLabel}>
+                  {newProjectSandbox ? 'Sandbox Mode' : 'Full Access Mode'}
+                </Text>
+                <Text style={styles.sandboxDescription}>
+                  {newProjectSandbox
+                    ? 'Terminal restricted to project folder'
+                    : 'Terminal has full filesystem access'}
+                </Text>
+              </View>
+              <View style={[
+                styles.sandboxIndicator,
+                { backgroundColor: newProjectSandbox ? colors.success : colors.warning }
+              ]} />
+            </TouchableOpacity>
+
             <View style={styles.modalActions}>
               <Button
                 title="Cancel"
                 variant="secondary"
                 onPress={() => {
                   setNewProjectName('');
+                  setNewProjectSandbox(true);
                   setShowNewProjectModal(false);
                 }}
               />
@@ -195,6 +350,12 @@ const styles = StyleSheet.create({
   subtitle: {
     ...typography.caption,
     color: colors.mutedForeground,
+    marginTop: spacing.xs,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
     marginTop: spacing.xs,
   },
   headerActions: {
@@ -291,5 +452,36 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'flex-end',
     gap: spacing.sm,
+  },
+  sandboxToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.cardBackground,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    marginBottom: spacing.lg,
+  },
+  sandboxIconContainer: {
+    marginRight: spacing.sm,
+  },
+  sandboxTextContainer: {
+    flex: 1,
+  },
+  sandboxLabel: {
+    ...typography.body,
+    fontWeight: '500',
+    color: colors.foreground,
+  },
+  sandboxDescription: {
+    ...typography.caption,
+    color: colors.mutedForeground,
+    marginTop: 2,
+  },
+  sandboxIndicator: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
   },
 });

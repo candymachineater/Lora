@@ -1,6 +1,6 @@
 import { Project, ProjectFile } from '../../types';
 
-const SNACK_API = 'https://snack.expo.dev/api/v2/snacks';
+const SNACK_API = 'https://snack.expo.dev/api/snacks';
 const SDK_VERSION = '52.0.0';
 
 interface SnackFile {
@@ -29,7 +29,7 @@ export async function createSnack(project: Project): Promise<string> {
   for (const file of project.files) {
     snackFiles[file.path] = {
       type: 'CODE',
-      contents: file.content,
+      contents: file.content || '',
     };
   }
 

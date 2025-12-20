@@ -1,5 +1,5 @@
 import { Tabs } from 'expo-router';
-import { FolderOpen, MessageCircle, Code2, Play, Settings } from 'lucide-react-native';
+import { FolderOpen, Terminal, Code2, Play } from 'lucide-react-native';
 import { colors } from '../../theme';
 
 export default function TabLayout() {
@@ -18,13 +18,12 @@ export default function TabLayout() {
         },
         tabBarLabelStyle: {
           fontSize: 12,
-          fontWeight: '500',
+          fontWeight: '600' as const,
         },
         headerStyle: {
           backgroundColor: colors.background,
         },
         headerTintColor: colors.foreground,
-        headerShadowVisible: false,
       }}
     >
       <Tabs.Screen
@@ -39,9 +38,9 @@ export default function TabLayout() {
       <Tabs.Screen
         name="chat"
         options={{
-          title: 'Chat',
+          title: 'Terminal',
           tabBarIcon: ({ color, size }) => (
-            <MessageCircle color={color} size={size} />
+            <Terminal color={color} size={size} />
           ),
         }}
       />
@@ -61,6 +60,13 @@ export default function TabLayout() {
           tabBarIcon: ({ color, size }) => (
             <Play color={color} size={size} />
           ),
+        }}
+      />
+      {/* Voice tab hidden - voice mode is now integrated into Terminal */}
+      <Tabs.Screen
+        name="voice"
+        options={{
+          href: null, // Hide from tab bar
         }}
       />
     </Tabs>

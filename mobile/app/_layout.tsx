@@ -13,7 +13,6 @@ export default function RootLayout() {
             backgroundColor: colors.background,
           },
           headerTintColor: colors.foreground,
-          headerShadowVisible: false,
           contentStyle: {
             backgroundColor: colors.background,
           },

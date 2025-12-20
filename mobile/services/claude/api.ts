@@ -1,55 +1,98 @@
-import { WSMessage, WSResponse } from '../../types';
-import { REACT_NATIVE_SYSTEM_PROMPT } from './prompts';
+import { WSMessage, WSResponse, ServerProject, ProjectFile } from '../../types';
 
 type MessageCallback = (chunk: string) => void;
 type ConnectionCallback = () => void;
 type ErrorCallback = (error: string) => void;
+type ProjectsCallback = (projects: ServerProject[]) => void;
+type FilesCallback = (files: ProjectFile[]) => void;
+type FileContentCallback = (content: string) => void;
+type ProjectCreatedCallback = (project: ServerProject) => void;
 
-class ClaudeService {
+class BridgeService {
   private ws: WebSocket | null = null;
   private serverUrl: string = '';
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 5;
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
+
+  // Callbacks
   private onMessageCallback: MessageCallback | null = null;
   private onDoneCallback: ConnectionCallback | null = null;
   private onErrorCallback: ErrorCallback | null = null;
   private onConnectCallback: ConnectionCallback | null = null;
   private onDisconnectCallback: ConnectionCallback | null = null;
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 3;
-  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
-  private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private onProjectsCallback: ProjectsCallback | null = null;
+  private onFilesCallback: FilesCallback | null = null;
+  private onFileContentCallback: FileContentCallback | null = null;
+  private onProjectCreatedCallback: ProjectCreatedCallback | null = null;
 
-  async connect(serverUrl: string): Promise<boolean> {
+  // Pending promise resolvers for request/response pattern
+  private pendingResolvers: Map<string, (value: any) => void> = new Map();
+
+  // Request counter for unique IDs
+  private requestCounter = 0;
+
+  // Track if a connection is in progress
+  private connectingPromise: Promise<ServerProject[]> | null = null;
+
+  async connect(serverUrl: string): Promise<ServerProject[]> {
+    // If already connected to the same server, return empty (caller should use listProjects)
+    if (this.isConnected() && this.serverUrl === serverUrl) {
+      console.log('[Bridge] Already connected, reusing connection');
+      return [];
+    }
+
+    // If connection is in progress to the same server, wait for it
+    if (this.connectingPromise && this.serverUrl === serverUrl) {
+      console.log('[Bridge] Connection in progress, waiting...');
+      return this.connectingPromise;
+    }
+
+    // If connecting to a different server or not connected, start fresh
+    this.connectingPromise = this._doConnect(serverUrl);
+    try {
+      const result = await this.connectingPromise;
+      return result;
+    } finally {
+      this.connectingPromise = null;
+    }
+  }
+
+  private _doConnect(serverUrl: string): Promise<ServerProject[]> {
     return new Promise((resolve, reject) => {
       try {
         this.serverUrl = serverUrl;
+        // Clear any pending resolvers from old connection
+        this.pendingResolvers.clear();
         this.cleanup();
 
         this.ws = new WebSocket(serverUrl);
 
         this.ws.onopen = () => {
-          console.log('[Claude] Connected to bridge server');
+          console.log('[Bridge] Connected to bridge server');
           this.reconnectAttempts = 0;
           this.startPingInterval();
-          resolve(true);
         };
 
         this.ws.onmessage = (event) => {
           try {
             const response: WSResponse = JSON.parse(event.data);
-            this.handleResponse(response);
+            console.log(`[Bridge] Received message type: ${response.type}`);
+            this.handleResponse(response, resolve);
           } catch (err) {
-            console.error('[Claude] Failed to parse message:', err);
+            console.error('[Bridge] Failed to parse message:', err);
           }
         };
 
         this.ws.onerror = (error) => {
-          console.error('[Claude] WebSocket error:', error);
+          console.error('[Bridge] WebSocket error:', error);
           this.onErrorCallback?.('Connection error');
           reject(new Error('WebSocket connection failed'));
         };
 
         this.ws.onclose = () => {
-          console.log('[Claude] Disconnected from bridge server');
+          console.log('[Bridge] Disconnected from bridge server');
           this.cleanup();
           this.onDisconnectCallback?.();
           this.attemptReconnect();
@@ -60,24 +103,190 @@ class ClaudeService {
     });
   }
 
-  private handleResponse(response: WSResponse) {
+  private handleResponse(response: WSResponse, initialResolve?: (projects: ServerProject[]) => void) {
     switch (response.type) {
       case 'connected':
         this.onConnectCallback?.();
+        // Resolve initial connection with projects list
+        if (initialResolve && response.projects) {
+          initialResolve(response.projects);
+        }
         break;
+
       case 'stream':
         if (response.content) {
           this.onMessageCallback?.(response.content);
         }
         break;
+
       case 'done':
         this.onDoneCallback?.();
         break;
+
       case 'error':
         this.onErrorCallback?.(response.error || 'Unknown error');
         break;
+
       case 'pong':
-        // Connection is alive
+        break;
+
+      case 'projects':
+        if (response.projects) {
+          this.onProjectsCallback?.(response.projects);
+          this.pendingResolvers.get('projects')?.(response.projects);
+          this.pendingResolvers.delete('projects');
+        }
+        break;
+
+      case 'files':
+        console.log(`[Bridge] Received 'files' response: ${response.files?.length || 0} files`);
+        if (response.files) {
+          this.onFilesCallback?.(response.files);
+          const resolver = this.pendingResolvers.get('files');
+          if (resolver) {
+            console.log('[Bridge] Resolving pending files promise');
+            resolver(response.files);
+            this.pendingResolvers.delete('files');
+          } else {
+            console.log('[Bridge] No pending files resolver found');
+          }
+        }
+        break;
+
+      case 'file_content':
+        this.onFileContentCallback?.(response.fileContent || '');
+        this.pendingResolvers.get('file_content')?.(response.fileContent || '');
+        this.pendingResolvers.delete('file_content');
+        break;
+
+      case 'file_saved':
+        console.log(`[Bridge] File saved: ${response.filePath}`);
+        this.pendingResolvers.get('file_saved')?.(response.filePath);
+        this.pendingResolvers.delete('file_saved');
+        break;
+
+      case 'project_created':
+        if (response.project) {
+          this.onProjectCreatedCallback?.(response.project);
+          this.pendingResolvers.get('project_created')?.(response.project);
+          this.pendingResolvers.delete('project_created');
+        }
+        break;
+
+      case 'project_deleted':
+        if (response.projectId) {
+          this.pendingResolvers.get('project_deleted')?.(response.projectId);
+          this.pendingResolvers.delete('project_deleted');
+        }
+        break;
+
+      case 'terminal_created':
+        if (response.terminalId) {
+          this.pendingResolvers.get('terminal_created')?.(response.terminalId);
+          this.pendingResolvers.delete('terminal_created');
+        }
+        break;
+
+      case 'terminal_output':
+        if (response.terminalId && response.content) {
+          this.handleTerminalOutput(response.terminalId, response.content);
+        }
+        break;
+
+      case 'terminal_closed':
+        if (response.terminalId) {
+          this.handleTerminalClosed(response.terminalId);
+        }
+        break;
+
+      // Voice responses
+      case 'voice_status':
+        if (response.voiceAvailable) {
+          this.pendingResolvers.get('voice_status')?.(response.voiceAvailable);
+          this.pendingResolvers.delete('voice_status');
+        }
+        break;
+
+      case 'voice_created':
+        if (response.voiceSessionId) {
+          this.pendingResolvers.get('voice_created')?.(response.voiceSessionId);
+          this.pendingResolvers.delete('voice_created');
+        }
+        break;
+
+      case 'voice_transcription':
+        if (response.voiceSessionId && response.transcription) {
+          this.handleVoiceTranscription(response.voiceSessionId, response.transcription);
+        }
+        break;
+
+      case 'voice_progress':
+        if (response.voiceSessionId && response.responseText) {
+          this.handleVoiceProgress(response.voiceSessionId, response.responseText);
+        }
+        break;
+
+      case 'voice_response':
+        if (response.voiceSessionId && response.responseText) {
+          this.handleVoiceResponse(response.voiceSessionId, response.responseText, response.audioData);
+        }
+        break;
+
+      case 'voice_audio':
+        if (response.voiceSessionId && response.audioData && response.audioMimeType) {
+          this.handleVoiceAudio(response.voiceSessionId, response.audioData, response.audioMimeType);
+        }
+        break;
+
+      case 'voice_closed':
+        if (response.voiceSessionId) {
+          this.handleVoiceClosed(response.voiceSessionId);
+        }
+        break;
+
+      // Voice-Terminal integration responses
+      case 'voice_terminal_enabled':
+        if (response.terminalId) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          vtCallbacks?.onEnabled?.();
+        }
+        break;
+
+      case 'voice_terminal_disabled':
+        if (response.terminalId) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          vtCallbacks?.onDisabled?.();
+          this.voiceTerminalCallbacks.delete(response.terminalId);
+        }
+        break;
+
+      case 'voice_terminal_speaking':
+        if (response.terminalId && response.responseText && response.audioData) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          vtCallbacks?.onSpeaking?.(response.responseText, response.audioData);
+        }
+        break;
+
+      case 'voice_progress':
+        // Handle progress for both voice sessions and voice-terminal
+        if (response.voiceSessionId && response.responseText) {
+          this.handleVoiceProgress(response.voiceSessionId, response.responseText);
+        }
+        if (response.terminalId && response.responseText) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          vtCallbacks?.onProgress?.(response.responseText);
+        }
+        break;
+
+      case 'voice_transcription':
+        // Handle transcription for both voice sessions and voice-terminal
+        if (response.voiceSessionId && response.transcription) {
+          this.handleVoiceTranscription(response.voiceSessionId, response.transcription);
+        }
+        if (response.terminalId && response.transcription) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          vtCallbacks?.onTranscription?.(response.transcription);
+        }
         break;
     }
   }
@@ -86,7 +295,7 @@ class ClaudeService {
     this.stopPingInterval();
     this.pingInterval = setInterval(() => {
       this.ping();
-    }, 30000); // Ping every 30 seconds
+    }, 30000);
   }
 
   private stopPingInterval() {
@@ -98,19 +307,19 @@ class ClaudeService {
 
   private attemptReconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.log('[Claude] Max reconnect attempts reached');
+      console.log('[Bridge] Max reconnect attempts reached');
       return;
     }
 
     this.reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000);
 
-    console.log(`[Claude] Attempting reconnect in ${delay}ms...`);
+    console.log(`[Bridge] Attempting reconnect in ${delay}ms...`);
 
     this.reconnectTimeout = setTimeout(() => {
       if (this.serverUrl) {
         this.connect(this.serverUrl).catch((err) => {
-          console.error('[Claude] Reconnect failed:', err);
+          console.error('[Bridge] Reconnect failed:', err);
         });
       }
     }, delay);
@@ -137,51 +346,369 @@ class ClaudeService {
       this.ws = null;
     }
     this.serverUrl = '';
-    this.reconnectAttempts = this.maxReconnectAttempts; // Prevent auto-reconnect
+    this.reconnectAttempts = this.maxReconnectAttempts;
   }
 
   isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 
-  ping() {
+  private send(message: WSMessage) {
     if (this.isConnected()) {
-      const message: WSMessage = { type: 'ping' };
+      console.log(`[Bridge] Sending message: ${message.type}`);
       this.ws?.send(JSON.stringify(message));
+    } else {
+      console.log(`[Bridge] Cannot send message ${message.type}: not connected (state=${this.ws?.readyState})`);
     }
+  }
+
+  ping() {
+    this.send({ type: 'ping' });
   }
 
   cancel() {
-    if (this.isConnected()) {
-      const message: WSMessage = { type: 'cancel' };
-      this.ws?.send(JSON.stringify(message));
-    }
+    this.send({ type: 'cancel' });
   }
 
-  async sendMessage(
-    prompt: string,
-    options?: {
-      systemPrompt?: string;
-      onChunk?: MessageCallback;
-      onDone?: ConnectionCallback;
-      onError?: ErrorCallback;
+  // Project management
+  async createProject(name: string): Promise<ServerProject> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+      this.pendingResolvers.set('project_created', resolve);
+      this.send({ type: 'create_project', projectName: name });
+      setTimeout(() => {
+        if (this.pendingResolvers.has('project_created')) {
+          this.pendingResolvers.delete('project_created');
+          reject(new Error('Timeout creating project'));
+        }
+      }, 10000);
+    });
+  }
+
+  async deleteProject(projectId: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+      this.pendingResolvers.set('project_deleted', resolve);
+      this.send({ type: 'delete_project', projectId });
+      setTimeout(() => {
+        if (this.pendingResolvers.has('project_deleted')) {
+          this.pendingResolvers.delete('project_deleted');
+          reject(new Error('Timeout deleting project'));
+        }
+      }, 10000);
+    });
+  }
+
+  async listProjects(): Promise<ServerProject[]> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+      this.pendingResolvers.set('projects', resolve);
+      this.send({ type: 'list_projects' });
+      setTimeout(() => {
+        if (this.pendingResolvers.has('projects')) {
+          this.pendingResolvers.delete('projects');
+          reject(new Error('Timeout listing projects'));
+        }
+      }, 10000);
+    });
+  }
+
+  async getFiles(projectId: string, subPath?: string): Promise<ProjectFile[]> {
+    return new Promise((resolve, reject) => {
+      console.log(`[Bridge] getFiles called: projectId=${projectId}, subPath=${subPath || '(root)'}`);
+      if (!this.isConnected()) {
+        console.log('[Bridge] getFiles failed: not connected');
+        reject(new Error('Not connected'));
+        return;
+      }
+      // Cancel any existing pending files request (project may have changed)
+      if (this.pendingResolvers.has('files')) {
+        console.log('[Bridge] getFiles: cancelling previous pending request');
+        this.pendingResolvers.delete('files');
+      }
+      console.log('[Bridge] Sending get_files message...');
+      this.pendingResolvers.set('files', (files) => {
+        console.log(`[Bridge] getFiles response received: ${files?.length || 0} files`);
+        resolve(files);
+      });
+      this.send({ type: 'get_files', projectId, filePath: subPath });
+      setTimeout(() => {
+        if (this.pendingResolvers.has('files')) {
+          console.log('[Bridge] getFiles timeout - no response received after 30s');
+          this.pendingResolvers.delete('files');
+          reject(new Error('Timeout getting files'));
+        }
+      }, 30000); // Increased timeout - messages can be delayed behind terminal output
+    });
+  }
+
+  async getFileContent(projectId: string, filePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+      this.pendingResolvers.set('file_content', resolve);
+      this.send({ type: 'get_file_content', projectId, filePath });
+      setTimeout(() => {
+        if (this.pendingResolvers.has('file_content')) {
+          this.pendingResolvers.delete('file_content');
+          reject(new Error('Timeout getting file content'));
+        }
+      }, 10000);
+    });
+  }
+
+  async saveFile(projectId: string, filePath: string, content: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+      console.log(`[Bridge] Saving file: ${filePath}`);
+      this.pendingResolvers.set('file_saved', resolve);
+      this.send({ type: 'save_file', projectId, filePath, content });
+      setTimeout(() => {
+        if (this.pendingResolvers.has('file_saved')) {
+          this.pendingResolvers.delete('file_saved');
+          reject(new Error('Timeout saving file'));
+        }
+      }, 10000);
+    });
+  }
+
+  // Terminal management
+  private terminalCallbacks: Map<string, {
+    onOutput?: (data: string) => void;
+    onClose?: () => void;
+  }> = new Map();
+
+  async createTerminal(
+    projectId: string,
+    callbacks: {
+      onOutput?: (data: string) => void;
+      onClose?: () => void;
+    },
+    cols: number = 80,
+    rows: number = 24,
+    sandbox: boolean = true
+  ): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+
+      // Temporarily store callbacks to associate with terminal ID when created
+      const tempId = `pending-${Date.now()}`;
+      this.terminalCallbacks.set(tempId, callbacks);
+
+      this.pendingResolvers.set('terminal_created', (terminalId: string) => {
+        // Move callbacks to actual terminal ID
+        this.terminalCallbacks.delete(tempId);
+        this.terminalCallbacks.set(terminalId, callbacks);
+        resolve(terminalId);
+      });
+
+      this.send({ type: 'terminal_create', projectId, cols, rows, sandbox });
+
+      setTimeout(() => {
+        if (this.pendingResolvers.has('terminal_created')) {
+          this.pendingResolvers.delete('terminal_created');
+          this.terminalCallbacks.delete(tempId);
+          reject(new Error('Timeout creating terminal'));
+        }
+      }, 10000);
+    });
+  }
+
+  sendTerminalInput(terminalId: string, input: string) {
+    this.send({ type: 'terminal_input', terminalId, input });
+  }
+
+  resizeTerminal(terminalId: string, cols: number, rows: number) {
+    this.send({ type: 'terminal_resize', terminalId, cols, rows });
+  }
+
+  closeTerminal(terminalId: string) {
+    this.send({ type: 'terminal_close', terminalId });
+    this.terminalCallbacks.delete(terminalId);
+  }
+
+  private handleTerminalOutput(terminalId: string, data: string) {
+    const callbacks = this.terminalCallbacks.get(terminalId);
+    callbacks?.onOutput?.(data);
+  }
+
+  private handleTerminalClosed(terminalId: string) {
+    const callbacks = this.terminalCallbacks.get(terminalId);
+    callbacks?.onClose?.();
+    this.terminalCallbacks.delete(terminalId);
+  }
+
+  // Voice session management
+  private voiceCallbacks: Map<string, {
+    onTranscription?: (text: string) => void;
+    onProgress?: (text: string) => void;
+    onResponse?: (text: string, audioData?: string) => void;
+    onAudio?: (audioData: string, mimeType: string) => void;
+    onClose?: () => void;
+    onError?: (error: string) => void;
+  }> = new Map();
+
+  async checkVoiceStatus(): Promise<{ stt: boolean; tts: boolean; agent: boolean }> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+      this.pendingResolvers.set('voice_status', resolve);
+      this.send({ type: 'voice_status' });
+      setTimeout(() => {
+        if (this.pendingResolvers.has('voice_status')) {
+          this.pendingResolvers.delete('voice_status');
+          reject(new Error('Timeout checking voice status'));
+        }
+      }, 5000);
+    });
+  }
+
+  async createVoiceSession(
+    projectId: string,
+    callbacks: {
+      onTranscription?: (text: string) => void;
+      onProgress?: (text: string) => void;
+      onResponse?: (text: string, audioData?: string) => void;
+      onAudio?: (audioData: string, mimeType: string) => void;
+      onClose?: () => void;
+      onError?: (error: string) => void;
     }
-  ): Promise<void> {
-    if (!this.isConnected()) {
-      throw new Error('Not connected to bridge server');
+  ): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+
+      const tempId = `pending-voice-${Date.now()}`;
+      this.voiceCallbacks.set(tempId, callbacks);
+
+      this.pendingResolvers.set('voice_created', (voiceSessionId: string) => {
+        this.voiceCallbacks.delete(tempId);
+        this.voiceCallbacks.set(voiceSessionId, callbacks);
+        resolve(voiceSessionId);
+      });
+
+      this.send({ type: 'voice_create', projectId });
+
+      setTimeout(() => {
+        if (this.pendingResolvers.has('voice_created')) {
+          this.pendingResolvers.delete('voice_created');
+          this.voiceCallbacks.delete(tempId);
+          reject(new Error('Timeout creating voice session'));
+        }
+      }, 10000);
+    });
+  }
+
+  sendVoiceAudio(voiceSessionId: string, audioData: string, mimeType: string = 'audio/wav') {
+    console.log(`[Bridge] Sending voice audio: ${audioData.length} chars, type: ${mimeType}`);
+    this.send({
+      type: 'voice_audio',
+      voiceSessionId,
+      audioData,
+      audioMimeType: mimeType
+    });
+  }
+
+  sendVoiceText(voiceSessionId: string, text: string) {
+    console.log(`[Bridge] Sending voice text: "${text}"`);
+    this.send({
+      type: 'voice_text',
+      voiceSessionId,
+      text
+    });
+  }
+
+  closeVoiceSession(voiceSessionId: string) {
+    this.send({ type: 'voice_close', voiceSessionId });
+    this.voiceCallbacks.delete(voiceSessionId);
+  }
+
+  private handleVoiceTranscription(voiceSessionId: string, transcription: string) {
+    const callbacks = this.voiceCallbacks.get(voiceSessionId);
+    callbacks?.onTranscription?.(transcription);
+  }
+
+  private handleVoiceProgress(voiceSessionId: string, text: string) {
+    const callbacks = this.voiceCallbacks.get(voiceSessionId);
+    callbacks?.onProgress?.(text);
+  }
+
+  private handleVoiceResponse(voiceSessionId: string, text: string, audioData?: string) {
+    const callbacks = this.voiceCallbacks.get(voiceSessionId);
+    callbacks?.onResponse?.(text, audioData);
+  }
+
+  private handleVoiceAudio(voiceSessionId: string, audioData: string, mimeType: string) {
+    const callbacks = this.voiceCallbacks.get(voiceSessionId);
+    callbacks?.onAudio?.(audioData, mimeType);
+  }
+
+  private handleVoiceClosed(voiceSessionId: string) {
+    const callbacks = this.voiceCallbacks.get(voiceSessionId);
+    callbacks?.onClose?.();
+    this.voiceCallbacks.delete(voiceSessionId);
+  }
+
+  // Voice-Terminal integration
+  // This links voice input/output directly to a terminal running Claude Code
+  private voiceTerminalCallbacks: Map<string, {
+    onTranscription?: (text: string) => void;
+    onProgress?: (text: string) => void;
+    onSpeaking?: (text: string, audioData: string) => void;
+    onEnabled?: () => void;
+    onDisabled?: () => void;
+    onError?: (error: string) => void;
+  }> = new Map();
+
+  enableVoiceOnTerminal(
+    terminalId: string,
+    callbacks: {
+      onTranscription?: (text: string) => void;
+      onProgress?: (text: string) => void;
+      onSpeaking?: (text: string, audioData: string) => void;
+      onEnabled?: () => void;
+      onDisabled?: () => void;
+      onError?: (error: string) => void;
     }
+  ) {
+    this.voiceTerminalCallbacks.set(terminalId, callbacks);
+    this.send({ type: 'voice_terminal_enable', terminalId });
+  }
 
-    this.onMessageCallback = options?.onChunk || null;
-    this.onDoneCallback = options?.onDone || null;
-    this.onErrorCallback = options?.onError || null;
+  disableVoiceOnTerminal(terminalId: string) {
+    this.send({ type: 'voice_terminal_disable', terminalId });
+    this.voiceTerminalCallbacks.delete(terminalId);
+  }
 
-    const message: WSMessage = {
-      type: 'chat',
-      prompt,
-      systemPrompt: options?.systemPrompt || REACT_NATIVE_SYSTEM_PROMPT,
-    };
-
-    this.ws?.send(JSON.stringify(message));
+  sendVoiceAudioToTerminal(terminalId: string, audioData: string, mimeType: string = 'audio/wav') {
+    console.log(`[Bridge] Sending voice audio to terminal: ${audioData.length} chars`);
+    this.send({
+      type: 'voice_terminal_audio',
+      terminalId,
+      audioData,
+      audioMimeType: mimeType
+    });
   }
 
   // Event listeners
@@ -192,6 +719,14 @@ class ClaudeService {
   onDisconnect(callback: ConnectionCallback) {
     this.onDisconnectCallback = callback;
   }
+
+  onProjects(callback: ProjectsCallback) {
+    this.onProjectsCallback = callback;
+  }
+
+  onProjectCreated(callback: ProjectCreatedCallback) {
+    this.onProjectCreatedCallback = callback;
+  }
 }
 
-export const claudeService = new ClaudeService();
+export const bridgeService = new BridgeService();

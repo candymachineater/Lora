@@ -35,7 +35,7 @@ export async function saveProjectToFileSystem(project: Project): Promise<void> {
     // Save each file
     for (const file of project.files) {
       const projectFile = new File(projectDir, file.path);
-      await projectFile.write(file.content);
+      await projectFile.write(file.content || '');
     }
 
     // Save manifest
@@ -80,6 +80,8 @@ export async function loadProjectFromFileSystem(projectId: string): Promise<Proj
         const content = await file.text();
         files.push({
           path: fileMeta.path,
+          name: fileMeta.path.split('/').pop() || fileMeta.path,
+          isDirectory: false,
           content,
           type: fileMeta.type,
         });
@@ -90,6 +92,7 @@ export async function loadProjectFromFileSystem(projectId: string): Promise<Proj
       id: manifest.id,
       name: manifest.name,
       description: manifest.description,
+      sandbox: manifest.sandbox ?? true, // Default to sandbox for older projects
       createdAt: new Date(manifest.createdAt),
       updatedAt: new Date(manifest.updatedAt),
       files,
@@ -121,9 +124,9 @@ export async function createVersion(
   const version: Version = {
     id: generateId(),
     projectId: project.id,
-    message,
+    description: message,
     timestamp: new Date(),
-    files: Object.fromEntries(project.files.map((f) => [f.path, f.content])),
+    snapshot: JSON.stringify(Object.fromEntries(project.files.map((f) => [f.path, f.content || '']))),
   };
 
   const versionDir = new Directory(getVersionsDir(), project.id);
@@ -206,17 +209,20 @@ function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
-export function createNewProject(name: string, description?: string): Project {
+export function createNewProject(name: string, description?: string, sandbox: boolean = true): Project {
   const now = new Date();
   return {
     id: generateId(),
     name,
     description,
+    sandbox,
     createdAt: now,
     updatedAt: now,
     files: [
       {
         path: 'App.tsx',
+        name: 'App.tsx',
+        isDirectory: false,
         content: `import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 
