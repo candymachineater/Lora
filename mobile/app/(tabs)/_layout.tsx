@@ -223,11 +223,13 @@ function VoiceTabButton() {
         // Use the registered handler for proper cleanup
         micPressHandler();
       } else {
-        // Fallback: at least set status to off if handler not available
-        console.log('[VoiceButton] No handler available, forcing status to off');
+        // Fallback: handler not available (chat component unmounted)
+        // Navigate to chat tab to trigger proper cleanup
+        console.log('[VoiceButton] No handler available, navigating to chat for cleanup');
         useVoiceStore.getState().setVoiceStatus('off');
         useVoiceStore.getState().setVoiceTranscript('');
         useVoiceStore.getState().setVoiceProgress('');
+        router.push('/(tabs)/chat');
       }
     }
   };

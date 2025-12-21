@@ -183,7 +183,8 @@ export default function TerminalScreen() {
       wasVoiceActiveRef.current = true;
     }
 
-    // Only cleanup when transitioning from active to off
+    // Cleanup when transitioning from active to off OR when remounting with off status
+    // (in case voice was turned off while component was unmounted)
     if (voiceStatus === 'off' && wasVoiceActiveRef.current) {
       wasVoiceActiveRef.current = false;
       console.log('[Voice] Status changed to off, running cleanup');
@@ -220,6 +221,17 @@ export default function TerminalScreen() {
           soundRef.current = null;
         }
 
+        // Stop thinking sound
+        if (thinkingSoundRef.current) {
+          try {
+            await thinkingSoundRef.current.stopAsync();
+            await thinkingSoundRef.current.unloadAsync();
+          } catch (e) {
+            // Ignore
+          }
+          thinkingSoundRef.current = null;
+        }
+
         // Notify server and disable voice on terminal
         if (activeTerminal) {
           bridgeService.sendVoiceInterrupt(activeTerminal.id);
@@ -230,6 +242,17 @@ export default function TerminalScreen() {
       cleanup();
     }
   }, [voiceStatus, activeTerminal]);
+
+  // On mount, if voice status is 'off', ensure all terminals have voice disabled
+  // This handles the case where voice was turned off while component was unmounted
+  useEffect(() => {
+    if (voiceStatus === 'off' && terminals.length > 0) {
+      console.log('[Voice] Component mounted with voice off, ensuring all terminals disabled');
+      terminals.forEach((t) => {
+        bridgeService.disableVoiceOnTerminal(t.id);
+      });
+    }
+  }, []);
 
   // Create terminal with initial prompt passed directly to Claude Code
   const createTerminalWithPrompt = async (prompt: string) => {
@@ -468,14 +491,40 @@ export default function TerminalScreen() {
               break;
 
             case 'take_screenshot':
-              // Voice agent requested a fresh screenshot - capture and log it
+              // Voice agent requested a fresh screenshot - capture CURRENT TAB (not terminal!)
               console.log('[Voice-Terminal] Screenshot requested by agent');
-              if (viewShotRef.current?.capture) {
-                try {
-                  const uri = await viewShotRef.current.capture();
-                  console.log('[Voice-Terminal] Screenshot captured on demand:', uri);
-                } catch (err) {
-                  console.log('[Voice-Terminal] On-demand screenshot failed:', err);
+              try {
+                // Use the registered screenshot capture for the CURRENT tab (preview, editor, etc.)
+                const captureScreenshot = useVoiceStore.getState().captureCurrentTabScreenshot;
+                const uri = await captureScreenshot();
+                console.log('[Voice-Terminal] Screenshot captured from current tab:', uri ? `${uri.length} chars` : 'empty');
+
+                // Send screenshot back to server for vision analysis
+                if (uri && activeTerminal) {
+                  bridgeService.send({
+                    type: 'screenshot_captured' as any,
+                    terminalId: activeTerminal.id,
+                    screenshot: uri
+                  } as any);
+                  console.log('[Voice-Terminal] Screenshot sent to server for analysis');
+                } else if (!uri && activeTerminal) {
+                  // Screenshot failed - send empty response so server doesn't wait
+                  bridgeService.send({
+                    type: 'screenshot_captured' as any,
+                    terminalId: activeTerminal.id,
+                    screenshot: ''
+                  } as any);
+                  console.log('[Voice-Terminal] Screenshot capture failed, sent empty response');
+                }
+              } catch (err) {
+                console.log('[Voice-Terminal] On-demand screenshot failed:', err);
+                // Send empty response on error so server doesn't wait forever
+                if (activeTerminal) {
+                  bridgeService.send({
+                    type: 'screenshot_captured' as any,
+                    terminalId: activeTerminal.id,
+                    screenshot: ''
+                  } as any);
                 }
               }
               break;
@@ -531,15 +580,24 @@ export default function TerminalScreen() {
 
             case 'switch_terminal':
               // Switch to a specific terminal tab (by index or direction)
+              // First navigate to Chat tab if not already there
+              router.push('/(tabs)/chat');
+
               if (params?.index !== undefined) {
                 const idx = Number(params.index);
                 if (idx >= 0 && idx < terminals.length) {
                   setActiveTerminalIndex(idx);
+                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                  console.log(`[Voice-Terminal] Switched to terminal ${idx + 1}`);
                 }
               } else if (params?.direction === 'next') {
                 setActiveTerminalIndex((prev) => (prev + 1) % terminals.length);
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                console.log('[Voice-Terminal] Switched to next terminal');
               } else if (params?.direction === 'prev') {
                 setActiveTerminalIndex((prev) => (prev - 1 + terminals.length) % terminals.length);
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                console.log('[Voice-Terminal] Switched to previous terminal');
               }
               break;
 
@@ -761,19 +819,34 @@ export default function TerminalScreen() {
       // Set status to 'off' IMMEDIATELY to prevent double-taps during async cleanup
       setVoiceStatus('off');
       setVoiceTranscript('');
+      setVoiceProgress('');
 
-      // Now do async cleanup
+      // Now do async cleanup (with error handling)
       stopMetering();
-      if (recordingRef.current) {
-        await recordingRef.current.stopAndUnloadAsync();
+      try {
+        if (recordingRef.current) {
+          await recordingRef.current.stopAndUnloadAsync();
+          recordingRef.current = null;
+        }
+      } catch (e) {
+        console.log('[Voice] Error stopping recording:', e);
         recordingRef.current = null;
       }
-      if (soundRef.current) {
-        await soundRef.current.stopAsync();
-        await soundRef.current.unloadAsync();
+      try {
+        if (soundRef.current) {
+          await soundRef.current.stopAsync();
+          await soundRef.current.unloadAsync();
+          soundRef.current = null;
+        }
+      } catch (e) {
+        console.log('[Voice] Error stopping sound:', e);
         soundRef.current = null;
       }
-      bridgeService.disableVoiceOnTerminal(activeTerminal.id);
+      try {
+        bridgeService.disableVoiceOnTerminal(activeTerminal.id);
+      } catch (e) {
+        console.log('[Voice] Error disabling voice on terminal:', e);
+      }
     }
   }, [activeTerminal, voiceStatus, setVoiceStatus, setVoiceTranscript, setVoiceProgress]);
 
@@ -1171,6 +1244,11 @@ export default function TerminalScreen() {
     if (currentStatus !== 'off') {
       console.log('[Voice] Interrupting voice mode');
 
+      // IMMEDIATELY set status to off to prevent re-entry and update UI
+      setVoiceStatus('off');
+      setVoiceTranscript('');
+      setVoiceProgress('');
+
       // Clear TTS playing flag
       isTTSPlayingRef.current = false;
 
@@ -1197,19 +1275,14 @@ export default function TerminalScreen() {
       // Stop any recording
       await cleanupRecording();
 
-      // Notify server of interruption
-      if (activeTerminal) {
-        bridgeService.sendVoiceInterrupt(activeTerminal.id);
-      }
-
-      // Turn off voice mode
-      setVoiceStatus('off');
-      setVoiceTranscript('');
-      setVoiceProgress('');
-
-      // Disable voice on terminal
-      if (activeTerminal) {
-        bridgeService.disableVoiceOnTerminal(activeTerminal.id);
+      // Notify server and disable voice (wrap in try-catch to prevent blocking)
+      try {
+        if (activeTerminal) {
+          bridgeService.sendVoiceInterrupt(activeTerminal.id);
+          bridgeService.disableVoiceOnTerminal(activeTerminal.id);
+        }
+      } catch (e) {
+        console.log('[Voice] Error notifying server:', e);
       }
     }
   }, [activeTerminal, setVoiceStatus, setVoiceTranscript, setVoiceProgress]);
@@ -1227,7 +1300,6 @@ export default function TerminalScreen() {
 
   // Handle pending voice start from tab bar button (when navigating from another tab)
   useEffect(() => {
-    console.log('[Chat] Pending voice check:', { pendingVoiceStart, hasTerminal: !!activeTerminal, voiceStatus });
     if (pendingVoiceStart && activeTerminal && voiceStatus === 'off') {
       console.log('[Chat] Starting voice mode from pending flag');
       setPendingVoiceStart(false);
