@@ -759,6 +759,62 @@ const CLAUDE_CODE_SYSTEM_PROMPT = VOICE_AGENT_SYSTEM_PROMPT;
 
 
 // ============================================================================
+// TEXT NORMALIZATION (for common mishearings)
+// ============================================================================
+
+/**
+ * Common words/phrases that are often misheard by STT
+ * Maps misheard text to correct text
+ */
+const MISHEARING_CORRECTIONS: Array<{ pattern: RegExp; replacement: string }> = [
+  // Claude Code variations
+  { pattern: /\bquad code\b/gi, replacement: 'Claude Code' },
+  { pattern: /\bcloud code\b/gi, replacement: 'Claude Code' },
+  { pattern: /\bclod code\b/gi, replacement: 'Claude Code' },
+  { pattern: /\bclawed code\b/gi, replacement: 'Claude Code' },
+  { pattern: /\bclaude coat\b/gi, replacement: 'Claude Code' },
+  { pattern: /\bclaud code\b/gi, replacement: 'Claude Code' },
+  { pattern: /\bkloud code\b/gi, replacement: 'Claude Code' },
+  { pattern: /\bcod code\b/gi, replacement: 'Claude Code' },
+  { pattern: /\bquadcode\b/gi, replacement: 'Claude Code' },
+  { pattern: /\bcloudcode\b/gi, replacement: 'Claude Code' },
+
+  // Lora variations (wake word related)
+  { pattern: /\blaura\b/gi, replacement: 'Lora' },
+  { pattern: /\blara\b/gi, replacement: 'Lora' },
+  { pattern: /\blorra\b/gi, replacement: 'Lora' },
+  { pattern: /\blawra\b/gi, replacement: 'Lora' },
+
+  // Common programming terms
+  { pattern: /\breact native\b/gi, replacement: 'React Native' },
+  { pattern: /\breact js\b/gi, replacement: 'React.js' },
+  { pattern: /\bnode js\b/gi, replacement: 'Node.js' },
+  { pattern: /\bnext js\b/gi, replacement: 'Next.js' },
+  { pattern: /\btypescript\b/gi, replacement: 'TypeScript' },
+  { pattern: /\bjavascript\b/gi, replacement: 'JavaScript' },
+  { pattern: /\bjson\b/gi, replacement: 'JSON' },
+  { pattern: /\bapi\b/gi, replacement: 'API' },
+];
+
+/**
+ * Normalize transcribed text to fix common STT mishearings
+ */
+function normalizeTranscription(text: string): string {
+  let normalized = text;
+
+  for (const { pattern, replacement } of MISHEARING_CORRECTIONS) {
+    normalized = normalized.replace(pattern, replacement);
+  }
+
+  // Log if we made corrections
+  if (normalized !== text) {
+    voiceLog('INFO', 'STT', `Normalized: "${text}" → "${normalized}"`);
+  }
+
+  return normalized;
+}
+
+// ============================================================================
 // SPEECH-TO-TEXT (Whisper)
 // ============================================================================
 
@@ -803,11 +859,13 @@ export async function transcribeAudio(audioBuffer: Buffer, mimeType: string = 'a
             voiceLog('ERROR', 'STT', `Whisper error: ${result.error.message}`);
             reject(new Error(result.error.message));
           } else {
+            // Normalize the transcription to fix common mishearings
+            const normalizedText = normalizeTranscription(result.text);
             voiceLog('VOICE', 'STT', `Transcribed in ${duration}ms`, {
-              text: result.text,
+              text: normalizedText,
               audioSize: audioBuffer.length
             });
-            resolve(result.text);
+            resolve(normalizedText);
           }
         } catch (e) {
           voiceLog('ERROR', 'STT', 'Failed to parse Whisper response');
