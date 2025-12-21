@@ -40,8 +40,8 @@ export default function TerminalScreen() {
   const router = useRouter();
   const params = useLocalSearchParams<{ pendingPrompt?: string; createNewTerminal?: string }>();
 
-  const { currentProjectId, projects, currentProject } = useProjectStore();
-  const { bridgeServerUrl, isConnected, setIsConnected } = useSettingsStore();
+  const { currentProjectId, projects, currentProject, currentFile } = useProjectStore();
+  const { bridgeServerUrl, isConnected, setIsConnected, voiceAgentModel } = useSettingsStore();
 
   // Multi-terminal state
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
@@ -79,9 +79,15 @@ export default function TerminalScreen() {
   const workingScreenshotAttemptsRef = useRef<number>(0); // Limit working loop retries
   const wasVoiceActiveRef = useRef<boolean>(false); // Track if voice was active for cleanup
   const isTTSPlayingRef = useRef<boolean>(false); // Track if TTS is currently playing (prevent thinking sound overlap)
+  const activeTerminalRef = useRef<TerminalSession | undefined>(undefined); // Track current active terminal for voice callbacks
 
   const project = currentProject();
   const activeTerminal = terminals[activeTerminalIndex];
+
+  // Keep ref in sync with active terminal (for use in voice callbacks)
+  useEffect(() => {
+    activeTerminalRef.current = activeTerminal;
+  }, [activeTerminal]);
   const projectSandbox = project?.sandbox ?? true;
 
   // Connect to bridge server
@@ -276,8 +282,20 @@ export default function TerminalScreen() {
   // Thinking/working sound - loops while processing
   const playThinkingSound = async () => {
     try {
+      // Don't start if TTS is currently playing
+      if (isTTSPlayingRef.current) {
+        console.log('[Voice] Skipping thinking sound - TTS is playing');
+        return;
+      }
+
       // Stop any existing thinking sound first
       await stopThinkingSound();
+
+      // Check again after async operation - TTS might have started
+      if (isTTSPlayingRef.current) {
+        console.log('[Voice] Aborting thinking sound - TTS started during setup');
+        return;
+      }
 
       // Set audio mode for playback
       await Audio.setAudioModeAsync({
@@ -286,11 +304,25 @@ export default function TerminalScreen() {
         playThroughEarpieceAndroid: false,
       });
 
+      // Final check before playing
+      if (isTTSPlayingRef.current) {
+        console.log('[Voice] Aborting thinking sound - TTS started during audio mode setup');
+        return;
+      }
+
       // Load and play the thinking sound with looping
       const { sound } = await Audio.Sound.createAsync(
         require('../../assets/thinking-chime.mp3'),
         { isLooping: true, volume: 0.5 }
       );
+
+      // One more check before actually playing
+      if (isTTSPlayingRef.current) {
+        console.log('[Voice] Aborting thinking sound - TTS started during sound loading');
+        await sound.unloadAsync();
+        return;
+      }
+
       thinkingSoundRef.current = sound;
       await sound.playAsync();
       console.log('[Voice] Thinking sound started (looping)');
@@ -393,8 +425,8 @@ export default function TerminalScreen() {
 
     if (voiceStatus === 'off') {
       // Turn on voice mode for this terminal
-      console.log('[Chat] Enabling voice on terminal:', activeTerminal.id);
-      bridgeService.enableVoiceOnTerminal(activeTerminal.id, {
+      console.log('[Chat] Enabling voice on terminal:', activeTerminal.id, 'with model:', voiceAgentModel);
+      bridgeService.enableVoiceOnTerminal(activeTerminal.id, voiceAgentModel, {
         onTranscription: (text) => {
           console.log('[Voice-Terminal] Transcribed:', text);
           setVoiceTranscript(text);
@@ -541,6 +573,60 @@ export default function TerminalScreen() {
               }
               break;
 
+            case 'toggle_console':
+              // Toggle console panel in Preview tab
+              console.log('[Voice-Terminal] Toggling console panel');
+              useVoiceStore.getState().triggerPreviewAction('toggle_console');
+              break;
+
+            case 'reload_preview':
+              // Reload the preview webview
+              console.log('[Voice-Terminal] Reloading preview');
+              useVoiceStore.getState().triggerPreviewAction('reload_preview');
+              break;
+
+            case 'send_to_claude':
+              // Send console logs to Claude
+              console.log('[Voice-Terminal] Sending console logs to Claude');
+              useVoiceStore.getState().triggerPreviewAction('send_to_claude');
+              break;
+
+            // Editor actions
+            case 'open_file':
+              // Open a file in the editor
+              console.log('[Voice-Terminal] Opening file:', params?.filePath);
+              if (params?.filePath) {
+                router.push('/(tabs)/editor' as any);
+                useVoiceStore.getState().triggerEditorAction({
+                  type: 'open_file',
+                  filePath: String(params.filePath),
+                });
+              }
+              break;
+
+            case 'close_file':
+              // Close the current file and go back to file list
+              console.log('[Voice-Terminal] Closing file');
+              useVoiceStore.getState().triggerEditorAction({ type: 'close_file' });
+              break;
+
+            case 'save_file':
+              // Save the current file
+              console.log('[Voice-Terminal] Saving file');
+              useVoiceStore.getState().triggerEditorAction({ type: 'save_file' });
+              break;
+
+            case 'set_file_content':
+              // Replace file content
+              console.log('[Voice-Terminal] Setting file content');
+              if (params?.content !== undefined) {
+                useVoiceStore.getState().triggerEditorAction({
+                  type: 'set_file_content',
+                  content: String(params.content),
+                });
+              }
+              break;
+
             default:
               console.log('[Voice-Terminal] Unknown app control action:', control.action);
           }
@@ -552,35 +638,58 @@ export default function TerminalScreen() {
 
           // Show progress message based on what we're doing
           const workingMessages: Record<string, string> = {
-            'screenshot': '📷 Analyzing screen...',
-            'claude_action': '⏳ Waiting for Claude Code...',
-            'gathering_info': '🔍 Gathering information...',
-            'analyzing': '🧠 Thinking...',
+            'screenshot': 'Analyzing screen...',
+            'claude_action': 'Waiting for Claude Code...',
+            'gathering_info': 'Gathering information...',
+            'analyzing': 'Thinking...',
           };
-          setVoiceProgress(workingMessages[workingState.reason] || '⏳ Working...');
+          setVoiceProgress(workingMessages[workingState.reason] || 'Working...');
 
           // Handle follow-up actions
           if (workingState.followUpAction === 'take_screenshot') {
-            // Terminal tab uses WebView (xterm.js) which cannot be captured by ViewShot
-            // This is normal - we use terminal output instead of screenshot for the Terminal tab
-            console.log('[Voice-Terminal] Using terminal output for context (Terminal tab)');
+            // Get the ACTUAL current tab from store
+            const actualCurrentTab = useVoiceStore.getState().currentTab;
+            console.log('[Voice-Terminal] Take screenshot requested, current tab:', actualCurrentTab);
             workingScreenshotAttemptsRef.current = 0;
 
-            // Send terminal output to agent instead of screenshot
-            const terminalContent = activeTerminal?.output
-              ? activeTerminal.output.slice(-120000) // ~120k chars (~30k tokens) for context
-              : undefined;
+            let screenshot: string | undefined;
+            let terminalContent: string | undefined;
+
+            if (actualCurrentTab === 'terminal') {
+              // Terminal tab uses WebView (xterm.js) which cannot be captured by ViewShot
+              // Use terminal output text instead
+              console.log('[Voice-Terminal] Using terminal output for Terminal tab');
+              terminalContent = activeTerminal?.output
+                ? activeTerminal.output.slice(-120000) // ~120k chars (~30k tokens) for context
+                : undefined;
+            } else {
+              // Other tabs (Preview, Editor, etc.) - use registered capture function
+              console.log('[Voice-Terminal] Capturing screenshot for', actualCurrentTab, 'tab');
+              const captureScreenshot = useVoiceStore.getState().captureCurrentTabScreenshot;
+              screenshot = await captureScreenshot();
+              if (screenshot) {
+                console.log('[Voice-Terminal] Screenshot captured successfully');
+              } else {
+                console.log('[Voice-Terminal] Screenshot capture returned empty');
+              }
+            }
 
             bridgeService.sendVoiceAudioToTerminal(
               activeTerminal.id,
               '', // No audio
               'audio/wav',
-              undefined, // No screenshot (Terminal tab uses terminal output instead)
+              screenshot, // Real screenshot from the current tab
               terminalContent,
               {
-                currentTab: 'terminal',
+                currentTab: actualCurrentTab,
                 projectName: project?.name,
                 projectId: project?.id,
+                // Multi-terminal info
+                terminalCount: terminals.length,
+                activeTerminalIndex: activeTerminalIndex,
+                activeTerminalId: activeTerminal?.id,
+                // Editor info - which file is currently open (if any)
+                currentFile: currentFile || undefined,
               }
             );
             return;
@@ -603,7 +712,7 @@ export default function TerminalScreen() {
           const currentStatus = useVoiceStore.getState().voiceStatus;
           if (currentStatus !== 'off' && currentStatus !== 'speaking' && currentStatus !== 'processing') {
             // Interrupt current listening to notify about completed task
-            setVoiceProgress(`✅ Claude finished: ${description}`);
+            setVoiceProgress(`Claude finished: ${description}`);
 
             // The server has already sent a summary, so we can construct a notification message
             // and add it to the conversation context for the agent to reference
@@ -865,7 +974,9 @@ export default function TerminalScreen() {
     stopMetering();
     setAudioLevel(0);
 
-    if (!recordingRef.current || !activeTerminal) {
+    // Use ref to get current active terminal (avoids stale closure issues)
+    const currentActiveTerminal = activeTerminalRef.current;
+    if (!recordingRef.current || !currentActiveTerminal) {
       return;
     }
 
@@ -907,8 +1018,8 @@ export default function TerminalScreen() {
           const screenCapture: string | undefined = undefined;
 
           // Get terminal content (~120k chars for context, roughly 30k tokens)
-          const terminalContent = activeTerminal?.output
-            ? activeTerminal.output.slice(-120000)
+          const terminalContent = currentActiveTerminal?.output
+            ? currentActiveTerminal.output.slice(-120000)
             : undefined;
 
           // Build app state for context
@@ -918,11 +1029,17 @@ export default function TerminalScreen() {
             projectId: project?.id,
             hasPreview: false,
             fileCount: 0,
+            // Multi-terminal info
+            terminalCount: terminals.length,
+            activeTerminalIndex: activeTerminalIndex,
+            activeTerminalId: currentActiveTerminal?.id,
+            // Editor info - which file is currently open (if any)
+            currentFile: currentFile || undefined,
           };
 
           // Send to terminal with screenshot, terminal content, and app state
           bridgeService.sendVoiceAudioToTerminal(
-            activeTerminal.id,
+            currentActiveTerminal.id,
             base64,
             mimeType,
             screenCapture,
@@ -1169,22 +1286,24 @@ export default function TerminalScreen() {
         <View style={styles.tabsContainer}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tabsContent}>
             {terminals.map((terminal, index) => (
-              <TouchableOpacity
-                key={terminal.id}
-                style={[styles.tab, index === activeTerminalIndex && styles.tabActive]}
-                onPress={() => setActiveTerminalIndex(index)}
-              >
-                <Text style={[styles.tabText, index === activeTerminalIndex && styles.tabTextActive]}>
-                  {index + 1}
-                </Text>
+              <View key={terminal.id} style={[styles.tab, index === activeTerminalIndex && styles.tabActive]}>
+                <TouchableOpacity
+                  style={styles.tabLabel}
+                  onPress={() => setActiveTerminalIndex(index)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={[styles.tabText, index === activeTerminalIndex && styles.tabTextActive]}>
+                    Term {index + 1}
+                  </Text>
+                </TouchableOpacity>
                 <TouchableOpacity
                   style={styles.tabClose}
                   onPress={() => closeTerminal(index)}
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                 >
-                  <X color={index === activeTerminalIndex ? '#FFF' : '#888'} size={10} />
+                  <X color={index === activeTerminalIndex ? '#FFF' : '#666'} size={12} />
                 </TouchableOpacity>
-              </TouchableOpacity>
+              </View>
             ))}
           </ScrollView>
         </View>
@@ -1240,24 +1359,30 @@ const styles = StyleSheet.create({
   tab: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
     backgroundColor: '#1E1E1E',
-    borderRadius: 4,
-    gap: 6,
+    borderRadius: 6,
+    gap: 4,
+    overflow: 'hidden',
   },
   tabActive: {
     backgroundColor: colors.brandTiger,
   },
+  tabLabel: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
   tabText: {
     color: '#888',
-    fontSize: 11,
+    fontSize: 13,
     fontWeight: '600',
   },
   tabTextActive: {
     color: '#FFF',
   },
   tabClose: {
-    padding: 2,
+    padding: 8,
+    marginLeft: -4,
+    borderLeftWidth: 1,
+    borderLeftColor: 'rgba(255,255,255,0.1)',
   },
 });

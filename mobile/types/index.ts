@@ -74,6 +74,7 @@ export interface WSMessage {
   audioMimeType?: string; // e.g., 'audio/wav', 'audio/m4a'
   text?: string; // For voice_text (text input instead of audio)
   screenCapture?: string; // Base64 PNG screenshot of phone screen
+  model?: string; // Voice agent model (for voice_terminal_enable)
   terminalContent?: string; // Recent terminal output for context
   appState?: {  // Current app state for voice agent context
     currentTab: string;
@@ -106,7 +107,7 @@ export interface WSResponse {
   isComplete?: boolean; // True if this is the final TTS response (should return to listening after)
   // App control from voice agent
   appControl?: {
-    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
+    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project' | 'toggle_console' | 'reload_preview' | 'send_to_claude' | 'open_file' | 'close_file' | 'save_file' | 'set_file_content';
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
   };

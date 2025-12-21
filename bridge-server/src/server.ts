@@ -79,7 +79,12 @@ interface Message {
     projectId?: string;
     hasPreview?: boolean;
     fileCount?: number;
+    // Multi-terminal support
+    terminalCount?: number;        // Total number of open terminals
+    activeTerminalIndex?: number;  // Currently active terminal (0-indexed)
+    activeTerminalId?: string;     // ID of the active terminal
   };
+  model?: string; // Voice agent model selection
 }
 
 interface ProjectInfo {
@@ -126,7 +131,14 @@ interface StreamResponse {
       | 'switch_terminal'    // Switch terminal (params.index or params.direction: next/prev)
       | 'refresh_files'      // Refresh file list in editor
       | 'show_settings'      // Open settings modal
-      | 'scroll';            // Scroll terminal (params.direction: up/down, params.count)
+      | 'scroll'             // Scroll terminal (params.direction: up/down, params.count)
+      | 'toggle_console'     // Toggle console panel visibility in preview tab
+      | 'reload_preview'     // Reload the preview webview
+      | 'send_to_claude'     // Send console logs to Claude for analysis
+      | 'open_file'          // Open a file in editor (params.filePath)
+      | 'close_file'         // Close current file and return to file list
+      | 'save_file'          // Save the current file
+      | 'set_file_content';  // Replace file content (params.content)
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
   };
@@ -169,6 +181,7 @@ interface TerminalSession {
   pty: pty.IPty;
   // Voice-terminal integration
   voiceMode: boolean;
+  voiceAgentModel?: string; // Selected model for voice agent (e.g., claude-haiku-4-5-20251001)
   voiceAwaitingResponse: boolean;
   voiceAccumulatedOutput: string;
   voiceLastOutputTime: number;
@@ -1140,10 +1153,11 @@ wss.on('connection', (ws: WebSocket) => {
         const session = terminals.get(message.terminalId);
         if (session) {
           session.voiceMode = true;
+          session.voiceAgentModel = message.model; // Store selected model
           session.voiceAwaitingResponse = false;
           session.voiceAccumulatedOutput = '';
           session.voiceLastOutputTime = Date.now();
-          serverLog(`🎤 Voice mode enabled for terminal ${message.terminalId}`);
+          serverLog(`🎤 Voice mode enabled for terminal ${message.terminalId} with model: ${message.model || 'default'}`);
 
           const response: StreamResponse = {
             type: 'voice_terminal_enabled',
@@ -1196,6 +1210,7 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       if (message.type === 'voice_terminal_audio' && message.terminalId) {
+        serverLog(`[Voice] Audio received for terminal: ${message.terminalId}, activeTerminalId: ${message.appState?.activeTerminalId || 'unknown'}`);
         const session = terminals.get(message.terminalId);
         if (!session) {
           const response: StreamResponse = {
@@ -1306,6 +1321,7 @@ wss.on('connection', (ws: WebSocket) => {
           }
 
           // Send transcription to client (what the user said)
+          serverLog(`[Voice] User said: "${transcription}"`);
           const transcriptionResponse: StreamResponse = {
             type: 'voice_transcription',
             terminalId: message.terminalId,
@@ -1402,6 +1418,11 @@ wss.on('connection', (ws: WebSocket) => {
             if (message.appState.projectName) {
               appStateDesc += `- Project: ${message.appState.projectName}\n`;
             }
+            // Multi-terminal info
+            if (message.appState.terminalCount !== undefined && message.appState.terminalCount > 0) {
+              appStateDesc += `- Open terminals: ${message.appState.terminalCount}\n`;
+              appStateDesc += `- Active terminal: Terminal ${(message.appState.activeTerminalIndex ?? 0) + 1} of ${message.appState.terminalCount}\n`;
+            }
           }
 
           const agentResponse = await voiceService.processVoiceInput(
@@ -1412,8 +1433,12 @@ wss.on('connection', (ws: WebSocket) => {
               recentOutput: terminalContext + appStateDesc,
               claudeCodeState: stateDescription,
               screenCapture: message.screenCapture  // Phone screenshot if provided
-            }
+            },
+            session.voiceAgentModel  // Pass selected model
           );
+
+          // Log agent response for debugging
+          serverLog(`[Voice] Agent response: type=${agentResponse.type}, voiceResponse="${agentResponse.voiceResponse || ''}", content="${agentResponse.content?.substring(0, 100) || ''}"`);
 
           // Handle IGNORE - transcription artifacts, noise
           if (agentResponse.type === 'ignore') {
@@ -1447,19 +1472,22 @@ wss.on('connection', (ws: WebSocket) => {
             const tmuxName = session.tmuxSessionName;
 
             // Check if this is a "complex" command that needs observation after execution
-            // Complex commands: slash commands, or any command with voiceResponse (implies user expectation of result)
+            // Complex commands: slash commands always need follow-up to report what happened
             const commands = agentResponse.content.split(',').map(c => c.trim()).filter(c => c);
             const hasSlashCommand = commands.some(cmd => cmd.startsWith('/'));
-            const needsFollowUp = hasSlashCommand && agentResponse.voiceResponse;
+            const needsFollowUp = hasSlashCommand; // Always follow up on slash commands
+
+            // Determine intro speech - use agent's voiceResponse or a default
+            const introSpeech = agentResponse.voiceResponse || 'Let me do that for you.';
 
             // If this needs follow-up, speak FIRST before executing
-            if (needsFollowUp && agentResponse.voiceResponse) {
-              serverLog(`[Voice] Speaking before executing command...`);
-              const interimTTS = await voiceService.textToSpeech(agentResponse.voiceResponse);
+            if (needsFollowUp) {
+              serverLog(`[Voice] Speaking before executing command: "${introSpeech}"`);
+              const interimTTS = await voiceService.textToSpeech(introSpeech);
               const interimResponse: StreamResponse & { isComplete?: boolean } = {
                 type: 'voice_terminal_speaking',
                 terminalId: message.terminalId,
-                responseText: agentResponse.voiceResponse,
+                responseText: introSpeech,
                 audioData: interimTTS.toString('base64'),
                 audioMimeType: 'audio/mp3',
                 isComplete: false  // NOT final - more coming after we observe the result
@@ -1568,7 +1596,7 @@ wss.on('connection', (ws: WebSocket) => {
                   return repeatCount > 1 ? `Right ${repeatCount}x.` : 'Right.';
                 case 'ENTER':
                   await tmuxService.sendEnter(tmuxName);
-                  return 'Enter.';
+                  return 'Selected.';
                 case 'TAB':
                   for (let i = 0; i < repeatCount; i++) {
                     await tmuxService.sendSpecialKey(tmuxName, 'Tab');
@@ -1607,7 +1635,8 @@ wss.on('connection', (ws: WebSocket) => {
                   terminalContent: terminalOutput,
                   appState: message.appState,
                   systemNote: `[SYSTEM: The command was executed. Here's the current terminal output. Describe what you see and offer to help the user with next steps. Be concise.]`
-                }
+                },
+                session.voiceAgentModel  // Pass selected model
               );
 
               // Speak the follow-up
@@ -1725,6 +1754,7 @@ wss.on('connection', (ws: WebSocket) => {
             ws.send(JSON.stringify(audioResponse));
 
             // Send working state to client - this triggers the working chime and follow-up action
+            serverLog(`[Voice] Sending working state: reason=${agentResponse.workingState?.reason}, followUpAction=${agentResponse.workingState?.followUpAction}`);
             const workingResponse: StreamResponse = {
               type: 'voice_working',
               terminalId: message.terminalId,

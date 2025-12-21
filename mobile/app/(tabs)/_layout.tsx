@@ -7,6 +7,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, shadows, spacing } from '../../theme';
 import { ProjectSelector } from '../../components/common';
 import { useVoiceStore, useProjectStore, useSettingsStore } from '../../stores';
+import type { TabName } from '../../stores/voiceStore';
 
 // Simplified voice state colors - easy to understand
 const VOICE_COLORS = {
@@ -274,7 +275,7 @@ function VoiceTabButton() {
       case 'listening': return 'Listening...';
       case 'processing': return 'Thinking...';
       case 'speaking': return 'Speaking...';
-      case 'working': return '⏳ Working...';
+      case 'working': return 'Working...';
       default: return '';
     }
   };
@@ -288,7 +289,7 @@ function VoiceTabButton() {
       {/* Concentric rings - show for listening, speaking, processing */}
       {showRings && (
         <>
-          <Animated.View style={[
+          <Animated.View pointerEvents="none" style={[
             voiceButtonStyles.ring,
             {
               width: buttonSize,
@@ -299,7 +300,7 @@ function VoiceTabButton() {
               opacity: ring3Opacity,
             }
           ]} />
-          <Animated.View style={[
+          <Animated.View pointerEvents="none" style={[
             voiceButtonStyles.ring,
             {
               width: buttonSize,
@@ -310,7 +311,7 @@ function VoiceTabButton() {
               opacity: ring2Opacity,
             }
           ]} />
-          <Animated.View style={[
+          <Animated.View pointerEvents="none" style={[
             voiceButtonStyles.ring,
             {
               width: buttonSize,
@@ -326,7 +327,7 @@ function VoiceTabButton() {
 
       {/* Audio level ring - reacts to voice (only when listening) */}
       {voiceStatus === 'listening' && (
-        <View style={[
+        <View pointerEvents="none" style={[
           voiceButtonStyles.audioLevelRing,
           {
             width: buttonSize + 10,
@@ -455,10 +456,20 @@ const headerStyles = StyleSheet.create({
   },
 });
 
+// Map route names to TabName
+const routeToTab: Record<string, TabName> = {
+  'chat': 'terminal',
+  'preview': 'preview',
+  'editor': 'editor',
+  'index': 'projects',
+  'voice': 'voice',
+};
+
 export default function TabLayout() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const { currentProjectId } = useProjectStore();
+  const { setCurrentTab } = useVoiceStore();
 
   // Common header style
   const commonHeaderStyle = {
@@ -525,6 +536,18 @@ export default function TabLayout() {
         tabPress: () => {
           if (Platform.OS === 'ios') {
             Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          }
+        },
+        state: (e) => {
+          // Track current tab when navigation state changes
+          const state = e.data.state;
+          if (state?.routes && state.index !== undefined) {
+            const currentRoute = state.routes[state.index];
+            const tabName = routeToTab[currentRoute.name];
+            if (tabName) {
+              setCurrentTab(tabName);
+              console.log('[TabLayout] Current tab:', tabName);
+            }
           }
         },
       }}

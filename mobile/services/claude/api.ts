@@ -774,6 +774,7 @@ class BridgeService {
 
   enableVoiceOnTerminal(
     terminalId: string,
+    model: string | undefined,
     callbacks: {
       onTranscription?: (text: string) => void;
       onProgress?: (text: string) => void;
@@ -787,9 +788,9 @@ class BridgeService {
       onError?: (error: string) => void;
     }
   ) {
-    console.log('[BridgeService] enableVoiceOnTerminal called for:', terminalId);
+    console.log('[BridgeService] enableVoiceOnTerminal called for:', terminalId, 'with model:', model);
     this.voiceTerminalCallbacks.set(terminalId, callbacks);
-    this.send({ type: 'voice_terminal_enable', terminalId });
+    this.send({ type: 'voice_terminal_enable', terminalId, model });
     console.log('[BridgeService] Sent voice_terminal_enable message');
   }
 
