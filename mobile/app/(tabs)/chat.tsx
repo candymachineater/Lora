@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView } from 'rea
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Terminal as TerminalIcon, X } from 'lucide-react-native';
 import { Audio, AVPlaybackStatus } from 'expo-av';
-import ViewShot from 'react-native-view-shot';
+import ViewShot, { captureRef } from 'react-native-view-shot';
 import * as Haptics from 'expo-haptics';
 import { useProjectStore, useSettingsStore, useVoiceStore } from '../../stores';
 import { bridgeService } from '../../services/claude/api';
@@ -436,20 +436,46 @@ export default function TerminalScreen() {
           // Agent is gathering info - don't return to listening yet
           setVoiceStatus('working');
 
+          // Show progress message based on what we're doing
+          const workingMessages: Record<string, string> = {
+            'screenshot': '📷 Analyzing screen...',
+            'claude_action': '⏳ Waiting for Claude Code...',
+            'gathering_info': '🔍 Gathering information...',
+            'analyzing': '🧠 Thinking...',
+          };
+          setVoiceProgress(workingMessages[workingState.reason] || '⏳ Working...');
+
           // Handle follow-up actions
           if (workingState.followUpAction === 'take_screenshot') {
             console.log('[Voice-Terminal] Taking screenshot for working state...');
             // Capture screenshot and send it back to the agent
             try {
-              if (viewShotRef.current?.capture) {
-                const screenshotUri = await viewShotRef.current.capture();
+              if (viewShotRef.current) {
+                // Wait a moment for any animations/rendering to complete
+                await new Promise(resolve => setTimeout(resolve, 300));
+
+                // Use captureRef with explicit options for better quality
+                const screenshotUri = await captureRef(viewShotRef, {
+                  format: 'png',
+                  quality: 1,
+                  result: 'tmpfile',
+                });
+                console.log('[Voice-Terminal] Screenshot URI:', screenshotUri);
+
                 const screenshotResponse = await fetch(screenshotUri);
                 const screenshotBlob = await screenshotResponse.blob();
+                console.log('[Voice-Terminal] Screenshot blob size:', screenshotBlob.size, 'bytes');
+
+                // Check if blob is too small (indicates capture failure)
+                if (screenshotBlob.size < 5000) {
+                  console.warn('[Voice-Terminal] Screenshot too small, may have failed');
+                }
+
                 const screenshotReader = new FileReader();
                 const screenCapture = await new Promise<string>((resolve) => {
                   screenshotReader.onloadend = () => {
                     const base64Screenshot = (screenshotReader.result as string).split(',')[1];
-                    console.log('[Voice-Terminal] Working screenshot captured, size:', Math.round(base64Screenshot.length / 1024), 'KB');
+                    console.log('[Voice-Terminal] Working screenshot base64 size:', Math.round(base64Screenshot.length / 1024), 'KB');
                     resolve(base64Screenshot);
                   };
                   screenshotReader.readAsDataURL(screenshotBlob);
@@ -467,10 +493,6 @@ export default function TerminalScreen() {
                   projectId: project?.id,
                 };
 
-                // Create a minimal audio buffer to trigger the agent with the screenshot
-                // The agent is waiting for a follow-up with the screenshot
-                // We'll send a special "screenshot ready" signal as empty audio
-                // Actually, we need to send a proper message - let's use a text-based approach
                 console.log('[Voice-Terminal] Sending screenshot to agent for analysis...');
 
                 // Send a voice audio message with just the screenshot (no audio needed)
@@ -609,10 +631,24 @@ export default function TerminalScreen() {
       return;
     }
 
-    // Don't start if we're already listening or processing
+    // Stop any existing recording first to prevent conflict
     if (recordingRef.current) {
-      console.log('[Voice] Already recording, skipping');
-      return;
+      console.log('[Voice] Stopping existing recording before wake word listen');
+      try {
+        const status = await recordingRef.current.getStatusAsync();
+        if (status.isRecording) {
+          await recordingRef.current.stopAndUnloadAsync();
+        }
+      } catch (e) {
+        console.log('[Voice] Error stopping existing recording:', e);
+      }
+      recordingRef.current = null;
+    }
+
+    // Clear metering interval if active
+    if (meteringIntervalRef.current) {
+      clearInterval(meteringIntervalRef.current);
+      meteringIntervalRef.current = null;
     }
 
     try {
@@ -793,6 +829,26 @@ export default function TerminalScreen() {
       soundRef.current = null;
     }
 
+    // Stop any existing recording first to prevent conflict
+    if (recordingRef.current) {
+      console.log('[Voice] Stopping existing recording before starting new one');
+      try {
+        const status = await recordingRef.current.getStatusAsync();
+        if (status.isRecording) {
+          await recordingRef.current.stopAndUnloadAsync();
+        }
+      } catch (e) {
+        console.log('[Voice] Error stopping existing recording:', e);
+      }
+      recordingRef.current = null;
+    }
+
+    // Clear metering interval if active
+    if (meteringIntervalRef.current) {
+      clearInterval(meteringIntervalRef.current);
+      meteringIntervalRef.current = null;
+    }
+
     try {
       console.log('[Voice] Requesting audio permissions for listening...');
       const { granted } = await Audio.requestPermissionsAsync();
@@ -805,6 +861,8 @@ export default function TerminalScreen() {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
       });
 
       const recording = new Audio.Recording();
@@ -932,16 +990,23 @@ export default function TerminalScreen() {
           // Capture screenshot of current screen for voice agent vision
           let screenCapture: string | undefined;
           try {
-            if (viewShotRef.current?.capture) {
+            if (viewShotRef.current) {
               console.log('[Voice-Terminal] Capturing screenshot...');
-              const screenshotUri = await viewShotRef.current.capture();
+              // Use captureRef with explicit options for better quality
+              const screenshotUri = await captureRef(viewShotRef, {
+                format: 'png',
+                quality: 1,
+                result: 'tmpfile',
+              });
+              console.log('[Voice-Terminal] Screenshot URI:', screenshotUri);
               const screenshotResponse = await fetch(screenshotUri);
               const screenshotBlob = await screenshotResponse.blob();
+              console.log('[Voice-Terminal] Screenshot blob size:', screenshotBlob.size, 'bytes');
               const screenshotReader = new FileReader();
               screenCapture = await new Promise<string>((resolve) => {
                 screenshotReader.onloadend = () => {
                   const base64Screenshot = (screenshotReader.result as string).split(',')[1];
-                  console.log('[Voice-Terminal] Screenshot captured, size:', Math.round(base64Screenshot.length / 1024), 'KB');
+                  console.log('[Voice-Terminal] Screenshot base64 size:', Math.round(base64Screenshot.length / 1024), 'KB');
                   resolve(base64Screenshot);
                 };
                 screenshotReader.readAsDataURL(screenshotBlob);
@@ -996,13 +1061,15 @@ export default function TerminalScreen() {
         await soundRef.current.unloadAsync();
       }
 
-      // Always play through speaker (not earpiece)
+      // Always play through speaker (not earpiece) on both iOS and Android
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: false,
         playsInSilentModeIOS: true,
         staysActiveInBackground: false,
         shouldDuckAndroid: true,
         playThroughEarpieceAndroid: false,
+        // iOS-specific: use speaker for playback
+        interruptionModeIOS: 1, // INTERRUPTION_MODE_IOS_DO_NOT_MIX
       });
 
       const audioUri = `data:audio/mp3;base64,${base64Audio}`;
@@ -1146,7 +1213,7 @@ export default function TerminalScreen() {
   return (
     <ViewShot ref={viewShotRef} style={styles.container} options={{ format: 'png', quality: 0.8 }}>
       {/* Voice Status Bar - compact display when voice is active */}
-      {voiceStatus !== 'off' && (voiceTranscript || voiceProgress) && (
+      {voiceStatus !== 'off' && (voiceTranscript || voiceProgress || voiceStatus === 'working') && (
         <View style={styles.voiceStatusBar}>
           {voiceTranscript && (
             <Text style={styles.voiceStatusBarText} numberOfLines={2}>
@@ -1157,6 +1224,11 @@ export default function TerminalScreen() {
           {voiceProgress && (
             <Text style={styles.voiceStatusBarProgress} numberOfLines={1}>
               {voiceProgress}
+            </Text>
+          )}
+          {voiceStatus === 'working' && !voiceProgress && (
+            <Text style={styles.voiceStatusBarProgress} numberOfLines={1}>
+              ⏳ Working...
             </Text>
           )}
         </View>
