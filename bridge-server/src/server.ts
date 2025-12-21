@@ -72,6 +72,14 @@ interface Message {
   audioMimeType?: string; // e.g., 'audio/wav', 'audio/m4a'
   text?: string; // For voice_text (text input instead of audio)
   screenCapture?: string; // Base64 encoded PNG screenshot of the phone screen
+  terminalContent?: string; // Recent terminal output for context
+  appState?: {  // Current app state for voice agent context
+    currentTab: string;
+    projectName?: string;
+    projectId?: string;
+    hasPreview?: boolean;
+    fileCount?: number;
+  };
 }
 
 interface ProjectInfo {
@@ -88,7 +96,7 @@ interface FileInfo {
 }
 
 interface StreamResponse {
-  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
+  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ProjectInfo[];
@@ -108,9 +116,14 @@ interface StreamResponse {
   voiceEnabled?: boolean; // Voice mode status for terminal
   // App control from voice agent
   appControl?: {
-    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot';
+    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
+  };
+  // Working state from voice agent (agent is still in control, playing waiting sound)
+  workingState?: {
+    reason: 'screenshot' | 'claude_action' | 'gathering_info' | 'analyzing';
+    followUpAction?: 'take_screenshot' | 'wait_for_claude' | 'check_files';
   };
   // Preview-related fields
   previewUrl?: string;
@@ -1292,12 +1305,27 @@ wss.on('connection', (ws: WebSocket) => {
 
           // Process with Voice Agent LLM - it decides what to do
           const projectMeta = listProjects().find(p => p.id === session.projectId);
+
+          // Build comprehensive context for voice agent
+          // Use terminal content from mobile app if provided, otherwise use accumulated output
+          const terminalContext = message.terminalContent || session.voiceAccumulatedOutput.slice(-500);
+
+          // Build app state description
+          let appStateDesc = '';
+          if (message.appState) {
+            appStateDesc = `\n## App State:\n`;
+            appStateDesc += `- Current tab: ${message.appState.currentTab}\n`;
+            if (message.appState.projectName) {
+              appStateDesc += `- Project: ${message.appState.projectName}\n`;
+            }
+          }
+
           const agentResponse = await voiceService.processVoiceInput(
             transcription,
             message.terminalId,  // sessionId for conversation memory
             {
-              projectName: projectMeta?.name,
-              recentOutput: session.voiceAccumulatedOutput.slice(-500),
+              projectName: message.appState?.projectName || projectMeta?.name,
+              recentOutput: terminalContext + appStateDesc,
               claudeCodeState: stateDescription,
               screenCapture: message.screenCapture  // Phone screenshot if provided
             }
@@ -1489,6 +1517,33 @@ wss.on('connection', (ws: WebSocket) => {
             // Set TTS cooldown
             session.voiceLastTTSTime = Date.now();
             session.voiceIdleWaiting = true;
+            return;
+          }
+
+          // Handle WORKING - agent is gathering info/waiting, don't yield floor
+          if (agentResponse.type === 'working' && agentResponse.workingState) {
+            // Send TTS for the status message (e.g., "One moment, let me check that")
+            const ttsAudio = await voiceService.textToSpeech(agentResponse.content);
+            const audioResponse: StreamResponse = {
+              type: 'voice_terminal_speaking',
+              terminalId: message.terminalId,
+              responseText: agentResponse.content,
+              audioData: ttsAudio.toString('base64'),
+              audioMimeType: 'audio/mp3'
+            };
+            ws.send(JSON.stringify(audioResponse));
+
+            // Send working state to client - this triggers the working chime and follow-up action
+            const workingResponse: StreamResponse = {
+              type: 'voice_working',
+              terminalId: message.terminalId,
+              workingState: agentResponse.workingState
+            };
+            ws.send(JSON.stringify(workingResponse));
+
+            // Don't set idle state - agent is still in control
+            session.voiceLastTTSTime = Date.now();
+            session.voiceIdleWaiting = false;
             return;
           }
 

@@ -283,6 +283,13 @@ class BridgeService {
         }
         break;
 
+      case 'voice_working':
+        if (response.terminalId && response.workingState) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          vtCallbacks?.onWorking?.(response.workingState);
+        }
+        break;
+
       case 'voice_progress':
         // Handle progress for both voice sessions and voice-terminal
         if (response.voiceSessionId && response.responseText) {
@@ -739,6 +746,7 @@ class BridgeService {
     onProgress?: (text: string) => void;
     onSpeaking?: (text: string, audioData: string) => void;
     onAppControl?: (control: { action: string; target?: string; params?: Record<string, unknown> }) => void;
+    onWorking?: (workingState: { reason: string; followUpAction?: string }) => void;
     onEnabled?: () => void;
     onDisabled?: () => void;
     onError?: (error: string) => void;
@@ -751,6 +759,7 @@ class BridgeService {
       onProgress?: (text: string) => void;
       onSpeaking?: (text: string, audioData: string) => void;
       onAppControl?: (control: { action: string; target?: string; params?: Record<string, unknown> }) => void;
+      onWorking?: (workingState: { reason: string; followUpAction?: string }) => void;
       onEnabled?: () => void;
       onDisabled?: () => void;
       onError?: (error: string) => void;
@@ -765,14 +774,29 @@ class BridgeService {
     this.voiceTerminalCallbacks.delete(terminalId);
   }
 
-  sendVoiceAudioToTerminal(terminalId: string, audioData: string, mimeType: string = 'audio/wav', screenCapture?: string) {
+  sendVoiceAudioToTerminal(
+    terminalId: string,
+    audioData: string,
+    mimeType: string = 'audio/wav',
+    screenCapture?: string,
+    terminalContent?: string,
+    appState?: {
+      currentTab: string;
+      projectName?: string;
+      projectId?: string;
+      hasPreview?: boolean;
+      fileCount?: number;
+    }
+  ) {
     this.send({
       type: 'voice_terminal_audio',
       terminalId,
       audioData,
       audioMimeType: mimeType,
-      screenCapture  // Base64 PNG of phone screen for vision
-    });
+      screenCapture,  // Base64 PNG of phone screen for vision
+      terminalContent, // Recent terminal output for context
+      appState  // Current app state
+    } as any);  // Cast to any since WSMessage type doesn't include all fields
   }
 
   // Preview server management

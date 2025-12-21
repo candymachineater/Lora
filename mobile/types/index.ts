@@ -74,10 +74,18 @@ export interface WSMessage {
   audioMimeType?: string; // e.g., 'audio/wav', 'audio/m4a'
   text?: string; // For voice_text (text input instead of audio)
   screenCapture?: string; // Base64 PNG screenshot of phone screen
+  terminalContent?: string; // Recent terminal output for context
+  appState?: {  // Current app state for voice agent context
+    currentTab: string;
+    projectName?: string;
+    projectId?: string;
+    hasPreview?: boolean;
+    fileCount?: number;
+  };
 }
 
 export interface WSResponse {
-  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
+  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ServerProject[];
@@ -97,9 +105,14 @@ export interface WSResponse {
   voiceEnabled?: boolean; // Voice mode status for terminal
   // App control from voice agent
   appControl?: {
-    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot';
+    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
+  };
+  // Working state from voice agent (agent is still in control, playing waiting sound)
+  workingState?: {
+    reason: 'screenshot' | 'claude_action' | 'gathering_info' | 'analyzing';
+    followUpAction?: 'take_screenshot' | 'wait_for_claude' | 'check_files';
   };
   // Preview-related fields
   previewUrl?: string;

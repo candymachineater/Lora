@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView, Animated, Easing } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
-import { Terminal as TerminalIcon, Plus, X, Mic, MicOff, Volume2, Square } from 'lucide-react-native';
+import { Terminal as TerminalIcon, Plus, X, Mic, MicOff, Volume2, Square, Loader2 } from 'lucide-react-native';
 import { Audio, AVPlaybackStatus } from 'expo-av';
 import ViewShot from 'react-native-view-shot';
 import * as Haptics from 'expo-haptics';
@@ -17,7 +17,7 @@ interface TerminalSession {
   sandbox: boolean;
 }
 
-type VoiceStatus = 'off' | 'idle' | 'listening' | 'processing' | 'speaking';
+type VoiceStatus = 'off' | 'idle' | 'listening' | 'processing' | 'speaking' | 'working';
 
 // VAD Configuration - Tuned for natural conversation flow
 // Based on OpenAI Realtime API best practices
@@ -63,6 +63,8 @@ export default function TerminalScreen() {
 
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
+  const workingChimeSoundRef = useRef<Audio.Sound | null>(null);
+  const workingChimeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const meteringIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const silenceStartRef = useRef<number | null>(null);
   const recordingStartRef = useRef<number | null>(null);
@@ -76,6 +78,8 @@ export default function TerminalScreen() {
   const ring3Opacity = useRef(new Animated.Value(0.1)).current;
   const glowAnim = useRef(new Animated.Value(0)).current;
   const viewShotRef = useRef<ViewShot>(null);
+  const lastScreenshotRef = useRef<string | undefined>(undefined);
+  const terminalContentRef = useRef<string>(''); // Store terminal output for voice context
 
   const project = currentProject();
   const activeTerminal = terminals[activeTerminalIndex];
@@ -165,6 +169,27 @@ export default function TerminalScreen() {
       return () => {
         breathe.stop();
         glow.stop();
+      };
+    } else if (voiceStatus === 'working') {
+      // Slow, calm pulse for working state
+      const workingPulse = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, { toValue: 1.05, duration: 1500, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
+          Animated.timing(pulseAnim, { toValue: 1, duration: 1500, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
+        ])
+      );
+      // Subtle glow for working
+      const workingGlow = Animated.loop(
+        Animated.sequence([
+          Animated.timing(glowAnim, { toValue: 0.6, duration: 2000, useNativeDriver: false }),
+          Animated.timing(glowAnim, { toValue: 0.3, duration: 2000, useNativeDriver: false }),
+        ])
+      );
+      workingPulse.start();
+      workingGlow.start();
+      return () => {
+        workingPulse.stop();
+        workingGlow.stop();
       };
     } else {
       pulseAnim.setValue(1);
@@ -292,6 +317,39 @@ export default function TerminalScreen() {
     }
   };
 
+  // Working chime - a subtle, airy sound played periodically while agent is working
+  // Using a simple sine wave tone that sounds like a gentle glass chime
+  const playWorkingChime = async () => {
+    try {
+      // Create a simple beep tone using Expo Audio
+      // The chime is created using a short audio buffer that sounds glass-like
+      // For now, we use a haptic feedback as a subtle cue since we don't have a chime asset
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    } catch (err) {
+      console.log('[Voice] Chime playback error:', err);
+    }
+  };
+
+  const startWorkingChime = () => {
+    // Play immediately
+    playWorkingChime();
+    // Then repeat every 3 seconds
+    workingChimeIntervalRef.current = setInterval(() => {
+      playWorkingChime();
+    }, 3000);
+  };
+
+  const stopWorkingChime = () => {
+    if (workingChimeIntervalRef.current) {
+      clearInterval(workingChimeIntervalRef.current);
+      workingChimeIntervalRef.current = null;
+    }
+    if (workingChimeSoundRef.current) {
+      workingChimeSoundRef.current.unloadAsync();
+      workingChimeSoundRef.current = null;
+    }
+  };
+
   const createTerminal = useCallback(async () => {
     if (!currentProjectId) return;
 
@@ -361,6 +419,36 @@ export default function TerminalScreen() {
     createTerminal();
   }, [createTerminal]);
 
+  // Capture screenshot before voice overlay appears
+  const captureScreenshot = async (): Promise<string | undefined> => {
+    try {
+      if (viewShotRef.current?.capture) {
+        const screenshotUri = await viewShotRef.current.capture();
+        const screenshotResponse = await fetch(screenshotUri);
+        const screenshotBlob = await screenshotResponse.blob();
+        return new Promise<string>((resolve) => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64Screenshot = (reader.result as string).split(',')[1];
+            resolve(base64Screenshot);
+          };
+          reader.readAsDataURL(screenshotBlob);
+        });
+      }
+    } catch (err) {
+      console.log('[Voice-Terminal] Screenshot capture failed:', err);
+    }
+    return undefined;
+  };
+
+  // Keep track of terminal content for voice agent context
+  useEffect(() => {
+    if (activeTerminal?.output) {
+      // Store last 3000 chars of terminal output for context
+      terminalContentRef.current = activeTerminal.output.slice(-3000);
+    }
+  }, [activeTerminal?.output]);
+
   // Voice Mode Functions - now integrated directly with terminal
   const toggleVoiceMode = async () => {
     if (!activeTerminal) {
@@ -369,6 +457,11 @@ export default function TerminalScreen() {
     }
 
     if (voiceStatus === 'off') {
+      // Capture screenshot BEFORE voice overlay appears
+      console.log('[Voice-Terminal] Capturing screenshot before enabling voice mode...');
+      lastScreenshotRef.current = await captureScreenshot();
+      console.log('[Voice-Terminal] Screenshot captured:', lastScreenshotRef.current ? 'success' : 'failed');
+
       // Turn on voice mode for this terminal
       bridgeService.enableVoiceOnTerminal(activeTerminal.id, {
         onTranscription: (text) => {
@@ -386,7 +479,7 @@ export default function TerminalScreen() {
           setVoiceProgress('');
           playAudio(audioData);
         },
-        onAppControl: (control) => {
+        onAppControl: async (control) => {
           console.log('[Voice-Terminal] App control:', control);
           // Handle app control actions from voice agent
           if (control.action === 'navigate' && control.target) {
@@ -402,11 +495,50 @@ export default function TerminalScreen() {
             const route = tabMap[control.target.toLowerCase()];
             if (route) {
               router.push(route as any);
+              // Capture screenshot after navigation completes
+              setTimeout(async () => {
+                lastScreenshotRef.current = await captureScreenshot();
+                console.log('[Voice-Terminal] Screenshot captured after navigation');
+              }, 500);
             }
           } else if (control.action === 'take_screenshot') {
-            // Voice agent requested a fresh screenshot - will be sent with next audio
+            // Voice agent requested a fresh screenshot
             console.log('[Voice-Terminal] Screenshot requested by agent');
+            lastScreenshotRef.current = await captureScreenshot();
+            console.log('[Voice-Terminal] Fresh screenshot captured');
+          } else if (control.action === 'refresh_files') {
+            // Navigate to editor and refresh - files will auto-refresh
+            router.push('/(tabs)/editor' as any);
+            console.log('[Voice-Terminal] Navigating to editor to show files');
+          } else if (control.action === 'show_settings') {
+            // Open settings modal
+            router.push('/settings' as any);
+            console.log('[Voice-Terminal] Opening settings');
+          } else if (control.action === 'create_project') {
+            // Navigate to projects tab to create new project
+            router.push('/(tabs)' as any);
+            console.log('[Voice-Terminal] Navigating to projects');
           }
+        },
+        onWorking: async (workingState) => {
+          console.log('[Voice-Terminal] Working state:', workingState);
+          setVoiceStatus('working');
+          setVoiceProgress('');
+
+          // Start the working chime
+          startWorkingChime();
+
+          // Handle follow-up actions
+          if (workingState.followUpAction === 'take_screenshot') {
+            // Capture screenshot and send it back
+            const screenshot = await captureScreenshot();
+            if (screenshot && activeTerminal) {
+              lastScreenshotRef.current = screenshot;
+              // Terminal content and app state will be sent with next voice audio
+              console.log('[Voice-Terminal] Screenshot captured for working state');
+            }
+          }
+          // Other follow-up actions (wait_for_claude, check_files) are handled by the server
         },
         onEnabled: () => {
           console.log('[Voice-Terminal] Voice mode enabled');
@@ -432,6 +564,7 @@ export default function TerminalScreen() {
 
       // Now do async cleanup
       stopMetering();
+      stopWorkingChime();
       if (recordingRef.current) {
         await recordingRef.current.stopAndUnloadAsync();
         recordingRef.current = null;
@@ -581,28 +714,45 @@ export default function TerminalScreen() {
           const base64 = (reader.result as string).split(',')[1];
           const mimeType = blob.type || 'audio/m4a';
 
-          // Capture screenshot of current screen for voice agent vision
-          let screenCapture: string | undefined;
-          try {
-            if (viewShotRef.current?.capture) {
-              const screenshotUri = await viewShotRef.current.capture();
-              const screenshotResponse = await fetch(screenshotUri);
-              const screenshotBlob = await screenshotResponse.blob();
-              const screenshotReader = new FileReader();
-              screenCapture = await new Promise<string>((resolve) => {
-                screenshotReader.onloadend = () => {
-                  const base64Screenshot = (screenshotReader.result as string).split(',')[1];
-                  resolve(base64Screenshot);
-                };
-                screenshotReader.readAsDataURL(screenshotBlob);
-              });
-            }
-          } catch (screenshotErr) {
-            console.log('[Voice-Terminal] Screenshot capture failed:', screenshotErr);
+          // Use the cached screenshot (captured before voice overlay appeared)
+          // and capture a fresh one for the next interaction
+          const screenCapture = lastScreenshotRef.current;
+
+          // Log screenshot usage
+          if (screenCapture) {
+            console.log('[Voice-Terminal] Using cached screenshot, size:', Math.round(screenCapture.length / 1024), 'KB');
+          } else {
+            console.log('[Voice-Terminal] No screenshot available');
           }
 
-          // Send to terminal with screenshot (will be transcribed and sent to voice agent)
-          bridgeService.sendVoiceAudioToTerminal(activeTerminal.id, base64, mimeType, screenCapture);
+          // Get terminal content for context (last 2000 chars, strip ANSI codes)
+          const terminalContent = terminalContentRef.current
+            ? stripAnsi(terminalContentRef.current).slice(-2000)
+            : undefined;
+
+          // Get current app state
+          const appState = {
+            currentTab: 'terminal',
+            projectName: project?.name,
+            projectId: currentProjectId || undefined,
+            hasPreview: false,  // Could check preview state if needed
+            fileCount: undefined  // Could count files if needed
+          };
+
+          // Send to terminal with screenshot, terminal content, and app state
+          bridgeService.sendVoiceAudioToTerminal(
+            activeTerminal.id,
+            base64,
+            mimeType,
+            screenCapture,
+            terminalContent,
+            appState
+          );
+
+          // Capture fresh screenshot for next interaction (after TTS plays, overlay may be hidden)
+          setTimeout(async () => {
+            lastScreenshotRef.current = await captureScreenshot();
+          }, 500);
         };
         reader.readAsDataURL(blob);
       }
@@ -614,6 +764,8 @@ export default function TerminalScreen() {
 
   const playAudio = async (base64Audio: string) => {
     try {
+      // Stop working chime when speaking starts
+      stopWorkingChime();
       setVoiceStatus('speaking');
 
       if (soundRef.current) {
@@ -744,6 +896,7 @@ export default function TerminalScreen() {
               {voiceStatus === 'idle' ? 'Tap to speak' :
                voiceStatus === 'listening' ? 'Listening...' :
                voiceStatus === 'processing' ? 'Processing...' :
+               voiceStatus === 'working' ? 'Working...' :
                'Speaking...'}
             </Text>
 
@@ -798,6 +951,11 @@ export default function TerminalScreen() {
                   shadowColor: '#22C55E',
                   shadowOpacity: 0.6,
                   shadowRadius: 20,
+                },
+                voiceStatus === 'working' && {
+                  shadowColor: '#60A5FA',
+                  shadowOpacity: 0.5,
+                  shadowRadius: 15,
                 }
               ]}>
                 <TouchableOpacity
@@ -806,15 +964,18 @@ export default function TerminalScreen() {
                     voiceStatus === 'listening' && styles.micButtonListening,
                     voiceStatus === 'speaking' && styles.micButtonSpeaking,
                     voiceStatus === 'processing' && styles.micButtonProcessing,
+                    voiceStatus === 'working' && styles.micButtonWorking,
                   ]}
                   onPress={handleVoiceMicPress}
-                  disabled={voiceStatus === 'processing'}
+                  disabled={voiceStatus === 'processing' || voiceStatus === 'working'}
                   activeOpacity={0.8}
                 >
                   {voiceStatus === 'listening' ? (
                     <MicOff size={28} color="#FFF" />
                   ) : voiceStatus === 'speaking' ? (
                     <Volume2 size={28} color="#FFF" />
+                  ) : voiceStatus === 'working' ? (
+                    <Loader2 size={28} color="#FFF" />
                   ) : (
                     <Mic size={28} color="#FFF" />
                   )}
@@ -1048,6 +1209,9 @@ const styles = StyleSheet.create({
   },
   micButtonProcessing: {
     backgroundColor: '#555',
+  },
+  micButtonWorking: {
+    backgroundColor: '#60A5FA',
   },
   voiceButtonsRow: {
     flexDirection: 'row',
