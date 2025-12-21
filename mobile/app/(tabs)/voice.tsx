@@ -30,7 +30,7 @@ type VoiceStatus = 'idle' | 'listening' | 'processing' | 'speaking' | 'error';
 // VAD Configuration - tuned to reduce background noise sensitivity
 const VAD_CONFIG = {
   SILENCE_THRESHOLD: -20, // dB level below which is considered silence (higher = less sensitive)
-  SILENCE_DURATION_MS: 1000, // How long silence before auto-stop (1 second)
+  SILENCE_DURATION_MS: 900, // How long silence before auto-stop (1 second)
   MIN_RECORDING_MS: 500, // Minimum recording duration before VAD kicks in
   METERING_INTERVAL_MS: 100, // How often to check audio levels
 };

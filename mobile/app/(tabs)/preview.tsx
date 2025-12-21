@@ -11,12 +11,12 @@ import {
   Animated,
 } from 'react-native';
 import { useRouter } from 'expo-router';
+import ViewShot from 'react-native-view-shot';
 import {
   Play,
   RefreshCw,
   ExternalLink,
   Share as ShareIcon,
-  Smartphone,
   Terminal,
   ChevronDown,
   ChevronUp,
@@ -26,10 +26,10 @@ import {
   AlertTriangle,
   Info,
 } from 'lucide-react-native';
-import { useProjectStore, useSettingsStore } from '../../stores';
+import { useProjectStore, useSettingsStore, useVoiceStore } from '../../stores';
 import { createSnack, createEmbeddedSnackUrl } from '../../services/bundler';
 import { bridgeService } from '../../services/claude';
-import { PreviewFrame, DeviceFrame, ConsoleMessage } from '../../components/preview';
+import { PreviewFrame, ConsoleMessage } from '../../components/preview';
 import { EmptyState, Button } from '../../components/common';
 import { colors, spacing, radius, typography } from '../../theme';
 import { Project, ProjectFile } from '../../types';
@@ -40,12 +40,13 @@ export default function PreviewScreen() {
   const router = useRouter();
   const { currentProject } = useProjectStore();
   const { isConnected } = useSettingsStore();
+  const { registerScreenshotCapture, unregisterScreenshotCapture, pendingPreviewAction, clearPreviewAction } = useVoiceStore();
   const lastProjectIdRef = useRef<string | null>(null);
+  const viewShotRef = useRef<ViewShot>(null);
 
   const [snackUrl, setSnackUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showDeviceFrame, setShowDeviceFrame] = useState(true);
   const [consoleMessages, setConsoleMessages] = useState<ConsoleMessage[]>([]);
   const [consoleExpanded, setConsoleExpanded] = useState(false);
   const [consoleHeight] = useState(new Animated.Value(0));
@@ -255,6 +256,52 @@ export default function PreviewScreen() {
     }
   }, [project?.id, snackUrl, isConnected]);
 
+  // Register screenshot capture function for voice agent
+  useEffect(() => {
+    const captureScreenshot = async (): Promise<string | undefined> => {
+      if (!viewShotRef.current) {
+        console.log('[Preview] ViewShot ref not available');
+        return undefined;
+      }
+      try {
+        const uri = await viewShotRef.current.capture();
+        // ViewShot returns a file URI, we need to read it as base64
+        // The URI is already a base64 data URI when using result: 'base64'
+        console.log('[Preview] Screenshot captured');
+        return uri;
+      } catch (error) {
+        console.error('[Preview] Failed to capture screenshot:', error);
+        return undefined;
+      }
+    };
+
+    registerScreenshotCapture('preview', captureScreenshot);
+    console.log('[Preview] Registered screenshot capture');
+
+    return () => {
+      unregisterScreenshotCapture('preview');
+      console.log('[Preview] Unregistered screenshot capture');
+    };
+  }, [registerScreenshotCapture, unregisterScreenshotCapture]);
+
+  // Handle voice agent preview actions
+  useEffect(() => {
+    if (pendingPreviewAction) {
+      console.log('[Preview] Handling voice action:', pendingPreviewAction);
+
+      if (pendingPreviewAction === 'toggle_console') {
+        toggleConsole();
+      } else if (pendingPreviewAction === 'reload_preview') {
+        handleRefresh();
+      } else if (pendingPreviewAction === 'send_to_claude') {
+        sendToClaude();
+      }
+
+      // Clear the action after handling
+      clearPreviewAction();
+    }
+  }, [pendingPreviewAction, clearPreviewAction]);
+
   const getMessageIcon = (type: ConsoleMessage['type']) => {
     switch (type) {
       case 'error':
@@ -297,20 +344,11 @@ export default function PreviewScreen() {
   }
 
   return (
-    <View style={styles.container}>
+    <ViewShot ref={viewShotRef} style={styles.container} options={{ format: 'png', quality: 0.8, result: 'base64' }}>
       {/* Header */}
       <View style={styles.header}>
         <Text style={styles.title}>Preview</Text>
         <View style={styles.headerActions}>
-          <TouchableOpacity
-            style={styles.iconButton}
-            onPress={() => setShowDeviceFrame(!showDeviceFrame)}
-          >
-            <Smartphone
-              color={showDeviceFrame ? colors.brandTiger : colors.mutedForeground}
-              size={20}
-            />
-          </TouchableOpacity>
           <TouchableOpacity style={styles.iconButton} onPress={handleRefresh}>
             <RefreshCw color={colors.foreground} size={20} />
           </TouchableOpacity>
@@ -344,21 +382,12 @@ export default function PreviewScreen() {
             />
           </View>
         ) : snackUrl ? (
-          showDeviceFrame ? (
-            <DeviceFrame>
-              <PreviewFrame
-                url={snackUrl}
-                onConsoleMessage={handleConsoleMessage}
-              />
-            </DeviceFrame>
-          ) : (
-            <View style={styles.fullPreview}>
-              <PreviewFrame
-                url={snackUrl}
-                onConsoleMessage={handleConsoleMessage}
-              />
-            </View>
-          )
+          <View style={styles.fullPreview}>
+            <PreviewFrame
+              url={snackUrl}
+              onConsoleMessage={handleConsoleMessage}
+            />
+          </View>
         ) : (
           <View style={styles.noPreviewContainer}>
             <Play color={colors.mutedForeground} size={48} />
@@ -451,7 +480,7 @@ export default function PreviewScreen() {
           </Animated.View>
         </View>
       )}
-    </View>
+    </ViewShot>
   );
 }
 

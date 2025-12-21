@@ -56,7 +56,7 @@ export interface Message {
 
 // WebSocket message types
 export interface WSMessage {
-  type: 'ping' | 'cancel' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'preview_start' | 'preview_stop' | 'preview_status';
+  type: 'ping' | 'cancel' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'preview_start' | 'preview_stop' | 'preview_status';
   projectName?: string;
   projectId?: string;
   filePath?: string;
@@ -74,6 +74,7 @@ export interface WSMessage {
   audioMimeType?: string; // e.g., 'audio/wav', 'audio/m4a'
   text?: string; // For voice_text (text input instead of audio)
   screenCapture?: string; // Base64 PNG screenshot of phone screen
+  model?: string; // Voice agent model (for voice_terminal_enable)
   terminalContent?: string; // Recent terminal output for context
   appState?: {  // Current app state for voice agent context
     currentTab: string;
@@ -82,11 +83,10 @@ export interface WSMessage {
     hasPreview?: boolean;
     fileCount?: number;
   };
-  wakeWordCheck?: boolean; // If true, only check for wake word "Hey Lora"
 }
 
 export interface WSResponse {
-  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_wake_word' | 'voice_no_wake_word' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
+  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_background_task_started' | 'voice_background_task_complete' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ServerProject[];
@@ -104,9 +104,10 @@ export interface WSResponse {
   audioMimeType?: string; // e.g., 'audio/mp3'
   voiceAvailable?: { stt: boolean; tts: boolean; agent: boolean }; // Service availability
   voiceEnabled?: boolean; // Voice mode status for terminal
+  isComplete?: boolean; // True if this is the final TTS response (should return to listening after)
   // App control from voice agent
   appControl?: {
-    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
+    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project' | 'toggle_console' | 'reload_preview' | 'send_to_claude' | 'open_file' | 'close_file' | 'save_file' | 'set_file_content';
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
   };
@@ -115,6 +116,10 @@ export interface WSResponse {
     reason: 'screenshot' | 'claude_action' | 'gathering_info' | 'analyzing';
     followUpAction?: 'take_screenshot' | 'wait_for_claude' | 'check_files';
   };
+  // Background task notification fields
+  backgroundTaskId?: string;
+  backgroundTaskDescription?: string;
+  backgroundTaskResult?: string;
   // Preview-related fields
   previewUrl?: string;
   previewPort?: number;

@@ -7,6 +7,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, shadows, spacing } from '../../theme';
 import { ProjectSelector } from '../../components/common';
 import { useVoiceStore, useProjectStore, useSettingsStore } from '../../stores';
+import type { TabName } from '../../stores/voiceStore';
 
 // Simplified voice state colors - easy to understand
 const VOICE_COLORS = {
@@ -15,12 +16,13 @@ const VOICE_COLORS = {
   listening: colors.success,        // Green - listening to you now
   processing: colors.success,       // Green - thinking (same as listening for simplicity)
   speaking: colors.brandSapphire,   // Blue - Lora is talking
+  working: colors.brandTiger,       // Orange - agent is gathering info (screenshot, etc)
 };
 
 // Voice button component for center tab
 function VoiceTabButton() {
   const router = useRouter();
-  const { voiceStatus, audioLevel, toggleVoiceMode, handleVoiceMicPress, setPendingVoiceStart } = useVoiceStore();
+  const { voiceStatus, audioLevel, voiceProgress, toggleVoiceMode, handleVoiceMicPress, setPendingVoiceStart } = useVoiceStore();
 
   // Animation values
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -201,27 +203,54 @@ function VoiceTabButton() {
 
   const handlePress = () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    console.log('[VoiceButton] Pressed, status:', voiceStatus);
 
-    if (voiceStatus === 'off') {
+    // Read current status directly from store to avoid stale closure
+    const currentStatus = useVoiceStore.getState().voiceStatus;
+    const micPressHandler = useVoiceStore.getState().handleVoiceMicPress;
+
+    console.log('[VoiceButton] Pressed, status:', currentStatus, 'handler:', !!micPressHandler);
+
+    if (currentStatus === 'off') {
       // TAP when OFF → Start voice mode
       console.log('[VoiceButton] Starting voice mode...');
       setPendingVoiceStart(true);
       router.push('/(tabs)/chat');
     } else {
-      // TAP when any active state → Turn off voice mode
-      // This allows user to cancel anytime (sleeping, listening, speaking, processing)
-      console.log('[VoiceButton] Turning off voice mode');
-      toggleVoiceMode?.();
+      // TAP when any active state → Interrupt and turn off voice mode
+      console.log('[VoiceButton] Interrupting voice mode');
+
+      if (micPressHandler) {
+        // Use the registered handler for proper cleanup
+        micPressHandler();
+      } else {
+        // Fallback: at least set status to off if handler not available
+        console.log('[VoiceButton] No handler available, forcing status to off');
+        useVoiceStore.getState().setVoiceStatus('off');
+        useVoiceStore.getState().setVoiceTranscript('');
+        useVoiceStore.getState().setVoiceProgress('');
+      }
     }
   };
 
   const handleLongPress = () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-    // LONG PRESS → Turn OFF voice mode completely
-    console.log('[VoiceButton] Long press - turning off voice mode');
-    if (toggleVoiceMode && voiceStatus !== 'off') {
-      toggleVoiceMode(); // This toggles off since it's already on
+
+    // Read current status directly from store to avoid stale closure
+    const currentStatus = useVoiceStore.getState().voiceStatus;
+    const micPressHandler = useVoiceStore.getState().handleVoiceMicPress;
+
+    console.log('[VoiceButton] Long press, status:', currentStatus);
+
+    if (currentStatus !== 'off') {
+      console.log('[VoiceButton] Long press - turning off voice mode');
+      if (micPressHandler) {
+        micPressHandler();
+      } else {
+        // Fallback
+        useVoiceStore.getState().setVoiceStatus('off');
+        useVoiceStore.getState().setVoiceTranscript('');
+        useVoiceStore.getState().setVoiceProgress('');
+      }
     }
   };
 
@@ -236,18 +265,23 @@ function VoiceTabButton() {
 
   // Status text below button
   const getStatusText = () => {
+    // If there's a custom progress message (like "Analyzing screen..."), use it
+    if (voiceProgress) {
+      return voiceProgress;
+    }
     switch (voiceStatus) {
       case 'off': return 'Tap to start';
       case 'sleeping': return 'Ready';
       case 'listening': return 'Listening...';
       case 'processing': return 'Thinking...';
       case 'speaking': return 'Speaking...';
+      case 'working': return 'Working...';
       default: return '';
     }
   };
 
   // Should show rings for these states
-  const showRings = voiceStatus === 'listening' || voiceStatus === 'speaking' || voiceStatus === 'processing';
+  const showRings = voiceStatus === 'listening' || voiceStatus === 'speaking' || voiceStatus === 'processing' || voiceStatus === 'working';
 
   return (
     <View style={voiceButtonStyles.outerContainer}>
@@ -255,7 +289,7 @@ function VoiceTabButton() {
       {/* Concentric rings - show for listening, speaking, processing */}
       {showRings && (
         <>
-          <Animated.View style={[
+          <Animated.View pointerEvents="none" style={[
             voiceButtonStyles.ring,
             {
               width: buttonSize,
@@ -266,7 +300,7 @@ function VoiceTabButton() {
               opacity: ring3Opacity,
             }
           ]} />
-          <Animated.View style={[
+          <Animated.View pointerEvents="none" style={[
             voiceButtonStyles.ring,
             {
               width: buttonSize,
@@ -277,7 +311,7 @@ function VoiceTabButton() {
               opacity: ring2Opacity,
             }
           ]} />
-          <Animated.View style={[
+          <Animated.View pointerEvents="none" style={[
             voiceButtonStyles.ring,
             {
               width: buttonSize,
@@ -293,7 +327,7 @@ function VoiceTabButton() {
 
       {/* Audio level ring - reacts to voice (only when listening) */}
       {voiceStatus === 'listening' && (
-        <View style={[
+        <View pointerEvents="none" style={[
           voiceButtonStyles.audioLevelRing,
           {
             width: buttonSize + 10,
@@ -422,10 +456,20 @@ const headerStyles = StyleSheet.create({
   },
 });
 
+// Map route names to TabName
+const routeToTab: Record<string, TabName> = {
+  'chat': 'terminal',
+  'preview': 'preview',
+  'editor': 'editor',
+  'index': 'projects',
+  'voice': 'voice',
+};
+
 export default function TabLayout() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const { currentProjectId } = useProjectStore();
+  const { setCurrentTab } = useVoiceStore();
 
   // Common header style
   const commonHeaderStyle = {
@@ -492,6 +536,18 @@ export default function TabLayout() {
         tabPress: () => {
           if (Platform.OS === 'ios') {
             Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          }
+        },
+        state: (e) => {
+          // Track current tab when navigation state changes
+          const state = e.data.state;
+          if (state?.routes && state.index !== undefined) {
+            const currentRoute = state.routes[state.index];
+            const tabName = routeToTab[currentRoute.name];
+            if (tabName) {
+              setCurrentTab(tabName);
+              console.log('[TabLayout] Current tab:', tabName);
+            }
           }
         },
       }}

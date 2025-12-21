@@ -407,13 +407,30 @@ function formatConversationHistory(memory: ConversationMemory): string {
 // ============================================================================
 
 export interface VoiceAgentResponse {
-  type: 'prompt' | 'control' | 'conversational' | 'ignore' | 'app_control' | 'working';
+  type: 'prompt' | 'control' | 'conversational' | 'ignore' | 'app_control' | 'working' | 'background_task';
   content: string;
   // Optional voice response to speak to user while executing the action
   // Use this when you want to tell the user what you're doing AND execute the action
   voiceResponse?: string;
   appAction?: {
-    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
+    action:
+      | 'navigate'           // Go to a tab (target: projects, terminal, editor, preview, settings)
+      | 'take_screenshot'    // Capture current screen
+      | 'send_input'         // Send text to terminal (params.text)
+      | 'send_control'       // Send control key (params.key: ESCAPE, CTRL_C, UP, DOWN, etc)
+      | 'new_terminal'       // Create new terminal tab
+      | 'close_terminal'     // Close current terminal tab
+      | 'switch_terminal'    // Switch terminal (params.index or params.direction: next/prev)
+      | 'refresh_files'      // Refresh file list in editor
+      | 'show_settings'      // Open settings modal
+      | 'scroll'             // Scroll terminal (params.direction: up/down, params.count)
+      | 'toggle_console'     // Toggle console panel visibility in preview tab
+      | 'reload_preview'     // Reload the preview webview
+      | 'send_to_claude'     // Send console logs to Claude for analysis
+      | 'open_file'          // Open a file in editor (params.filePath)
+      | 'close_file'         // Close current file and return to file list
+      | 'save_file'          // Save the current file
+      | 'set_file_content';  // Replace file content (params.content)
     target?: string;
     params?: Record<string, unknown>;
   };
@@ -421,6 +438,11 @@ export interface VoiceAgentResponse {
   workingState?: {
     reason: 'screenshot' | 'claude_action' | 'gathering_info' | 'analyzing';
     followUpAction?: 'take_screenshot' | 'wait_for_claude' | 'check_files';
+  };
+  // For background tasks - agent starts a Claude Code task but continues conversation
+  backgroundTask?: {
+    taskDescription: string;  // What Claude is doing (for notification later)
+    prompt: string;           // The actual prompt to send to Claude Code
   };
 }
 
@@ -606,14 +628,45 @@ Your name is Lora. You are:
 - Send slash commands (/resume, /clear, /compact)
 - Confirm/decline y/n prompts
 
-### 3. CONTROL THE APP
-- Navigate between tabs (Projects, Terminal, Editor, Preview)
-- Take screenshots to see what's happening
-- Help users find features
+### 3. CONTROL THE APP PROGRAMMATICALLY
+You have FULL programmatic control over the Lora app:
+
+**Navigation:**
+- Navigate between tabs (Projects, Terminal, Editor, Preview, Settings)
+- Open settings modal
+
+**Terminal Control:**
+- Create and close terminal tabs
+- Switch between terminal tabs
+- Send text input to terminal (run commands)
+- Send control keys (Escape, Ctrl+C, arrows, Enter, Tab)
+- Answer yes/no prompts
+- Scroll terminal output
+
+**Information Gathering:**
+- Take screenshots to see the current screen
+- Refresh file list in editor
+- Access terminal output history
+- Know current tab and project info
 
 ${LORA_APP_KNOWLEDGE}
 
 ${CLAUDE_CODE_KNOWLEDGE}
+
+## CONTEXT YOU RECEIVE
+
+With each user message, you receive:
+
+1. **Screenshot** (if available): Current screen as an image
+2. **Terminal Content**: Last ~2000 characters of terminal output
+3. **App State**: Current tab, project name, project ID
+4. **Conversation History**: Previous turns for context
+
+Use this context to:
+- Understand what the user is seeing
+- Know what Claude Code has done
+- Reference specific output or errors
+- Make informed decisions about actions
 
 ## SCREEN VISION
 
@@ -698,6 +751,10 @@ Available commands:
 ### WORKING - Agent is gathering info/waiting (DO NOT YIELD FLOOR)
 {"type": "working", "content": "Status message to speak", "workingState": {"reason": "REASON", "followUpAction": "ACTION"}}
 
+**CRITICAL**: Use WORKING when you need to see something BEFORE you can respond properly:
+- User asks "what's on the screen?" → WORKING to get screenshot first
+- User asks "what did Claude say?" and you need fresh terminal output → WORKING
+
 Reasons:
 - "screenshot" - Taking/analyzing a screenshot
 - "claude_action" - Waiting for Claude Code response
@@ -711,23 +768,136 @@ Follow-up actions:
 
 Example: {"type": "working", "content": "One moment, let me see what's on screen.", "workingState": {"reason": "screenshot", "followUpAction": "take_screenshot"}}
 
-### APP_CONTROL - Control Lora app UI
-{"type": "app_control", "content": "Description", "appAction": {"action": "ACTION", "target": "TARGET"}}
+### BACKGROUND_TASK - Start Claude Code task while continuing conversation
+{"type": "background_task", "content": "I'll have Claude do that. Now, what were we talking about?", "backgroundTask": {"taskDescription": "Adding dark mode", "prompt": "Add dark mode toggle to the app settings"}}
 
-Actions:
-- **navigate**: Go to tab
-  - Targets: "projects", "terminal", "editor", "preview"
-  - Example: {"action": "navigate", "target": "preview"}
-- **take_screenshot**: Capture current screen
-  - Example: {"action": "take_screenshot"}
-- **refresh_files**: Refresh file tree in Editor
-  - Example: {"action": "refresh_files"}
+Use this when:
+- User explicitly says "in the background" or "come back to me" or similar
+- User wants to give you a task AND continue talking about something else
+- User says things like "ask Claude to X and then let's talk about Y"
+
+The system will:
+1. Send the prompt to Claude Code
+2. Speak your "content" response to the user immediately
+3. Return to listening for more conversation
+4. When Claude Code finishes (detected via hooks), notify the user
+
+Example flow:
+User: "Hey Lora, have Claude check what this project is about, and then come back to me - I want to tell you about my day"
+→ {"type": "background_task", "content": "I've sent that to Claude. So tell me about your day!", "backgroundTask": {"taskDescription": "checking project purpose", "prompt": "What is this project about? Give me a brief overview."}}
+
+### APP_CONTROL - Control Lora app UI programmatically
+{"type": "app_control", "content": "Description", "appAction": {"action": "ACTION", "target": "TARGET", "params": {...}}}
+
+**COMPLETE ACTION REFERENCE:**
+
+#### Navigation Actions
+- **navigate**: Go to a tab or screen
+  - Targets: "projects", "terminal", "editor", "preview", "settings"
+  - Example: {"type": "app_control", "content": "Going to preview", "appAction": {"action": "navigate", "target": "preview"}}
+
+#### Terminal Actions
+- **send_input**: Type text into the terminal
+  - params.text: The text to type
+  - Example: {"type": "app_control", "content": "Typing command", "appAction": {"action": "send_input", "params": {"text": "npm install"}}}
+
+- **send_control**: Send a control key to terminal
+  - params.key: ESCAPE, CTRL_C, CTRL_D, ENTER, TAB, UP, DOWN, LEFT, RIGHT, YES, NO
+  - Example: {"type": "app_control", "content": "Pressing escape", "appAction": {"action": "send_control", "params": {"key": "ESCAPE"}}}
+  - Example: {"type": "app_control", "content": "Answering yes", "appAction": {"action": "send_control", "params": {"key": "YES"}}}
+
+#### Multi-Terminal Management
+The app can have multiple terminal tabs open (shown as "Term 1", "Term 2", etc.). The App State tells you:
+- How many terminals are open (terminalCount)
+- Which terminal is currently active (activeTerminalIndex, 0-based internally but shown as 1-based to user)
+
+- **new_terminal**: Create a new terminal tab (starts Claude Code automatically)
+  - Example: {"type": "app_control", "content": "Opening new terminal", "appAction": {"action": "new_terminal"}}
+
+- **close_terminal**: Close the currently active terminal tab
+  - Example: {"type": "app_control", "content": "Closing terminal", "appAction": {"action": "close_terminal"}}
+  - Only works if more than 1 terminal is open
+
+- **switch_terminal**: Switch to a different terminal tab
+  - params.index: Tab index (0-based, so Terminal 1 = index 0, Terminal 2 = index 1)
+  - params.direction: "next" or "prev" to cycle through tabs
+  - Example for Terminal 2: {"type": "app_control", "content": "Switching to Terminal 2", "appAction": {"action": "switch_terminal", "params": {"index": 1}}}
+  - Example for next: {"type": "app_control", "content": "Switching to next terminal", "appAction": {"action": "switch_terminal", "params": {"direction": "next"}}}
+
+**Multi-Terminal Tips:**
+- Each terminal has its own Claude Code session
+- You can open multiple terminals to run parallel tasks
+- When user says "switch to terminal 2", use index: 1 (0-based indexing)
+- When user says "go to the other terminal" and there are 2, use direction: "next"
+
+- **scroll**: Scroll terminal content
+  - params.direction: "up" or "down"
+  - params.count: Number of page scrolls (default 1)
+  - Example: {"type": "app_control", "content": "Scrolling up", "appAction": {"action": "scroll", "params": {"direction": "up", "count": 3}}}
+
+#### Other Actions
+- **take_screenshot**: Capture current screen for vision
+  - Example: {"type": "app_control", "content": "Taking screenshot", "appAction": {"action": "take_screenshot"}}
+
+- **refresh_files**: Refresh file tree in Editor (navigates to editor)
+  - Example: {"type": "app_control", "content": "Refreshing files", "appAction": {"action": "refresh_files"}}
+
 - **show_settings**: Open settings modal
-  - Example: {"action": "show_settings"}
+  - Example: {"type": "app_control", "content": "Opening settings", "appAction": {"action": "show_settings"}}
 
-**CRITICAL:** For Claude Code menus/lists, use CONTROL not APP_CONTROL!
-- "scroll down in resume list" → {"type": "control", "content": "DOWN:3"}
-- "go to preview tab" → {"type": "app_control", ... "navigate", "preview"}
+#### Preview Tab Actions
+- **toggle_console**: Show/hide the console panel in Preview tab (shows logs, errors, warnings)
+  - Example: {"type": "app_control", "content": "Expanding console", "appAction": {"action": "toggle_console"}}
+  - Use when user asks to "show console", "expand logs", "see errors", "check console"
+
+- **reload_preview**: Reload/refresh the preview webview
+  - Example: {"type": "app_control", "content": "Reloading preview", "appAction": {"action": "reload_preview"}}
+  - Use when user asks to "reload", "refresh preview", "try again"
+
+- **send_to_claude**: Send console logs from Preview tab to Claude Code for analysis
+  - Example: {"type": "app_control", "content": "Sending logs to Claude", "appAction": {"action": "send_to_claude"}}
+  - Use when user asks to "send logs to Claude", "analyze these errors", "have Claude fix these issues", "send console to Claude"
+  - This creates a new terminal with the console logs as context for Claude to analyze
+
+#### Editor Tab Actions
+The Editor tab shows project files and allows editing. You can:
+- See the currently open file in the App State context (currentFile field)
+- Navigate to Editor tab and request a screenshot to see the file list
+- Open, edit, and save files using these actions
+
+- **open_file**: Open a specific file in the editor
+  - Example: {"type": "app_control", "content": "Opening App.tsx", "appAction": {"action": "open_file", "params": {"filePath": "App.tsx"}}}
+  - Use when user asks to "open App.tsx", "show me the config file", "edit index.js"
+  - Will navigate to the Editor tab and open the file
+
+- **close_file**: Close the current file and return to the file list
+  - Example: {"type": "app_control", "content": "Closing file", "appAction": {"action": "close_file"}}
+  - Use when user asks to "close file", "go back to files", "exit editor"
+
+- **save_file**: Save the currently open file
+  - Example: {"type": "app_control", "content": "Saving file", "appAction": {"action": "save_file"}}
+  - Use when user asks to "save", "save file", "save changes"
+
+- **set_file_content**: Replace the entire content of the currently open file
+  - Example: {"type": "app_control", "content": "Updating file content", "appAction": {"action": "set_file_content", "params": {"content": "new file content here"}}}
+  - Use when user dictates new file content or asks to replace file contents
+  - IMPORTANT: This replaces the ENTIRE file content, so include all the code
+  - After setting content, you may want to save_file to persist changes
+
+**WHEN TO USE APP_CONTROL vs CONTROL:**
+- **APP_CONTROL**: For controlling the Lora mobile app (tabs, terminals, settings)
+- **CONTROL**: For Claude Code interactions (slash commands, menus, text input to Claude)
+
+Examples:
+- "go to preview" → APP_CONTROL with navigate
+- "press escape in Claude" → CONTROL with "ESCAPE"
+- "type hello world" (to Claude) → CONTROL with "hello world\\n"
+- "open a new terminal" → APP_CONTROL with new_terminal
+- "run npm install" (send to terminal) → APP_CONTROL with send_input
+- "scroll up in resume list" → CONTROL with "UP:3"
+- "open App.tsx" → APP_CONTROL with open_file
+- "save this file" → APP_CONTROL with save_file
+- "close the file" → APP_CONTROL with close_file
 
 ## DECISION LOGIC
 
@@ -735,11 +905,19 @@ Actions:
 - Vague: "build something cool"
 - New topic without context
 - Need clarification: "what kind of app?"
+- Pure conversation not about coding
 
-### When to SEND (prompt):
+### When to SEND (prompt) - BLOCKS until complete:
 - User confirmed: "yes, do it"
 - Clear request: "add a login page"
 - Follow-up: "now make it blue"
+- User wants to know what Claude does (will wait and report back)
+
+### When to use BACKGROUND_TASK:
+- User says "in the background", "come back to me", "while we talk"
+- User wants Claude to work AND continue a different conversation
+- Example: "ask Claude to add X, and let's discuss Y"
+- You send task to Claude but immediately return to user for conversation
 
 ### When to CONTROL:
 - Direct command: "press escape"
@@ -748,9 +926,15 @@ Actions:
 - Confirmation: "yes" or "no"
 
 ### When to use WORKING:
-- User asks about screen: "what do you see?"
-- Before taking any action that requires feedback
-- When you need to gather information first
+- User asks about screen: "what do you see?" AND you have NO screenshot
+- You need to SEE something before you can answer AND you don't already have it
+- ONLY use when you need FRESH information that you DON'T ALREADY HAVE
+
+### When NOT to use WORKING (CRITICAL):
+- You already have terminal output in context → ANALYZE IT DIRECTLY, give a CONVERSATIONAL response
+- User asks "what happened in this session?" and you have terminal output → READ IT and SUMMARIZE
+- You have the information needed → DON'T wait, RESPOND NOW
+- NEVER use WORKING with "wait_for_claude" if terminal output is already provided to you
 
 ## RULES
 
@@ -848,51 +1032,16 @@ function normalizeTranscription(text: string): string {
 }
 
 // ============================================================================
-// WAKE WORD DETECTION
+// VOICE INTERRUPT HANDLING
 // ============================================================================
 
-// Wake word patterns (case-insensitive)
-const WAKE_WORD_PATTERNS = [
-  /\bhey\s+lora\b/i,
-  /\bhey\s+laura\b/i,
-  /\bhi\s+lora\b/i,
-  /\bhi\s+laura\b/i,
-  /\bokay\s+lora\b/i,
-  /\bok\s+lora\b/i,
-  /\bhey\s+lara\b/i,
-  /\bhi\s+lara\b/i,
-];
-
 /**
- * Check if transcribed text contains a wake word
- * Returns the full transcription if wake word found, null otherwise
+ * Handle user interrupt of voice session
+ * Called when user taps the voice button to cancel
  */
-export function checkForWakeWord(transcription: string): { detected: boolean; text: string; remainder: string } {
-  const text = transcription.toLowerCase().trim();
-
-  for (const pattern of WAKE_WORD_PATTERNS) {
-    const match = text.match(pattern);
-    if (match) {
-      // Found wake word - extract the remainder after the wake word
-      const matchIndex = match.index || 0;
-      const matchLength = match[0].length;
-      const remainder = transcription.substring(matchIndex + matchLength).trim();
-
-      voiceLog('INFO', 'WakeWord', `Detected wake word in: "${transcription}"`, { remainder: remainder.substring(0, 50) });
-
-      return {
-        detected: true,
-        text: transcription,
-        remainder
-      };
-    }
-  }
-
-  return {
-    detected: false,
-    text: transcription,
-    remainder: ''
-  };
+export function handleInterrupt(terminalId: string): void {
+  voiceLog('INFO', 'INTERRUPT', `User interrupted voice session for ${terminalId}`);
+  // Any cleanup needed for the terminal's voice state can be added here
 }
 
 // ============================================================================
@@ -1032,10 +1181,21 @@ export async function textToSpeech(
 export async function processVoiceInput(
   userSpeech: string,
   sessionId?: string,
-  context?: { projectName?: string; recentOutput?: string; claudeCodeState?: string; screenCapture?: string }
+  context?: {
+    projectName?: string;
+    recentOutput?: string;
+    claudeCodeState?: string;
+    screenCapture?: string;
+    terminalContent?: string;  // Raw terminal output for observation
+    appState?: { currentTab: string; projectName?: string; projectId?: string; hasPreview?: boolean; fileCount?: number; currentFile?: string; terminalCount?: number; activeTerminalIndex?: number };
+    systemNote?: string;  // System instruction to inject (for follow-up after commands)
+  },
+  model?: string  // Optional model override (e.g., claude-haiku-4-5-20251001, claude-sonnet-4-5-20250514)
 ): Promise<VoiceAgentResponse> {
+  const activeModel = model || MODEL;
   voiceLog('AI', 'Agent', '┌─── PROCESSING VOICE INPUT ───');
   voiceLog('AI', 'Agent', `│ User said: "${userSpeech}"`);
+  voiceLog('AI', 'Agent', `│ Using model: ${activeModel}`);
 
   if (!anthropic) {
     voiceLog('AI', 'Agent', '│ No Anthropic API, falling back to prompt');
@@ -1073,8 +1233,34 @@ export async function processVoiceInput(
       contextInfo += `\n## Claude Code State: ${context.claudeCodeState}\n`;
     }
 
+    // Add app state context (current tab, file info, terminal info)
+    if (context?.appState) {
+      const { currentTab, currentFile, terminalCount, activeTerminalIndex } = context.appState;
+      contextInfo += `\n## App State:\n`;
+      contextInfo += `- Current Tab: ${currentTab}\n`;
+      if (currentFile) {
+        contextInfo += `- Currently Editing File: ${currentFile}\n`;
+      }
+      if (terminalCount && terminalCount > 1) {
+        contextInfo += `- Open Terminals: ${terminalCount} (active: Terminal ${(activeTerminalIndex || 0) + 1})\n`;
+      }
+    }
+
     if (context?.recentOutput) {
-      contextInfo += `\n## Recent Output (last 200 chars):\n${context.recentOutput.slice(-200)}\n`;
+      // Include more terminal output for better context (up to ~2000 tokens / 8000 chars)
+      const outputSlice = context.recentOutput.slice(-8000);
+      contextInfo += `\n## Recent Terminal Output (last ${outputSlice.length} chars):\n${outputSlice}\n`;
+    }
+
+    // Use terminalContent if provided (newer field for direct terminal observation)
+    if (context?.terminalContent && !context?.recentOutput) {
+      const outputSlice = context.terminalContent.slice(-8000);
+      contextInfo += `\n## Current Terminal Output:\n${outputSlice}\n`;
+    }
+
+    // Add system note if provided (for follow-up instructions)
+    if (context?.systemNote) {
+      contextInfo += `\n${context.systemNote}\n`;
     }
 
     voiceLog('AI', 'Agent', '│ Calling Claude Haiku 4.5...');
@@ -1135,7 +1321,7 @@ Output JSON only:`
     });
 
     const result = await anthropic.messages.create({
-      model: MODEL,
+      model: activeModel,  // Use passed model or default (defined at function start)
       max_tokens: 300,  // Allow more detailed responses when context is complex
       system: CLAUDE_CODE_SYSTEM_PROMPT,
       messages: [{
@@ -1204,7 +1390,8 @@ Output JSON only:`
 export async function summarizeForVoice(
   response: string,
   sessionId?: string,
-  verbosity: 'terse' | 'brief' | 'normal' | 'full' = 'brief'
+  verbosity: 'terse' | 'brief' | 'normal' | 'full' = 'brief',
+  model?: string  // Optional model override
 ): Promise<string> {
   voiceLog('AI', 'Summary', '┌─── SUMMARIZING FOR VOICE ───');
   voiceLog('AI', 'Summary', `│ Input length: ${response.length} chars`);
@@ -1233,7 +1420,7 @@ export async function summarizeForVoice(
     voiceLog('AI', 'Summary', `│ Calling AI for ${verbosity} summary...`);
 
     const result = await anthropic.messages.create({
-      model: MODEL,
+      model: model || MODEL,  // Use passed model or default
       max_tokens: 150,
       system: `You convert AI coding assistant output to speech-friendly text.
 
@@ -1386,7 +1573,7 @@ export default {
   processVoiceInput,
   summarizeForVoice,
   isVoiceServiceAvailable,
-  checkForWakeWord,
+  handleInterrupt,
   getConversationMemory,
   addConversationTurn,
   updateLastTurnWithResponse,

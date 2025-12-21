@@ -17,7 +17,12 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.lora.app",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true,
+          "NSAllowsLocalNetworking": true
+        },
+        "NSMicrophoneUsageDescription": "This app uses the microphone for voice commands"
       }
     },
     "android": {

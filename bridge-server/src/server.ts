@@ -53,7 +53,7 @@ fs.writeFileSync(serverLogFile, `=== Bridge Server Started at ${getTimestamp()} 
 fs.writeFileSync(terminalLogFile, `=== Terminal Logs Started at ${getTimestamp()} ===\n`);
 
 interface Message {
-  type: 'ping' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'preview_start' | 'preview_stop' | 'preview_status';
+  type: 'ping' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'preview_start' | 'preview_stop' | 'preview_status';
   projectName?: string;
   projectId?: string;
   filePath?: string;
@@ -79,8 +79,12 @@ interface Message {
     projectId?: string;
     hasPreview?: boolean;
     fileCount?: number;
+    // Multi-terminal support
+    terminalCount?: number;        // Total number of open terminals
+    activeTerminalIndex?: number;  // Currently active terminal (0-indexed)
+    activeTerminalId?: string;     // ID of the active terminal
   };
-  wakeWordCheck?: boolean; // If true, only check for wake word "Hey Lora"
+  model?: string; // Voice agent model selection
 }
 
 interface ProjectInfo {
@@ -97,7 +101,7 @@ interface FileInfo {
 }
 
 interface StreamResponse {
-  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_wake_word' | 'voice_no_wake_word' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
+  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_background_task_started' | 'voice_background_task_complete' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ProjectInfo[];
@@ -117,7 +121,24 @@ interface StreamResponse {
   voiceEnabled?: boolean; // Voice mode status for terminal
   // App control from voice agent
   appControl?: {
-    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
+    action:
+      | 'navigate'           // Go to a tab (target: projects, terminal, editor, preview, settings)
+      | 'take_screenshot'    // Capture current screen
+      | 'send_input'         // Send text to terminal (params.text)
+      | 'send_control'       // Send control key (params.key: ESCAPE, CTRL_C, UP, DOWN, etc)
+      | 'new_terminal'       // Create new terminal tab
+      | 'close_terminal'     // Close current terminal tab
+      | 'switch_terminal'    // Switch terminal (params.index or params.direction: next/prev)
+      | 'refresh_files'      // Refresh file list in editor
+      | 'show_settings'      // Open settings modal
+      | 'scroll'             // Scroll terminal (params.direction: up/down, params.count)
+      | 'toggle_console'     // Toggle console panel visibility in preview tab
+      | 'reload_preview'     // Reload the preview webview
+      | 'send_to_claude'     // Send console logs to Claude for analysis
+      | 'open_file'          // Open a file in editor (params.filePath)
+      | 'close_file'         // Close current file and return to file list
+      | 'save_file'          // Save the current file
+      | 'set_file_content';  // Replace file content (params.content)
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
   };
@@ -126,6 +147,10 @@ interface StreamResponse {
     reason: 'screenshot' | 'claude_action' | 'gathering_info' | 'analyzing';
     followUpAction?: 'take_screenshot' | 'wait_for_claude' | 'check_files';
   };
+  // Background task notification fields
+  backgroundTaskId?: string;
+  backgroundTaskDescription?: string;
+  backgroundTaskResult?: string;
   // Preview-related fields
   previewUrl?: string;
   previewPort?: number;
@@ -136,6 +161,16 @@ interface StreamResponse {
 }
 
 // Terminal session management (hybrid: tmux for commands, PTY for output)
+// Background task that's running while user continues conversation
+interface BackgroundTask {
+  id: string;
+  description: string;
+  prompt: string;
+  startedAt: number;
+  status: 'running' | 'completed' | 'failed';
+  result?: string;
+}
+
 interface TerminalSession {
   id: string;
   projectId: string;
@@ -146,6 +181,7 @@ interface TerminalSession {
   pty: pty.IPty;
   // Voice-terminal integration
   voiceMode: boolean;
+  voiceAgentModel?: string; // Selected model for voice agent (e.g., claude-haiku-4-5-20251001)
   voiceAwaitingResponse: boolean;
   voiceAccumulatedOutput: string;
   voiceLastOutputTime: number;
@@ -154,6 +190,12 @@ interface TerminalSession {
   voiceIdleWaiting: boolean;
   // Cooldown: timestamp when we last sent TTS - ignore audio for a few seconds after
   voiceLastTTSTime: number;
+  // Counter for consecutive WORKING responses - prevents infinite loops
+  voiceWorkingLoopCount: number;
+  // Background tasks running while user continues conversation
+  backgroundTasks: BackgroundTask[];
+  // WebSocket for sending notifications (stored for background task callbacks)
+  ws?: WebSocket;
 }
 
 // Home directory for non-sandboxed access
@@ -475,8 +517,9 @@ function getPreviewStatus(projectId: string): { running: boolean; url?: string; 
 /**
  * Process terminal output and generate voice response
  * Used when voice mode is enabled on a terminal
+ * @param isComplete - If true, this is the final response and client should return to listening
  */
-async function processTerminalVoiceResponse(ws: WebSocket, terminalId: string, response: string, session?: TerminalSession): Promise<void> {
+async function processTerminalVoiceResponse(ws: WebSocket, terminalId: string, response: string, session?: TerminalSession, isComplete: boolean = true): Promise<void> {
   try {
     // Summarize for voice with session context
     const voiceText = await voiceService.summarizeForVoice(response, terminalId, 'brief');
@@ -486,12 +529,13 @@ async function processTerminalVoiceResponse(ws: WebSocket, terminalId: string, r
       const audioBuffer = await voiceService.textToSpeech(voiceText);
 
       // Send to client
-      const audioResponse: StreamResponse = {
+      const audioResponse: StreamResponse & { isComplete?: boolean } = {
         type: 'voice_terminal_speaking',
         terminalId,
         responseText: voiceText,
         audioData: audioBuffer.toString('base64'),
-        audioMimeType: 'audio/mp3'
+        audioMimeType: 'audio/mp3',
+        isComplete  // Tell client this is the final response
       };
       ws.send(JSON.stringify(audioResponse));
 
@@ -1001,7 +1045,10 @@ wss.on('connection', (ws: WebSocket) => {
             voiceAccumulatedOutput: '',
             voiceLastOutputTime: Date.now(),
             voiceIdleWaiting: false,
-            voiceLastTTSTime: 0
+            voiceLastTTSTime: 0,
+            voiceWorkingLoopCount: 0,
+            backgroundTasks: [],
+            ws: ws
           };
           terminals.set(terminalId, session);
 
@@ -1106,10 +1153,11 @@ wss.on('connection', (ws: WebSocket) => {
         const session = terminals.get(message.terminalId);
         if (session) {
           session.voiceMode = true;
+          session.voiceAgentModel = message.model; // Store selected model
           session.voiceAwaitingResponse = false;
           session.voiceAccumulatedOutput = '';
           session.voiceLastOutputTime = Date.now();
-          serverLog(`🎤 Voice mode enabled for terminal ${message.terminalId}`);
+          serverLog(`🎤 Voice mode enabled for terminal ${message.terminalId} with model: ${message.model || 'default'}`);
 
           const response: StreamResponse = {
             type: 'voice_terminal_enabled',
@@ -1146,7 +1194,23 @@ wss.on('connection', (ws: WebSocket) => {
         return;
       }
 
-      if (message.type === 'voice_terminal_audio' && message.terminalId && message.audioData) {
+      // Handle voice interruption from user
+      if (message.type === 'voice_interrupt' && message.terminalId) {
+        const session = terminals.get(message.terminalId);
+        if (session) {
+          // Reset voice state
+          session.voiceAwaitingResponse = false;
+          session.voiceAccumulatedOutput = '';
+          session.voiceIdleWaiting = false;
+          serverLog(`⏹️ Voice session interrupted for terminal ${message.terminalId}`);
+          // Log the interrupt for debugging
+          voiceService.handleInterrupt(message.terminalId);
+        }
+        return;
+      }
+
+      if (message.type === 'voice_terminal_audio' && message.terminalId) {
+        serverLog(`[Voice] Audio received for terminal: ${message.terminalId}, activeTerminalId: ${message.appState?.activeTerminalId || 'unknown'}`);
         const session = terminals.get(message.terminalId);
         if (!session) {
           const response: StreamResponse = {
@@ -1159,110 +1223,105 @@ wss.on('connection', (ws: WebSocket) => {
         }
 
         try {
-          // Decode and transcribe audio
-          const audioBuffer = Buffer.from(message.audioData, 'base64');
-          const mimeType = message.audioMimeType || 'audio/wav';
+          // Check if this is a screenshot-only follow-up (from working state)
+          const isScreenshotFollowUp = (!message.audioData || message.audioData.length < 100) && message.screenCapture;
 
+          // Check if this is a terminal output follow-up (Terminal tab uses terminal content instead of screenshot)
+          const isTerminalOutputFollowUp = (!message.audioData || message.audioData.length < 100)
+            && !message.screenCapture
+            && message.terminalContent
+            && message.appState?.currentTab === 'terminal';
 
-          // Cooldown check - ignore audio that comes too soon after we sent TTS
-          // This prevents picking up our own audio playback
-          const TTS_COOLDOWN_MS = 3000; // 3 seconds after TTS before accepting new audio
-          const timeSinceTTS = Date.now() - session.voiceLastTTSTime;
-          if (session.voiceLastTTSTime > 0 && timeSinceTTS < TTS_COOLDOWN_MS) {
+          let transcription: string;
+
+          if (isScreenshotFollowUp) {
+            // This is a screenshot follow-up from working state
+            serverLog('[Voice] Processing screenshot follow-up');
+            transcription = '[Screenshot captured - please analyze what you see on the screen]';
+          } else if (isTerminalOutputFollowUp) {
+            // Terminal tab uses terminal output instead of screenshot - this is normal, not an error
+            serverLog('[Voice] Processing terminal output follow-up (Terminal tab)');
+            transcription = '[Viewing terminal output - please analyze the current terminal state]';
+          } else if (!message.audioData) {
+            // No audio data and no visual context - nothing to process
             return;
-          }
+          } else {
+            // Normal audio processing
+            // Decode and transcribe audio
+            const audioBuffer = Buffer.from(message.audioData, 'base64');
+            const mimeType = message.audioMimeType || 'audio/wav';
 
-          // Minimum audio size check - very small files are likely noise/silence
-          // M4A typically needs at least ~20KB for a second of speech
-          const MIN_AUDIO_SIZE = 15000; // 15KB minimum
-          if (audioBuffer.length < MIN_AUDIO_SIZE) {
-            return;
-          }
 
-          const transcription = await voiceService.transcribeAudio(audioBuffer, mimeType);
+            // Cooldown check - ignore audio that comes too soon after we sent TTS
+            // This prevents picking up our own audio playback
+            const TTS_COOLDOWN_MS = 3000; // 3 seconds after TTS before accepting new audio
+            const timeSinceTTS = Date.now() - session.voiceLastTTSTime;
+            if (session.voiceLastTTSTime > 0 && timeSinceTTS < TTS_COOLDOWN_MS) {
+              return;
+            }
+
+            // Minimum audio size check - very small files are likely noise/silence
+            // M4A typically needs at least ~20KB for a second of speech
+            const MIN_AUDIO_SIZE = 15000; // 15KB minimum
+            if (audioBuffer.length < MIN_AUDIO_SIZE) {
+              return;
+            }
+
+            transcription = await voiceService.transcribeAudio(audioBuffer, mimeType);
+          }
 
           if (!transcription || !transcription.trim()) {
             serverLog('[Voice] Empty transcription, ignoring');
             return;
           }
 
-          // Filter out common Whisper hallucinations on silence/noise
-          const WHISPER_HALLUCINATIONS = [
-            'thank you for watching',
-            'thanks for watching',
-            'subscribe',
-            'like and subscribe',
-            'see you next time',
-            'goodbye',
-            'thank you',
-            'you',
-            'bye',
-            'the end',
-            '...',
-            'hmm',
-            'um',
-            'uh',
-          ];
-          const lowerTrim = transcription.toLowerCase().trim();
-          if (WHISPER_HALLUCINATIONS.some(h => lowerTrim === h || lowerTrim === h + '.')) {
-            serverLog(`[Voice] Filtered Whisper hallucination: "${transcription}"`);
-            return;
+          // Reset working loop counter when user speaks (real audio, not a follow-up)
+          // This prevents the counter from carrying over between user requests
+          if (!isScreenshotFollowUp && !isTerminalOutputFollowUp) {
+            session.voiceWorkingLoopCount = 0;
           }
 
-          // Require minimum word count for meaningful input (at least 2 words)
-          const wordCount = transcription.trim().split(/\s+/).length;
-          if (wordCount < 2) {
-            serverLog(`[Voice] Too short (${wordCount} word): "${transcription}"`);
-            return;
-          }
-
-          // If we're in idle waiting after TTS, require more substantial input (3+ words)
-          if (session.voiceIdleWaiting && wordCount < 3) {
-            serverLog(`[Voice] Waiting for more substantial input (got ${wordCount} words)`);
-            return;
-          }
-
-          // WAKE WORD CHECK - if wakeWordCheck flag is set, only check for wake word
-          if (message.wakeWordCheck) {
-            const wakeResult = voiceService.checkForWakeWord(transcription);
-
-            if (wakeResult.detected) {
-              // Wake word found! Send wake word detected response
-              const wakeResponse: StreamResponse = {
-                type: 'voice_wake_word',
-                terminalId: message.terminalId,
-                transcription: wakeResult.text,
-                responseText: wakeResult.remainder // Any additional text after wake word
-              };
-              ws.send(JSON.stringify(wakeResponse));
-              serverLog(`[Voice] Wake word detected: "${transcription}"`);
-
-              // If there's additional content after wake word, process it as a command
-              if (wakeResult.remainder && wakeResult.remainder.length > 2) {
-                // Play a short acknowledgment and then process the remainder
-                const ackText = 'Yes?';
-                const ttsAudio = await voiceService.textToSpeech(ackText);
-                const audioResponse: StreamResponse = {
-                  type: 'voice_terminal_speaking',
-                  terminalId: message.terminalId,
-                  responseText: ackText,
-                  audioData: ttsAudio.toString('base64'),
-                  audioMimeType: 'audio/mp3'
-                };
-                ws.send(JSON.stringify(audioResponse));
-              }
-            } else {
-              // No wake word - send no_wake_word response to continue sleeping
-              const noWakeResponse: StreamResponse = {
-                type: 'voice_no_wake_word',
-                terminalId: message.terminalId
-              };
-              ws.send(JSON.stringify(noWakeResponse));
+          // Skip audio filtering for follow-ups (they have synthetic transcription)
+          if (!isScreenshotFollowUp && !isTerminalOutputFollowUp) {
+            // Filter out common Whisper hallucinations on silence/noise
+            const WHISPER_HALLUCINATIONS = [
+              'thank you for watching',
+              'thanks for watching',
+              'subscribe',
+              'like and subscribe',
+              'see you next time',
+              'goodbye',
+              'thank you',
+              'you',
+              'bye',
+              'the end',
+              '...',
+              'hmm',
+              'um',
+              'uh',
+            ];
+            const lowerTrim = transcription.toLowerCase().trim();
+            if (WHISPER_HALLUCINATIONS.some(h => lowerTrim === h || lowerTrim === h + '.')) {
+              serverLog(`[Voice] Filtered Whisper hallucination: "${transcription}"`);
+              return;
             }
-            return;
+
+            // Require minimum word count for meaningful input (at least 2 words)
+            const wordCount = transcription.trim().split(/\s+/).length;
+            if (wordCount < 2) {
+              serverLog(`[Voice] Too short (${wordCount} word): "${transcription}"`);
+              return;
+            }
+
+            // If we're in idle waiting after TTS, require more substantial input (3+ words)
+            if (session.voiceIdleWaiting && wordCount < 3) {
+              serverLog(`[Voice] Waiting for more substantial input (got ${wordCount} words)`);
+              return;
+            }
           }
 
           // Send transcription to client (what the user said)
+          serverLog(`[Voice] User said: "${transcription}"`);
           const transcriptionResponse: StreamResponse = {
             type: 'voice_transcription',
             terminalId: message.terminalId,
@@ -1359,6 +1418,11 @@ wss.on('connection', (ws: WebSocket) => {
             if (message.appState.projectName) {
               appStateDesc += `- Project: ${message.appState.projectName}\n`;
             }
+            // Multi-terminal info
+            if (message.appState.terminalCount !== undefined && message.appState.terminalCount > 0) {
+              appStateDesc += `- Open terminals: ${message.appState.terminalCount}\n`;
+              appStateDesc += `- Active terminal: Terminal ${(message.appState.activeTerminalIndex ?? 0) + 1} of ${message.appState.terminalCount}\n`;
+            }
           }
 
           const agentResponse = await voiceService.processVoiceInput(
@@ -1369,8 +1433,12 @@ wss.on('connection', (ws: WebSocket) => {
               recentOutput: terminalContext + appStateDesc,
               claudeCodeState: stateDescription,
               screenCapture: message.screenCapture  // Phone screenshot if provided
-            }
+            },
+            session.voiceAgentModel  // Pass selected model
           );
+
+          // Log agent response for debugging
+          serverLog(`[Voice] Agent response: type=${agentResponse.type}, voiceResponse="${agentResponse.voiceResponse || ''}", content="${agentResponse.content?.substring(0, 100) || ''}"`);
 
           // Handle IGNORE - transcription artifacts, noise
           if (agentResponse.type === 'ignore') {
@@ -1383,12 +1451,13 @@ wss.on('connection', (ws: WebSocket) => {
             const speechText = agentResponse.voiceResponse || agentResponse.content;
             const ttsAudioBuffer = await voiceService.textToSpeech(speechText);
 
-            const audioResponse: StreamResponse = {
+            const audioResponse: StreamResponse & { isComplete?: boolean } = {
               type: 'voice_terminal_speaking',
               terminalId: message.terminalId,
               responseText: speechText,
               audioData: ttsAudioBuffer.toString('base64'),
-              audioMimeType: 'audio/mp3'
+              audioMimeType: 'audio/mp3',
+              isComplete: true  // Final response - return to listening
             };
             ws.send(JSON.stringify(audioResponse));
 
@@ -1401,6 +1470,41 @@ wss.on('connection', (ws: WebSocket) => {
           // Handle CONTROL - terminal/Claude Code control commands
           if (agentResponse.type === 'control') {
             const tmuxName = session.tmuxSessionName;
+
+            // Check if this is a "complex" command that needs observation after execution
+            // Complex commands: slash commands always need follow-up to report what happened
+            const commands = agentResponse.content.split(',').map(c => c.trim()).filter(c => c);
+            const hasSlashCommand = commands.some(cmd => cmd.startsWith('/'));
+            const needsFollowUp = hasSlashCommand; // Always follow up on slash commands
+
+            // Determine intro speech - use agent's voiceResponse or a default
+            const introSpeech = agentResponse.voiceResponse || 'Let me do that for you.';
+
+            // If this needs follow-up, speak FIRST before executing
+            if (needsFollowUp) {
+              serverLog(`[Voice] Speaking before executing command: "${introSpeech}"`);
+              const interimTTS = await voiceService.textToSpeech(introSpeech);
+              const interimResponse: StreamResponse & { isComplete?: boolean } = {
+                type: 'voice_terminal_speaking',
+                terminalId: message.terminalId,
+                responseText: introSpeech,
+                audioData: interimTTS.toString('base64'),
+                audioMimeType: 'audio/mp3',
+                isComplete: false  // NOT final - more coming after we observe the result
+              };
+              ws.send(JSON.stringify(interimResponse));
+
+              // Tell mobile we're still working
+              const workingResponse: StreamResponse = {
+                type: 'voice_working',
+                terminalId: message.terminalId,
+                workingState: {
+                  reason: 'claude_action',
+                  followUpAction: 'wait_for_claude'
+                }
+              };
+              ws.send(JSON.stringify(workingResponse));
+            }
 
             // Helper function to execute a single control action
             async function executeControl(action: string): Promise<string> {
@@ -1492,7 +1596,7 @@ wss.on('connection', (ws: WebSocket) => {
                   return repeatCount > 1 ? `Right ${repeatCount}x.` : 'Right.';
                 case 'ENTER':
                   await tmuxService.sendEnter(tmuxName);
-                  return 'Enter.';
+                  return 'Selected.';
                 case 'TAB':
                   for (let i = 0; i < repeatCount; i++) {
                     await tmuxService.sendSpecialKey(tmuxName, 'Tab');
@@ -1504,8 +1608,7 @@ wss.on('connection', (ws: WebSocket) => {
               }
             }
 
-            // Parse and execute multiple commands separated by commas
-            const commands = agentResponse.content.split(',').map(c => c.trim()).filter(c => c);
+            // Execute all commands
             const results: string[] = [];
 
             for (const cmd of commands) {
@@ -1513,7 +1616,48 @@ wss.on('connection', (ws: WebSocket) => {
               results.push(result);
             }
 
-            // Use voiceResponse if provided, otherwise generate from results
+            // If this needed follow-up (slash command with voiceResponse), observe and report
+            if (needsFollowUp) {
+              serverLog(`[Voice] Command executed, waiting for terminal output to stabilize...`);
+
+              // Wait for terminal output to stabilize (give Claude Code time to respond)
+              await new Promise(r => setTimeout(r, 1500));
+
+              // Capture the new terminal output
+              const terminalOutput = await tmuxService.captureOutput(tmuxName, 50);
+
+              // Get agent to analyze and respond naturally
+              serverLog(`[Voice] Getting agent follow-up response...`);
+              const followUpResponse = await voiceService.processVoiceInput(
+                '', // No new user audio
+                message.terminalId,
+                {
+                  terminalContent: terminalOutput,
+                  appState: message.appState,
+                  systemNote: `[SYSTEM: The command was executed. Here's the current terminal output. Describe what you see and offer to help the user with next steps. Be concise.]`
+                },
+                session.voiceAgentModel  // Pass selected model
+              );
+
+              // Speak the follow-up
+              const followUpText = followUpResponse.voiceResponse || followUpResponse.content;
+              const followUpTTS = await voiceService.textToSpeech(followUpText);
+              const followUpAudio: StreamResponse & { isComplete?: boolean } = {
+                type: 'voice_terminal_speaking',
+                terminalId: message.terminalId,
+                responseText: followUpText,
+                audioData: followUpTTS.toString('base64'),
+                audioMimeType: 'audio/mp3',
+                isComplete: true  // NOW we're done - return to listening
+              };
+              ws.send(JSON.stringify(followUpAudio));
+
+              session.voiceLastTTSTime = Date.now();
+              session.voiceIdleWaiting = true;
+              return;
+            }
+
+            // For simple commands without follow-up, use voiceResponse if provided, otherwise generate from results
             const responseText = agentResponse.voiceResponse
               || (results.length > 1
                 ? `Done: ${results.join(' ')}`
@@ -1521,12 +1665,13 @@ wss.on('connection', (ws: WebSocket) => {
 
             // Generate voice response for control action
             const ttsAudio = await voiceService.textToSpeech(responseText);
-            const audioResponse: StreamResponse = {
+            const audioResponse: StreamResponse & { isComplete?: boolean } = {
               type: 'voice_terminal_speaking',
               terminalId: message.terminalId,
               responseText,
               audioData: ttsAudio.toString('base64'),
-              audioMimeType: 'audio/mp3'
+              audioMimeType: 'audio/mp3',
+              isComplete: true  // Final response - return to listening
             };
             ws.send(JSON.stringify(audioResponse));
 
@@ -1552,12 +1697,13 @@ wss.on('connection', (ws: WebSocket) => {
 
             // Also send voice response
             const ttsAudio = await voiceService.textToSpeech(speechText);
-            const audioResponse: StreamResponse = {
+            const audioResponse: StreamResponse & { isComplete?: boolean } = {
               type: 'voice_terminal_speaking',
               terminalId: message.terminalId,
               responseText: speechText,
               audioData: ttsAudio.toString('base64'),
-              audioMimeType: 'audio/mp3'
+              audioMimeType: 'audio/mp3',
+              isComplete: true  // Final response - return to listening
             };
             ws.send(JSON.stringify(audioResponse));
 
@@ -1569,18 +1715,46 @@ wss.on('connection', (ws: WebSocket) => {
 
           // Handle WORKING - agent is gathering info/waiting, don't yield floor
           if (agentResponse.type === 'working' && agentResponse.workingState) {
+            // Increment loop counter to prevent infinite "one moment" loops
+            session.voiceWorkingLoopCount++;
+            const MAX_WORKING_LOOPS = 2;  // Max consecutive WORKING responses before forcing completion
+
+            // If we've hit the loop limit, convert WORKING to CONVERSATIONAL and report what we have
+            if (session.voiceWorkingLoopCount > MAX_WORKING_LOOPS) {
+              serverLog(`[Voice] WORKING loop limit reached (${session.voiceWorkingLoopCount}), forcing completion`);
+              session.voiceWorkingLoopCount = 0;  // Reset for next time
+
+              // Analyze the terminal content we have and give a response
+              const fallbackText = "I've checked the terminal. Based on what I can see, please let me know what specific information you'd like me to focus on.";
+              const ttsAudio = await voiceService.textToSpeech(fallbackText);
+              const audioResponse: StreamResponse & { isComplete?: boolean } = {
+                type: 'voice_terminal_speaking',
+                terminalId: message.terminalId,
+                responseText: fallbackText,
+                audioData: ttsAudio.toString('base64'),
+                audioMimeType: 'audio/mp3',
+                isComplete: true  // Force completion - return to listening
+              };
+              ws.send(JSON.stringify(audioResponse));
+              session.voiceLastTTSTime = Date.now();
+              session.voiceIdleWaiting = true;
+              return;
+            }
+
             // Send TTS for the status message (e.g., "One moment, let me check that")
             const ttsAudio = await voiceService.textToSpeech(agentResponse.content);
-            const audioResponse: StreamResponse = {
+            const audioResponse: StreamResponse & { isComplete?: boolean } = {
               type: 'voice_terminal_speaking',
               terminalId: message.terminalId,
               responseText: agentResponse.content,
               audioData: ttsAudio.toString('base64'),
-              audioMimeType: 'audio/mp3'
+              audioMimeType: 'audio/mp3',
+              isComplete: false  // NOT final - more processing coming
             };
             ws.send(JSON.stringify(audioResponse));
 
             // Send working state to client - this triggers the working chime and follow-up action
+            serverLog(`[Voice] Sending working state: reason=${agentResponse.workingState?.reason}, followUpAction=${agentResponse.workingState?.followUpAction}`);
             const workingResponse: StreamResponse = {
               type: 'voice_working',
               terminalId: message.terminalId,
@@ -1594,6 +1768,104 @@ wss.on('connection', (ws: WebSocket) => {
             return;
           }
 
+          // Handle BACKGROUND_TASK - send to Claude Code and continue conversation
+          if (agentResponse.type === 'background_task' && agentResponse.backgroundTask) {
+            serverLog(`[Voice] Starting background task: "${agentResponse.backgroundTask.taskDescription}"`);
+
+            // Create a background task entry
+            const taskId = `task-${Date.now().toString(36)}`;
+            const task: BackgroundTask = {
+              id: taskId,
+              description: agentResponse.backgroundTask.taskDescription,
+              prompt: agentResponse.backgroundTask.prompt,
+              startedAt: Date.now(),
+              status: 'running'
+            };
+            session.backgroundTasks.push(task);
+
+            // Notify mobile app that a background task started
+            const taskStartedResponse: StreamResponse = {
+              type: 'voice_background_task_started',
+              terminalId: message.terminalId,
+              backgroundTaskId: taskId,
+              backgroundTaskDescription: task.description
+            };
+            ws.send(JSON.stringify(taskStartedResponse));
+
+            // Speak the conversational response to user (this is NOT final - we continue listening)
+            const ttsAudio = await voiceService.textToSpeech(agentResponse.content);
+            const audioResponse: StreamResponse & { isComplete?: boolean } = {
+              type: 'voice_terminal_speaking',
+              terminalId: message.terminalId,
+              responseText: agentResponse.content,
+              audioData: ttsAudio.toString('base64'),
+              audioMimeType: 'audio/mp3',
+              isComplete: true  // Return to listening for more conversation
+            };
+            ws.send(JSON.stringify(audioResponse));
+            session.voiceLastTTSTime = Date.now();
+            session.voiceIdleWaiting = true;  // User can continue talking
+
+            // Now start the Claude Code task in the background (async, don't await)
+            (async () => {
+              try {
+                // Capture output before sending command
+                const outputBeforeCommand = await tmuxService.captureOutput(session.tmuxSessionName, 100);
+
+                // Send the prompt to Claude Code
+                await tmuxService.sendCommand(session.tmuxSessionName, task.prompt);
+                await tmuxService.sendEnter(session.tmuxSessionName);
+
+                // Wait for Claude Code to finish (via hooks)
+                const claudeState = await tmuxService.waitForClaudeReadyWithHooks(session.tmuxSessionName, {
+                  timeoutMs: 300000,  // 5 minutes for background tasks
+                  pollIntervalMs: 500,
+                  previousOutput: outputBeforeCommand
+                });
+
+                // Extract the response
+                const claudeResponse = tmuxService.extractClaudeResponse(claudeState.rawOutput);
+
+                // Update task status
+                task.status = 'completed';
+                task.result = claudeResponse;
+
+                // Summarize for notification
+                const summary = claudeResponse && claudeResponse.length > 100
+                  ? await voiceService.summarizeForVoice(claudeResponse, message.terminalId, 'terse')
+                  : 'The task is done.';
+
+                serverLog(`[Voice] Background task completed: "${task.description}"`);
+
+                // If user is still in voice mode, notify them
+                if (session.voiceMode && session.ws) {
+                  // Send completion notification
+                  const completionResponse: StreamResponse = {
+                    type: 'voice_background_task_complete',
+                    terminalId: message.terminalId,
+                    backgroundTaskId: taskId,
+                    backgroundTaskDescription: task.description,
+                    backgroundTaskResult: summary
+                  };
+                  try {
+                    session.ws.send(JSON.stringify(completionResponse));
+                  } catch (e) {
+                    serverLog(`[Voice] Failed to send background task completion: ${e}`);
+                  }
+                }
+
+                // Remove from active tasks
+                session.backgroundTasks = session.backgroundTasks.filter(t => t.id !== taskId);
+              } catch (err) {
+                serverLog(`[Voice] Background task failed: ${err}`);
+                task.status = 'failed';
+                session.backgroundTasks = session.backgroundTasks.filter(t => t.id !== taskId);
+              }
+            })();
+
+            return;
+          }
+
           // PROMPT type - send natural language to Claude Code
           // Clear idle state - user is actively commanding
           session.voiceIdleWaiting = false;
@@ -1603,14 +1875,26 @@ wss.on('connection', (ws: WebSocket) => {
           // This lets the user know what's happening ("Let me check that for you")
           if (agentResponse.voiceResponse) {
             const ttsAudioBuffer = await voiceService.textToSpeech(agentResponse.voiceResponse);
-            const audioResponse: StreamResponse = {
+            const audioResponse: StreamResponse & { isComplete?: boolean } = {
               type: 'voice_terminal_speaking',
               terminalId: message.terminalId,
               responseText: agentResponse.voiceResponse,
               audioData: ttsAudioBuffer.toString('base64'),
-              audioMimeType: 'audio/mp3'
+              audioMimeType: 'audio/mp3',
+              isComplete: false  // NOT final - Claude will process and we'll send final response after
             };
             ws.send(JSON.stringify(audioResponse));
+
+            // Also tell mobile app we're still working (backup signal)
+            const workingResponse: StreamResponse = {
+              type: 'voice_working',
+              terminalId: message.terminalId,
+              workingState: {
+                reason: 'claude_action',
+                followUpAction: 'wait_for_claude'
+              }
+            };
+            ws.send(JSON.stringify(workingResponse));
           }
 
           // Send progress to client
@@ -1650,19 +1934,20 @@ wss.on('connection', (ws: WebSocket) => {
             // Claude is asking for confirmation - need to tell user
             const confirmText = 'Claude is asking for confirmation. Please say yes or no.';
             const ttsAudio = await voiceService.textToSpeech(confirmText);
-            const confirmResponse: StreamResponse = {
+            const confirmResponse: StreamResponse & { isComplete?: boolean } = {
               type: 'voice_terminal_speaking',
               terminalId: message.terminalId,
               responseText: confirmText,
               audioData: ttsAudio.toString('base64'),
-              audioMimeType: 'audio/mp3'
+              audioMimeType: 'audio/mp3',
+              isComplete: true  // Final response - return to listening
             };
             ws.send(JSON.stringify(confirmResponse));
             session.voiceLastTTSTime = Date.now();
             session.voiceIdleWaiting = true;
           } else if (claudeResponse && claudeResponse.length > 50) {
-            // Generate voice response
-            await processTerminalVoiceResponse(ws, message.terminalId, claudeResponse, session);
+            // Generate voice response (isComplete=true by default)
+            await processTerminalVoiceResponse(ws, message.terminalId, claudeResponse, session, true);
 
             // Enter idle state - wait for user to speak next
             session.voiceIdleWaiting = true;
@@ -1670,12 +1955,13 @@ wss.on('connection', (ws: WebSocket) => {
             // Provide feedback that task completed
             const doneText = 'Done. What would you like me to do next?';
             const ttsAudio = await voiceService.textToSpeech(doneText);
-            const doneResponse: StreamResponse = {
+            const doneResponse: StreamResponse & { isComplete?: boolean } = {
               type: 'voice_terminal_speaking',
               terminalId: message.terminalId,
               responseText: doneText,
               audioData: ttsAudio.toString('base64'),
-              audioMimeType: 'audio/mp3'
+              audioMimeType: 'audio/mp3',
+              isComplete: true  // Final response - return to listening
             };
             ws.send(JSON.stringify(doneResponse));
             session.voiceLastTTSTime = Date.now();

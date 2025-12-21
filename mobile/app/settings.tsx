@@ -19,11 +19,13 @@ import {
   ExternalLink,
   Trash2,
   Info,
+  Mic,
 } from 'lucide-react-native';
-import { useSettingsStore, useChatStore, useProjectStore } from '../stores';
+import { useSettingsStore, useChatStore, useProjectStore, useVoiceStore } from '../stores';
 import { claudeService } from '../services/claude';
 import { Button } from '../components/common';
 import { colors, spacing, radius, typography } from '../theme';
+import { VOICE_AGENT_MODELS, VoiceAgentModelId } from '../constants';
 
 export default function SettingsScreen() {
   const router = useRouter();
@@ -31,12 +33,17 @@ export default function SettingsScreen() {
     bridgeServerUrl,
     isConnected,
     autoPreview,
+    voiceAgentModel,
     setBridgeServerUrl,
     setIsConnected,
     setAutoPreview,
+    setVoiceAgentModel,
   } = useSettingsStore();
   const { clearChat } = useChatStore();
   const { projects } = useProjectStore();
+  const { voiceStatus } = useVoiceStore();
+
+  const isVoiceActive = voiceStatus !== 'off';
 
   const [serverUrl, setServerUrl] = useState(bridgeServerUrl);
   const [connecting, setConnecting] = useState(false);
@@ -170,6 +177,50 @@ export default function SettingsScreen() {
             thumbColor={colors.background}
           />
         </View>
+
+        {/* Voice Agent Model Picker */}
+        <View style={styles.settingRow}>
+          <View style={styles.settingInfo}>
+            <View style={styles.settingLabelRow}>
+              <Mic color={colors.mutedForeground} size={16} />
+              <Text style={styles.settingLabel}>Voice Agent Model</Text>
+            </View>
+            <Text style={styles.settingDescription}>
+              {isVoiceActive
+                ? 'Disable voice mode to change model'
+                : 'Choose the AI model for voice commands'}
+            </Text>
+          </View>
+        </View>
+        <View style={[styles.modelPicker, isVoiceActive && styles.modelPickerDisabled]}>
+          {VOICE_AGENT_MODELS.map((model) => (
+            <TouchableOpacity
+              key={model.id}
+              style={[
+                styles.modelOption,
+                voiceAgentModel === model.id && styles.modelOptionSelected,
+                isVoiceActive && styles.modelOptionDisabled,
+              ]}
+              onPress={() => !isVoiceActive && setVoiceAgentModel(model.id as VoiceAgentModelId)}
+              disabled={isVoiceActive}
+            >
+              <Text style={[
+                styles.modelOptionLabel,
+                voiceAgentModel === model.id && styles.modelOptionLabelSelected,
+                isVoiceActive && styles.modelOptionLabelDisabled,
+              ]}>
+                {model.label}
+              </Text>
+              <Text style={[
+                styles.modelOptionDescription,
+                voiceAgentModel === model.id && styles.modelOptionDescriptionSelected,
+                isVoiceActive && styles.modelOptionDescriptionDisabled,
+              ]}>
+                {model.description}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
       </View>
 
       {/* Data Section */}
@@ -291,8 +342,59 @@ const styles = StyleSheet.create({
     ...typography.body,
     color: colors.foreground,
   },
+  settingLabelRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
   settingDescription: {
     ...typography.caption,
+    color: colors.mutedForeground,
+  },
+  modelPicker: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  modelPickerDisabled: {
+    opacity: 0.5,
+  },
+  modelOption: {
+    flex: 1,
+    padding: spacing.md,
+    backgroundColor: colors.cardBackground,
+    borderRadius: radius.lg,
+    borderWidth: 2,
+    borderColor: colors.border,
+    alignItems: 'center',
+  },
+  modelOptionSelected: {
+    borderColor: colors.brandTiger,
+    backgroundColor: colors.brandTiger + '10',
+  },
+  modelOptionDisabled: {
+    borderColor: colors.border,
+  },
+  modelOptionLabel: {
+    ...typography.button,
+    color: colors.foreground,
+    marginBottom: spacing.xs,
+  },
+  modelOptionLabelSelected: {
+    color: colors.brandTiger,
+  },
+  modelOptionLabelDisabled: {
+    color: colors.mutedForeground,
+  },
+  modelOptionDescription: {
+    ...typography.caption,
+    color: colors.mutedForeground,
+    textAlign: 'center',
+  },
+  modelOptionDescriptionSelected: {
+    color: colors.brandTiger,
+  },
+  modelOptionDescriptionDisabled: {
     color: colors.mutedForeground,
   },
   statRow: {

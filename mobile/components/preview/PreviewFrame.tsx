@@ -97,8 +97,29 @@ export function PreviewFrame({ url, onError, onConsoleMessage }: PreviewFramePro
         });
       }
     } catch (e) {
-      // Ignore parse errors
+      // Ignore parse errors - might be non-JSON messages
+      console.log('[PreviewFrame] Non-JSON message:', event.nativeEvent.data?.substring(0, 100));
     }
+  };
+
+  const handleHttpError = (syntheticEvent: any) => {
+    const { nativeEvent } = syntheticEvent;
+    console.warn('[PreviewFrame] HTTP error:', nativeEvent.statusCode, nativeEvent.description);
+    onConsoleMessage?.({
+      type: 'error',
+      message: `HTTP Error ${nativeEvent.statusCode}: ${nativeEvent.description || nativeEvent.url}`,
+      timestamp: new Date(),
+    });
+  };
+
+  const handleRenderProcessGone = (syntheticEvent: any) => {
+    const { nativeEvent } = syntheticEvent;
+    console.warn('[PreviewFrame] Render process gone:', nativeEvent);
+    onConsoleMessage?.({
+      type: 'error',
+      message: `WebView crashed: ${nativeEvent?.didCrash ? 'Process crashed' : 'Process killed'}`,
+      timestamp: new Date(),
+    });
   };
 
   if (!url) {
@@ -131,12 +152,22 @@ export function PreviewFrame({ url, onError, onConsoleMessage }: PreviewFramePro
         source={{ uri: url }}
         style={styles.webview}
         onLoadStart={() => {
+          console.log('[PreviewFrame] Load started:', url);
           setLoading(true);
           setError(null);
         }}
-        onLoadEnd={() => setLoading(false)}
+        onLoadEnd={() => {
+          console.log('[PreviewFrame] Load ended');
+          setLoading(false);
+        }}
+        onLoadProgress={({ nativeEvent }) => {
+          if (nativeEvent.progress === 1) {
+            console.log('[PreviewFrame] Load complete');
+          }
+        }}
         onError={(e) => {
           const errorMsg = e.nativeEvent.description || 'Unknown error';
+          console.error('[PreviewFrame] Load error:', errorMsg);
           setError(errorMsg);
           setLoading(false);
           onError?.(errorMsg);
@@ -146,14 +177,30 @@ export function PreviewFrame({ url, onError, onConsoleMessage }: PreviewFramePro
             timestamp: new Date(),
           });
         }}
+        onHttpError={handleHttpError}
+        renderError={(errorName) => (
+          <View style={styles.errorContainer}>
+            <Text style={styles.errorText}>Failed to load: {errorName}</Text>
+          </View>
+        )}
         onMessage={handleMessage}
         injectedJavaScript={CONSOLE_CAPTURE_SCRIPT}
+        injectedJavaScriptBeforeContentLoaded={CONSOLE_CAPTURE_SCRIPT}
         allowsInlineMediaPlayback
         mediaPlaybackRequiresUserAction={false}
-        javaScriptEnabled
-        domStorageEnabled
-        startInLoadingState
-        scalesPageToFit
+        javaScriptEnabled={true}
+        domStorageEnabled={true}
+        startInLoadingState={true}
+        originWhitelist={['*']}
+        mixedContentMode="always"
+        allowUniversalAccessFromFileURLs={true}
+        allowFileAccessFromFileURLs={true}
+        allowsFullscreenVideo={true}
+        cacheEnabled={false}
+        incognito={false}
+        thirdPartyCookiesEnabled={true}
+        sharedCookiesEnabled={true}
+        userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
       />
     </View>
   );

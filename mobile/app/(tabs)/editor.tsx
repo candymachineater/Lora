@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   StyleSheet,
@@ -9,10 +9,11 @@ import {
   TouchableOpacity,
 } from 'react-native';
 import { useRouter } from 'expo-router';
+import ViewShot from 'react-native-view-shot';
 import { Code2, ChevronLeft, Save, Plus, RefreshCw } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
-import { useProjectStore, useSettingsStore } from '../../stores';
+import { useProjectStore, useSettingsStore, useVoiceStore } from '../../stores';
 import { bridgeService } from '../../services/claude/api';
 import { FileTree, CodeEditor } from '../../components/editor';
 import { EmptyState, Button } from '../../components/common';
@@ -24,6 +25,8 @@ export default function EditorScreen() {
   const insets = useSafeAreaInsets();
   const { currentProjectId, currentProject, currentFile, setCurrentFile } = useProjectStore();
   const { isConnected } = useSettingsStore();
+  const { pendingEditorAction, clearEditorAction, registerScreenshotCapture, unregisterScreenshotCapture } = useVoiceStore();
+  const viewShotRef = useRef<ViewShot>(null);
 
   const [showNewFileModal, setShowNewFileModal] = useState(false);
   const [newFileName, setNewFileName] = useState('');
@@ -151,6 +154,82 @@ export default function EditorScreen() {
     }
   }, [currentFile, fetchFileContent]);
 
+  // Handle voice agent editor actions
+  useEffect(() => {
+    if (pendingEditorAction && pendingEditorAction.type) {
+      console.log('[Editor] Handling voice action:', pendingEditorAction);
+
+      const handleAction = async () => {
+        switch (pendingEditorAction.type) {
+          case 'open_file':
+            if (pendingEditorAction.filePath) {
+              console.log('[Editor] Opening file:', pendingEditorAction.filePath);
+              setCurrentFile(pendingEditorAction.filePath);
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+            }
+            break;
+
+          case 'close_file':
+            console.log('[Editor] Closing file');
+            handleBackToFiles();
+            break;
+
+          case 'save_file':
+            if (currentFile && isDirty) {
+              console.log('[Editor] Saving file');
+              await handleSaveFile();
+            }
+            break;
+
+          case 'refresh_files':
+            console.log('[Editor] Refreshing files');
+            await handleRefresh();
+            break;
+
+          case 'set_file_content':
+            if (pendingEditorAction.content !== undefined) {
+              console.log('[Editor] Setting file content');
+              setFileContent(pendingEditorAction.content);
+              setIsDirty(pendingEditorAction.content !== originalContent);
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+            }
+            break;
+        }
+
+        // Clear the action after handling
+        clearEditorAction();
+      };
+
+      handleAction();
+    }
+  }, [pendingEditorAction, clearEditorAction, currentFile, isDirty, originalContent, setCurrentFile]);
+
+  // Register screenshot capture function for voice agent
+  useEffect(() => {
+    const captureScreenshot = async (): Promise<string | undefined> => {
+      if (!viewShotRef.current) {
+        console.log('[Editor] ViewShot ref not available');
+        return undefined;
+      }
+      try {
+        const uri = await viewShotRef.current.capture();
+        console.log('[Editor] Screenshot captured');
+        return uri;
+      } catch (error) {
+        console.error('[Editor] Failed to capture screenshot:', error);
+        return undefined;
+      }
+    };
+
+    registerScreenshotCapture('editor', captureScreenshot);
+    console.log('[Editor] Registered screenshot capture');
+
+    return () => {
+      unregisterScreenshotCapture('editor');
+      console.log('[Editor] Unregistered screenshot capture');
+    };
+  }, [registerScreenshotCapture, unregisterScreenshotCapture]);
+
   const handleSelectFile = (path: string) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setCurrentFile(path);
@@ -234,7 +313,7 @@ export default function EditorScreen() {
   // Show code editor when file is selected
   if (currentFile && currentFileData) {
     return (
-      <View style={[styles.container, { paddingTop: insets.top }]}>
+      <ViewShot ref={viewShotRef} style={[styles.container, { paddingTop: insets.top }]} options={{ format: 'png', quality: 0.8, result: 'base64' }}>
         {/* Editor Header */}
         <View style={styles.editorHeader}>
           <TouchableOpacity style={styles.backButton} onPress={handleBackToFiles}>
@@ -272,13 +351,13 @@ export default function EditorScreen() {
             language={currentFileData.type || 'tsx'}
           />
         )}
-      </View>
+      </ViewShot>
     );
   }
 
   // Show file tree by default
   return (
-    <View style={[styles.container, { paddingTop: insets.top }]}>
+    <ViewShot ref={viewShotRef} style={[styles.container, { paddingTop: insets.top }]} options={{ format: 'png', quality: 0.8, result: 'base64' }}>
       {/* File Tree Header */}
       <View style={styles.fileTreeHeader}>
         <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
@@ -367,7 +446,7 @@ export default function EditorScreen() {
           </View>
         </View>
       </Modal>
-    </View>
+    </ViewShot>
   );
 }
 
