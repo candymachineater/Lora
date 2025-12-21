@@ -2,7 +2,6 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
   StyleSheet,
-  Dimensions,
   Modal,
   TextInput,
   Text,
@@ -10,23 +9,22 @@ import {
   TouchableOpacity,
 } from 'react-native';
 import { useRouter } from 'expo-router';
-import { Code2, RefreshCw, PanelLeftClose, PanelLeft, Save } from 'lucide-react-native';
+import { Code2, ChevronLeft, Save, Plus, RefreshCw } from 'lucide-react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as Haptics from 'expo-haptics';
 import { useProjectStore, useSettingsStore } from '../../stores';
 import { bridgeService } from '../../services/claude/api';
-import { FileTree, CodeEditor, TabBar } from '../../components/editor';
+import { FileTree, CodeEditor } from '../../components/editor';
 import { EmptyState, Button } from '../../components/common';
 import { ProjectFile } from '../../types';
 import { colors, spacing, radius, typography, shadows } from '../../theme';
 
-const { width: screenWidth } = Dimensions.get('window');
-const FILE_TREE_WIDTH = screenWidth < 600 ? 150 : 200; // Smaller on mobile
-
 export default function EditorScreen() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const { currentProjectId, currentProject, currentFile, setCurrentFile } = useProjectStore();
   const { isConnected } = useSettingsStore();
 
-  const [showFileSidebar, setShowFileSidebar] = useState(true); // Always show sidebar
   const [showNewFileModal, setShowNewFileModal] = useState(false);
   const [newFileName, setNewFileName] = useState('');
   const [files, setFiles] = useState<ProjectFile[]>([]);
@@ -41,8 +39,7 @@ export default function EditorScreen() {
 
   const project = currentProject();
 
-  // Fetch files from bridge server (root level or subdirectory)
-  // silent: when true, don't manage isRefreshing state (caller handles it)
+  // Fetch files from bridge server
   const fetchFiles = useCallback(async (dirPath?: string, isExpand: boolean = false, silent: boolean = false) => {
     if (!currentProjectId || !bridgeService.isConnected()) return [];
 
@@ -53,7 +50,6 @@ export default function EditorScreen() {
 
       const serverFiles = await bridgeService.getFiles(currentProjectId, dirPath);
 
-      // Convert to ProjectFile format with full path
       const formattedFiles: ProjectFile[] = serverFiles.map((f) => ({
         path: f.path,
         name: f.name,
@@ -63,7 +59,6 @@ export default function EditorScreen() {
 
       return formattedFiles;
     } catch (err: any) {
-      // Ignore "request already pending" errors - they're expected during polling
       if (err?.message !== 'Request already pending') {
         console.error('[Editor] Failed to fetch files:', err);
       }
@@ -75,15 +70,12 @@ export default function EditorScreen() {
     }
   }, [currentProjectId]);
 
-  // Fetch root files
-  // silent: when true, don't manage isRefreshing state (caller handles it)
   const fetchRootFiles = useCallback(async (silent: boolean = false) => {
     const rootFiles = await fetchFiles(undefined, false, silent);
     setFiles(rootFiles);
     return rootFiles;
   }, [fetchFiles]);
 
-  // Fetch file content
   const fetchFileContent = useCallback(async (filePath: string) => {
     if (!currentProjectId || !bridgeService.isConnected()) return;
 
@@ -105,7 +97,6 @@ export default function EditorScreen() {
 
   // Clear state when project changes
   useEffect(() => {
-    // Reset all file-related state when project changes
     setFiles([]);
     setFileContent('');
     setOriginalContent('');
@@ -114,49 +105,32 @@ export default function EditorScreen() {
     setCurrentFile(null);
   }, [currentProjectId, setCurrentFile]);
 
-  // Initial file fetch and polling
+  // Initial file fetch
   useEffect(() => {
     if (currentProjectId && isConnected) {
       fetchRootFiles();
-
-      // Poll for file changes every 5 seconds (longer to reduce load)
-      const pollInterval = setInterval(() => {
-        fetchRootFiles();
-      }, 5000);
-
-      return () => clearInterval(pollInterval);
     }
   }, [currentProjectId, isConnected, fetchRootFiles]);
 
   // Handle directory expansion
   const handleExpandDirectory = useCallback(async (dirPath: string) => {
     if (expandedDirs.has(dirPath)) {
-      // Collapse: remove directory and its children
       const newExpanded = new Set(expandedDirs);
       newExpanded.delete(dirPath);
       setExpandedDirs(newExpanded);
-
-      // Remove children from files list
       setFiles((prev) => prev.filter((f) => !f.path.startsWith(dirPath + '/')));
     } else {
-      // Expand: fetch children and add to files
       setLoadingDirs((prev) => new Set(prev).add(dirPath));
 
       try {
         const childFiles = await fetchFiles(dirPath, true);
-
-        // Add children after parent in the files list
         setFiles((prev) => {
           const parentIndex = prev.findIndex((f) => f.path === dirPath);
           if (parentIndex === -1) return prev;
-
           const newFiles = [...prev];
-          // Insert children after parent
           newFiles.splice(parentIndex + 1, 0, ...childFiles);
           return newFiles;
         });
-
-        // Mark as expanded
         setExpandedDirs((prev) => new Set(prev).add(dirPath));
       } catch (err) {
         console.error('[Editor] Failed to expand directory:', err);
@@ -178,38 +152,30 @@ export default function EditorScreen() {
   }, [currentFile, fetchFileContent]);
 
   const handleSelectFile = (path: string) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setCurrentFile(path);
   };
 
-  const handleRefresh = async () => {
-    // Warn if there are unsaved changes
+  const handleBackToFiles = () => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     if (isDirty) {
-      // For now, just reset dirty state - could add confirmation dialog later
-      console.log('[Editor] Discarding unsaved changes on refresh');
+      // Could add confirmation dialog here
     }
+    setCurrentFile(null);
+    setFileContent('');
+    setOriginalContent('');
+    setIsDirty(false);
+  };
 
-    // Reset expanded state and refetch
+  const handleRefresh = async () => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setExpandedDirs(new Set());
     setIsRefreshing(true);
-
     try {
-      // Pass silent: true so we manage isRefreshing here, not in fetchRootFiles
       await fetchRootFiles(true);
-      if (currentFile) {
-        await fetchFileContent(currentFile);
-      }
     } finally {
       setIsRefreshing(false);
     }
-  };
-
-  const handleAddFile = () => {
-    // TODO: Implement file creation via bridge server
-    setShowNewFileModal(false);
-  };
-
-  const handleDeleteFile = (path: string) => {
-    // TODO: Implement file deletion via bridge server
   };
 
   const handleCodeChange = (code: string) => {
@@ -220,6 +186,7 @@ export default function EditorScreen() {
   const handleSaveFile = async () => {
     if (!currentProjectId || !currentFile || !isDirty) return;
 
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     try {
       setIsSaving(true);
       await bridgeService.saveFile(currentProjectId, currentFile, fileContent);
@@ -234,11 +201,11 @@ export default function EditorScreen() {
 
   if (!project) {
     return (
-      <View style={styles.container}>
+      <View style={[styles.container, { paddingTop: insets.top }]}>
         <EmptyState
           icon={<Code2 color={colors.mutedForeground} size={48} />}
           title="No project selected"
-          description="Select or create a project to view and edit code"
+          description="Select or create a project to view files"
           action={
             <Button title="Go to Projects" onPress={() => router.push('/')} />
           }
@@ -249,7 +216,7 @@ export default function EditorScreen() {
 
   if (!isConnected) {
     return (
-      <View style={styles.container}>
+      <View style={[styles.container, { paddingTop: insets.top }]}>
         <EmptyState
           icon={<Code2 color={colors.mutedForeground} size={48} />}
           title="Not connected"
@@ -262,105 +229,102 @@ export default function EditorScreen() {
     );
   }
 
-  const openTabs = currentFile ? [{ path: currentFile, modified: false }] : [];
   const currentFileData = files.find((f) => f.path === currentFile);
 
-  return (
-    <View style={styles.container}>
-      {/* Header with sidebar toggle and refresh */}
-      <View style={styles.header}>
-        <View style={styles.headerLeft}>
+  // Show code editor when file is selected
+  if (currentFile && currentFileData) {
+    return (
+      <View style={[styles.container, { paddingTop: insets.top }]}>
+        {/* Editor Header */}
+        <View style={styles.editorHeader}>
+          <TouchableOpacity style={styles.backButton} onPress={handleBackToFiles}>
+            <ChevronLeft color={colors.foreground} size={24} />
+          </TouchableOpacity>
+          <View style={styles.fileInfo}>
+            <Text style={styles.fileName} numberOfLines={1}>
+              {currentFileData.name}
+            </Text>
+            {isDirty && <View style={styles.dirtyIndicator} />}
+          </View>
           <TouchableOpacity
-            style={styles.toggleButton}
-            onPress={() => setShowFileSidebar(!showFileSidebar)}
+            style={[styles.saveButton, !isDirty && styles.saveButtonDisabled]}
+            onPress={handleSaveFile}
+            disabled={!isDirty || isSaving}
           >
-            {showFileSidebar ? (
-              <PanelLeftClose color={colors.foreground} size={18} />
+            {isSaving ? (
+              <ActivityIndicator size="small" color={colors.brandTiger} />
             ) : (
-              <PanelLeft color={colors.foreground} size={18} />
+              <Save color={isDirty ? colors.brandTiger : colors.mutedForeground} size={22} />
             )}
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>{project.name}</Text>
         </View>
-        <View style={styles.headerRight}>
-          {isDirty && (
-            <TouchableOpacity
-              style={styles.saveButton}
-              onPress={handleSaveFile}
-              disabled={isSaving}
-            >
-              {isSaving ? (
-                <ActivityIndicator size="small" color={colors.brandTiger} />
-              ) : (
-                <Save color={colors.brandTiger} size={18} />
-              )}
-            </TouchableOpacity>
-          )}
+
+        {/* Code Editor */}
+        {isLoading ? (
+          <View style={styles.loadingContainer}>
+            <ActivityIndicator size="large" color={colors.brandTiger} />
+            <Text style={styles.loadingText}>Loading file...</Text>
+          </View>
+        ) : (
+          <CodeEditor
+            code={fileContent}
+            onChange={handleCodeChange}
+            language={currentFileData.type || 'tsx'}
+          />
+        )}
+      </View>
+    );
+  }
+
+  // Show file tree by default
+  return (
+    <View style={[styles.container, { paddingTop: insets.top }]}>
+      {/* File Tree Header */}
+      <View style={styles.fileTreeHeader}>
+        <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
+          <ChevronLeft color={colors.foreground} size={24} />
+        </TouchableOpacity>
+        <Text style={styles.projectTitle}>{project.name}</Text>
+        <View style={styles.headerActions}>
           <TouchableOpacity
-            style={styles.refreshButton}
+            style={styles.headerIconButton}
             onPress={handleRefresh}
             disabled={isRefreshing}
           >
             <RefreshCw
               color={isRefreshing ? colors.mutedForeground : colors.foreground}
-              size={18}
+              size={20}
             />
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.headerIconButton}
+            onPress={() => setShowNewFileModal(true)}
+          >
+            <Plus color={colors.foreground} size={22} />
           </TouchableOpacity>
         </View>
       </View>
 
-      <View style={styles.editorContainer}>
-        {/* File Sidebar */}
-        {showFileSidebar && (
-          <View style={[styles.sidebar, { width: FILE_TREE_WIDTH }]}>
-            <FileTree
-              files={files}
-              currentFile={currentFile}
-              onSelectFile={handleSelectFile}
-              onExpandDirectory={handleExpandDirectory}
-              expandedDirs={expandedDirs}
-              loadingDirs={loadingDirs}
-              onAddFile={() => setShowNewFileModal(true)}
-              onDeleteFile={handleDeleteFile}
-            />
+      {/* Full Width File Tree */}
+      <View style={styles.fileTreeContainer}>
+        {files.length === 0 ? (
+          <View style={styles.emptyFiles}>
+            <Text style={styles.emptyFilesText}>
+              No files yet.{'\n'}Use the terminal to create files.
+            </Text>
           </View>
-        )}
-
-        {/* Editor Area */}
-        <View style={styles.editorArea}>
-          {/* Tab Bar */}
-          <TabBar
-            tabs={openTabs}
-            activeTab={currentFile}
-            onSelectTab={setCurrentFile}
+        ) : (
+          <FileTree
+            files={files}
+            currentFile={currentFile}
+            onSelectFile={handleSelectFile}
+            onExpandDirectory={handleExpandDirectory}
+            expandedDirs={expandedDirs}
+            loadingDirs={loadingDirs}
+            onAddFile={() => setShowNewFileModal(true)}
+            onDeleteFile={() => {}}
           />
-
-          {/* Code Editor */}
-          {isLoading ? (
-            <View style={styles.loadingContainer}>
-              <ActivityIndicator size="large" color={colors.brandTiger} />
-              <Text style={styles.loadingText}>Loading file...</Text>
-            </View>
-          ) : currentFileData ? (
-            <CodeEditor
-              code={fileContent}
-              onChange={handleCodeChange}
-              language={currentFileData.type || 'tsx'}
-            />
-          ) : files.length === 0 ? (
-            <View style={styles.noFileSelected}>
-              <Text style={styles.noFileText}>
-                No files in project yet.{'\n'}Use the terminal to create files.
-              </Text>
-            </View>
-          ) : (
-            <View style={styles.noFileSelected}>
-              <Text style={styles.noFileText}>
-                Select a file to view and edit
-              </Text>
-            </View>
-          )}
-        </View>
+        )}
       </View>
 
       {/* New File Modal */}
@@ -393,7 +357,10 @@ export default function EditorScreen() {
               />
               <Button
                 title="Create"
-                onPress={handleAddFile}
+                onPress={() => {
+                  // TODO: Implement file creation
+                  setShowNewFileModal(false);
+                }}
                 disabled={!newFileName.trim()}
               />
             </View>
@@ -407,22 +374,14 @@ export default function EditorScreen() {
 function getFileType(filename: string): 'tsx' | 'ts' | 'json' | 'css' | 'md' | 'js' | 'jsx' {
   const ext = filename.split('.').pop()?.toLowerCase();
   switch (ext) {
-    case 'tsx':
-      return 'tsx';
-    case 'ts':
-      return 'ts';
-    case 'jsx':
-      return 'jsx';
-    case 'js':
-      return 'js';
-    case 'json':
-      return 'json';
-    case 'css':
-      return 'css';
-    case 'md':
-      return 'md';
-    default:
-      return 'ts';
+    case 'tsx': return 'tsx';
+    case 'ts': return 'ts';
+    case 'jsx': return 'jsx';
+    case 'js': return 'js';
+    case 'json': return 'json';
+    case 'css': return 'css';
+    case 'md': return 'md';
+    default: return 'ts';
   }
 }
 
@@ -431,50 +390,85 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.background,
   },
-  header: {
+  // File Tree Header
+  fileTreeHeader: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: spacing.md,
+    paddingHorizontal: spacing.sm,
     paddingVertical: spacing.sm,
-    backgroundColor: colors.cardBackground,
+    backgroundColor: colors.background,
     borderBottomWidth: 1,
     borderBottomColor: colors.border,
     ...shadows.sm,
   },
-  headerLeft: {
+  backButton: {
+    padding: spacing.xs,
+  },
+  projectTitle: {
+    flex: 1,
+    ...typography.h4,
+    color: colors.foreground,
+    marginLeft: spacing.sm,
+  },
+  headerActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: spacing.sm,
+    gap: spacing.xs,
   },
-  headerTitle: {
+  headerIconButton: {
+    padding: spacing.sm,
+  },
+  // File Tree
+  fileTreeContainer: {
+    flex: 1,
+    backgroundColor: colors.cardBackground,
+  },
+  emptyFiles: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: spacing.xl,
+  },
+  emptyFilesText: {
+    ...typography.body,
+    color: colors.mutedForeground,
+    textAlign: 'center',
+  },
+  // Editor Header
+  editorHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.sm,
+    backgroundColor: colors.background,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    ...shadows.sm,
+  },
+  fileInfo: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: spacing.sm,
+  },
+  fileName: {
     ...typography.h4,
     color: colors.foreground,
   },
-  toggleButton: {
-    padding: spacing.sm,
-  },
-  headerRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
+  dirtyIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: colors.brandTiger,
+    marginLeft: spacing.sm,
   },
   saveButton: {
     padding: spacing.sm,
   },
-  refreshButton: {
-    padding: spacing.sm,
+  saveButtonDisabled: {
+    opacity: 0.5,
   },
-  editorContainer: {
-    flex: 1,
-    flexDirection: 'row',
-  },
-  sidebar: {
-    height: '100%',
-  },
-  editorArea: {
-    flex: 1,
-  },
+  // Loading
   loadingContainer: {
     flex: 1,
     justifyContent: 'center',
@@ -486,18 +480,7 @@ const styles = StyleSheet.create({
     color: colors.mutedForeground,
     marginTop: spacing.md,
   },
-  noFileSelected: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: colors.codeBackground,
-    padding: spacing.lg,
-  },
-  noFileText: {
-    ...typography.body,
-    color: colors.mutedForeground,
-    textAlign: 'center',
-  },
+  // Modal
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.5)',

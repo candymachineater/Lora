@@ -1,23 +1,21 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView, Animated, Easing } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
-import { Terminal as TerminalIcon, Plus, X, Mic, MicOff, Volume2, Square, Loader2 } from 'lucide-react-native';
+import { Terminal as TerminalIcon, X } from 'lucide-react-native';
 import { Audio, AVPlaybackStatus } from 'expo-av';
 import ViewShot from 'react-native-view-shot';
 import * as Haptics from 'expo-haptics';
-import { useProjectStore, useSettingsStore } from '../../stores';
+import { useProjectStore, useSettingsStore, useVoiceStore } from '../../stores';
 import { bridgeService } from '../../services/claude/api';
 import { Terminal } from '../../components/terminal';
 import { EmptyState, Button } from '../../components/common';
-import { colors, spacing, shadows } from '../../theme';
+import { colors, spacing } from '../../theme';
 
 interface TerminalSession {
   id: string;
   output: string;
   sandbox: boolean;
 }
-
-type VoiceStatus = 'off' | 'idle' | 'listening' | 'processing' | 'speaking' | 'working';
 
 // VAD Configuration - Tuned for natural conversation flow
 // Based on OpenAI Realtime API best practices
@@ -33,10 +31,11 @@ const VAD_CONFIG = {
   MAX_RECORDING_MS: 60000, // Maximum 60s recording to prevent runaway
   METERING_INTERVAL_MS: 100, // How often to check audio levels
   POST_TTS_DELAY_MS: 2000, // Wait 2s after TTS ends before listening (user thinking time)
-};
 
-// Helper to strip ANSI codes for display
-const stripAnsi = (str: string) => str.replace(/\x1b\[[0-9;]*m/g, '');
+  // Wake word settings
+  WAKE_WORD_MAX_MS: 5000, // Max 5s recording for wake word detection
+  ACTIVE_TIMEOUT_MS: 60000, // Return to sleeping after 60s of inactivity
+};
 
 export default function TerminalScreen() {
   const router = useRouter();
@@ -55,153 +54,35 @@ export default function TerminalScreen() {
   const pendingPromptRef = useRef<string | null>(null);
   const pendingPromptSentRef = useRef(false);
 
-  // Voice mode state - now integrated directly with terminal
-  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>('off');
-  const [audioLevel, setAudioLevel] = useState(0);
-  const [voiceTranscript, setVoiceTranscript] = useState<string>('');
-  const [voiceProgress, setVoiceProgress] = useState<string>('');
+  // Voice mode state - now managed via voiceStore for tab bar integration
+  const {
+    voiceStatus,
+    voiceTranscript,
+    voiceProgress,
+    pendingVoiceStart,
+    setVoiceStatus,
+    setAudioLevel,
+    setVoiceTranscript,
+    setVoiceProgress,
+    setPendingVoiceStart,
+    setToggleVoiceMode,
+    setHandleVoiceMicPress,
+  } = useVoiceStore();
 
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
-  const workingChimeSoundRef = useRef<Audio.Sound | null>(null);
-  const workingChimeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const meteringIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const silenceStartRef = useRef<number | null>(null);
   const recordingStartRef = useRef<number | null>(null);
-  // Multiple orb animations for ChatGPT-style effect
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  const ring1Anim = useRef(new Animated.Value(1)).current;
-  const ring2Anim = useRef(new Animated.Value(1)).current;
-  const ring3Anim = useRef(new Animated.Value(1)).current;
-  const ring1Opacity = useRef(new Animated.Value(0.3)).current;
-  const ring2Opacity = useRef(new Animated.Value(0.2)).current;
-  const ring3Opacity = useRef(new Animated.Value(0.1)).current;
-  const glowAnim = useRef(new Animated.Value(0)).current;
+  // Wake word tracking
+  const isWakeWordModeRef = useRef<boolean>(true); // true = sleeping mode, false = active mode
+  const activeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastActivityRef = useRef<number>(Date.now());
   const viewShotRef = useRef<ViewShot>(null);
-  const lastScreenshotRef = useRef<string | undefined>(undefined);
-  const terminalContentRef = useRef<string>(''); // Store terminal output for voice context
 
   const project = currentProject();
   const activeTerminal = terminals[activeTerminalIndex];
   const projectSandbox = project?.sandbox ?? true;
-
-  // Enhanced orb animations for voice mode (ChatGPT-style)
-  useEffect(() => {
-    if (voiceStatus === 'listening') {
-      // Main pulse
-      const mainPulse = Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, { toValue: 1.15, duration: 600, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-          Animated.timing(pulseAnim, { toValue: 1, duration: 600, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-        ])
-      );
-
-      // Concentric ring animations with staggered timing
-      const ring1Pulse = Animated.loop(
-        Animated.sequence([
-          Animated.parallel([
-            Animated.timing(ring1Anim, { toValue: 1.8, duration: 1500, useNativeDriver: true, easing: Easing.out(Easing.ease) }),
-            Animated.timing(ring1Opacity, { toValue: 0, duration: 1500, useNativeDriver: true }),
-          ]),
-          Animated.parallel([
-            Animated.timing(ring1Anim, { toValue: 1, duration: 0, useNativeDriver: true }),
-            Animated.timing(ring1Opacity, { toValue: 0.3, duration: 0, useNativeDriver: true }),
-          ]),
-        ])
-      );
-
-      const ring2Pulse = Animated.loop(
-        Animated.sequence([
-          Animated.delay(500),
-          Animated.parallel([
-            Animated.timing(ring2Anim, { toValue: 2.2, duration: 1500, useNativeDriver: true, easing: Easing.out(Easing.ease) }),
-            Animated.timing(ring2Opacity, { toValue: 0, duration: 1500, useNativeDriver: true }),
-          ]),
-          Animated.parallel([
-            Animated.timing(ring2Anim, { toValue: 1, duration: 0, useNativeDriver: true }),
-            Animated.timing(ring2Opacity, { toValue: 0.2, duration: 0, useNativeDriver: true }),
-          ]),
-        ])
-      );
-
-      const ring3Pulse = Animated.loop(
-        Animated.sequence([
-          Animated.delay(1000),
-          Animated.parallel([
-            Animated.timing(ring3Anim, { toValue: 2.6, duration: 1500, useNativeDriver: true, easing: Easing.out(Easing.ease) }),
-            Animated.timing(ring3Opacity, { toValue: 0, duration: 1500, useNativeDriver: true }),
-          ]),
-          Animated.parallel([
-            Animated.timing(ring3Anim, { toValue: 1, duration: 0, useNativeDriver: true }),
-            Animated.timing(ring3Opacity, { toValue: 0.1, duration: 0, useNativeDriver: true }),
-          ]),
-        ])
-      );
-
-      mainPulse.start();
-      ring1Pulse.start();
-      ring2Pulse.start();
-      ring3Pulse.start();
-
-      return () => {
-        mainPulse.stop();
-        ring1Pulse.stop();
-        ring2Pulse.stop();
-        ring3Pulse.stop();
-      };
-    } else if (voiceStatus === 'speaking') {
-      // Gentle breathing animation when speaking
-      const breathe = Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, { toValue: 1.08, duration: 800, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-          Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-        ])
-      );
-      // Glow effect
-      const glow = Animated.loop(
-        Animated.sequence([
-          Animated.timing(glowAnim, { toValue: 1, duration: 1000, useNativeDriver: false }),
-          Animated.timing(glowAnim, { toValue: 0.5, duration: 1000, useNativeDriver: false }),
-        ])
-      );
-      breathe.start();
-      glow.start();
-      return () => {
-        breathe.stop();
-        glow.stop();
-      };
-    } else if (voiceStatus === 'working') {
-      // Slow, calm pulse for working state
-      const workingPulse = Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, { toValue: 1.05, duration: 1500, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-          Animated.timing(pulseAnim, { toValue: 1, duration: 1500, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
-        ])
-      );
-      // Subtle glow for working
-      const workingGlow = Animated.loop(
-        Animated.sequence([
-          Animated.timing(glowAnim, { toValue: 0.6, duration: 2000, useNativeDriver: false }),
-          Animated.timing(glowAnim, { toValue: 0.3, duration: 2000, useNativeDriver: false }),
-        ])
-      );
-      workingPulse.start();
-      workingGlow.start();
-      return () => {
-        workingPulse.stop();
-        workingGlow.stop();
-      };
-    } else {
-      pulseAnim.setValue(1);
-      ring1Anim.setValue(1);
-      ring2Anim.setValue(1);
-      ring3Anim.setValue(1);
-      ring1Opacity.setValue(0.3);
-      ring2Opacity.setValue(0.2);
-      ring3Opacity.setValue(0.1);
-      glowAnim.setValue(0);
-    }
-  }, [voiceStatus]);
 
   // Connect to bridge server
   useEffect(() => {
@@ -317,39 +198,6 @@ export default function TerminalScreen() {
     }
   };
 
-  // Working chime - a subtle, airy sound played periodically while agent is working
-  // Using a simple sine wave tone that sounds like a gentle glass chime
-  const playWorkingChime = async () => {
-    try {
-      // Create a simple beep tone using Expo Audio
-      // The chime is created using a short audio buffer that sounds glass-like
-      // For now, we use a haptic feedback as a subtle cue since we don't have a chime asset
-      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    } catch (err) {
-      console.log('[Voice] Chime playback error:', err);
-    }
-  };
-
-  const startWorkingChime = () => {
-    // Play immediately
-    playWorkingChime();
-    // Then repeat every 3 seconds
-    workingChimeIntervalRef.current = setInterval(() => {
-      playWorkingChime();
-    }, 3000);
-  };
-
-  const stopWorkingChime = () => {
-    if (workingChimeIntervalRef.current) {
-      clearInterval(workingChimeIntervalRef.current);
-      workingChimeIntervalRef.current = null;
-    }
-    if (workingChimeSoundRef.current) {
-      workingChimeSoundRef.current.unloadAsync();
-      workingChimeSoundRef.current = null;
-    }
-  };
-
   const createTerminal = useCallback(async () => {
     if (!currentProjectId) return;
 
@@ -419,50 +267,19 @@ export default function TerminalScreen() {
     createTerminal();
   }, [createTerminal]);
 
-  // Capture screenshot before voice overlay appears
-  const captureScreenshot = async (): Promise<string | undefined> => {
-    try {
-      if (viewShotRef.current?.capture) {
-        const screenshotUri = await viewShotRef.current.capture();
-        const screenshotResponse = await fetch(screenshotUri);
-        const screenshotBlob = await screenshotResponse.blob();
-        return new Promise<string>((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            const base64Screenshot = (reader.result as string).split(',')[1];
-            resolve(base64Screenshot);
-          };
-          reader.readAsDataURL(screenshotBlob);
-        });
-      }
-    } catch (err) {
-      console.log('[Voice-Terminal] Screenshot capture failed:', err);
-    }
-    return undefined;
-  };
+  // Voice Mode Functions - exposed to tab bar via store
+  const toggleVoiceMode = useCallback(async () => {
+    console.log('[Chat] toggleVoiceMode called, activeTerminal:', !!activeTerminal, 'voiceStatus:', voiceStatus);
 
-  // Keep track of terminal content for voice agent context
-  useEffect(() => {
-    if (activeTerminal?.output) {
-      // Store last 3000 chars of terminal output for context
-      terminalContentRef.current = activeTerminal.output.slice(-3000);
-    }
-  }, [activeTerminal?.output]);
-
-  // Voice Mode Functions - now integrated directly with terminal
-  const toggleVoiceMode = async () => {
     if (!activeTerminal) {
+      console.log('[Chat] No active terminal!');
       Alert.alert('No Terminal', 'Please wait for terminal to be ready');
       return;
     }
 
     if (voiceStatus === 'off') {
-      // Capture screenshot BEFORE voice overlay appears
-      console.log('[Voice-Terminal] Capturing screenshot before enabling voice mode...');
-      lastScreenshotRef.current = await captureScreenshot();
-      console.log('[Voice-Terminal] Screenshot captured:', lastScreenshotRef.current ? 'success' : 'failed');
-
       // Turn on voice mode for this terminal
+      console.log('[Chat] Enabling voice on terminal:', activeTerminal.id);
       bridgeService.enableVoiceOnTerminal(activeTerminal.id, {
         onTranscription: (text) => {
           console.log('[Voice-Terminal] Transcribed:', text);
@@ -479,7 +296,7 @@ export default function TerminalScreen() {
           setVoiceProgress('');
           playAudio(audioData);
         },
-        onAppControl: async (control) => {
+        onAppControl: (control) => {
           console.log('[Voice-Terminal] App control:', control);
           // Handle app control actions from voice agent
           if (control.action === 'navigate' && control.target) {
@@ -495,65 +312,83 @@ export default function TerminalScreen() {
             const route = tabMap[control.target.toLowerCase()];
             if (route) {
               router.push(route as any);
-              // Capture screenshot after navigation completes
-              setTimeout(async () => {
-                lastScreenshotRef.current = await captureScreenshot();
-                console.log('[Voice-Terminal] Screenshot captured after navigation');
-              }, 500);
             }
           } else if (control.action === 'take_screenshot') {
-            // Voice agent requested a fresh screenshot
+            // Voice agent requested a fresh screenshot - will be sent with next audio
             console.log('[Voice-Terminal] Screenshot requested by agent');
-            lastScreenshotRef.current = await captureScreenshot();
-            console.log('[Voice-Terminal] Fresh screenshot captured');
-          } else if (control.action === 'refresh_files') {
-            // Navigate to editor and refresh - files will auto-refresh
-            router.push('/(tabs)/editor' as any);
-            console.log('[Voice-Terminal] Navigating to editor to show files');
-          } else if (control.action === 'show_settings') {
-            // Open settings modal
-            router.push('/settings' as any);
-            console.log('[Voice-Terminal] Opening settings');
-          } else if (control.action === 'create_project') {
-            // Navigate to projects tab to create new project
-            router.push('/(tabs)' as any);
-            console.log('[Voice-Terminal] Navigating to projects');
           }
         },
-        onWorking: async (workingState) => {
-          console.log('[Voice-Terminal] Working state:', workingState);
-          setVoiceStatus('working');
-          setVoiceProgress('');
-
-          // Start the working chime
-          startWorkingChime();
-
-          // Handle follow-up actions
-          if (workingState.followUpAction === 'take_screenshot') {
-            // Capture screenshot and send it back
-            const screenshot = await captureScreenshot();
-            if (screenshot && activeTerminal) {
-              lastScreenshotRef.current = screenshot;
-              // Terminal content and app state will be sent with next voice audio
-              console.log('[Voice-Terminal] Screenshot captured for working state');
+        onWakeWord: (text) => {
+          console.log('[Voice-Terminal] Wake word detected:', text);
+          // Haptic feedback for wake word
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          // Switch to active mode
+          isWakeWordModeRef.current = false;
+          lastActivityRef.current = Date.now();
+          // If the wake word had additional content, show it as transcript
+          const wakeWords = ['hey lora', 'hey laura', 'hi lora', 'hi laura', 'okay lora', 'ok lora'];
+          let remainder = text.toLowerCase();
+          for (const ww of wakeWords) {
+            if (remainder.startsWith(ww)) {
+              remainder = text.substring(ww.length).trim();
+              break;
             }
           }
-          // Other follow-up actions (wait_for_claude, check_files) are handled by the server
+          if (remainder.length > 2) {
+            setVoiceTranscript(remainder);
+            setVoiceStatus('processing');
+          } else {
+            // No additional content - start listening for command
+            setVoiceStatus('listening');
+            setTimeout(() => startListening(), 100);
+          }
+        },
+        onNoWakeWord: () => {
+          console.log('[Voice-Terminal] No wake word detected, continuing to sleep');
+          // Stay in sleeping mode, start listening again
+          setVoiceStatus('sleeping');
+          setTimeout(() => startWakeWordListening(), 500);
         },
         onEnabled: () => {
-          console.log('[Voice-Terminal] Voice mode enabled');
-          setVoiceStatus('idle');
+          console.log('[Voice-Terminal] Voice mode enabled, starting active listening');
+          isWakeWordModeRef.current = false; // Start in active mode, not wake word mode
           setVoiceTranscript('');
           setVoiceProgress('');
+          // Start in active listening mode immediately
+          // Only go to sleeping mode after first interaction completes
+          setTimeout(() => startListening(), 500);
         },
         onDisabled: () => {
           console.log('[Voice-Terminal] Voice mode disabled');
+          // Clear any active timeout
+          if (activeTimeoutRef.current) {
+            clearTimeout(activeTimeoutRef.current);
+            activeTimeoutRef.current = null;
+          }
           setVoiceStatus('off');
         },
         onError: (error) => {
           console.error('[Voice-Terminal] Error:', error);
+
+          // Check if terminal was not found (stale session)
+          if (error.includes('Terminal not found')) {
+            console.log('[Voice-Terminal] Terminal stale, clearing and recreating...');
+            setVoiceStatus('off');
+            // Clear stale terminals and recreate
+            setTerminals([]);
+            terminalCounter.current = 0;
+            // Set pending flag to retry voice after new terminal is created
+            setPendingVoiceStart(true);
+            // Create new terminal
+            createTerminal();
+            return;
+          }
+
           Alert.alert('Voice Error', error);
-          setVoiceStatus('idle');
+          // Go back to sleeping mode on error
+          setVoiceStatus('sleeping');
+          isWakeWordModeRef.current = true;
+          setTimeout(() => startWakeWordListening(), 1000);
         }
       });
     } else {
@@ -564,7 +399,6 @@ export default function TerminalScreen() {
 
       // Now do async cleanup
       stopMetering();
-      stopWorkingChime();
       if (recordingRef.current) {
         await recordingRef.current.stopAndUnloadAsync();
         recordingRef.current = null;
@@ -576,21 +410,208 @@ export default function TerminalScreen() {
       }
       bridgeService.disableVoiceOnTerminal(activeTerminal.id);
     }
+  }, [activeTerminal, voiceStatus, setVoiceStatus, setVoiceTranscript, setVoiceProgress]);
+
+  // Wake word listening mode - shorter timeout, only checks for "Hey Lora"
+  const startWakeWordListening = async () => {
+    console.log('[Voice] startWakeWordListening called, activeTerminal:', !!activeTerminal, 'voiceStatus:', voiceStatus);
+
+    // Check current voice status from store directly to avoid stale closure
+    const currentStatus = useVoiceStore.getState().voiceStatus;
+    console.log('[Voice] Current status from store:', currentStatus);
+
+    if (!activeTerminal || currentStatus === 'off') {
+      console.log('[Voice] Skipping wake word listening - no terminal or voice off');
+      return;
+    }
+
+    // Don't start if we're already listening or processing
+    if (recordingRef.current) {
+      console.log('[Voice] Already recording, skipping');
+      return;
+    }
+
+    try {
+      console.log('[Voice] Requesting audio permissions...');
+      const { granted } = await Audio.requestPermissionsAsync();
+      if (!granted) {
+        console.log('[Voice] Audio permission denied');
+        return;
+      }
+      console.log('[Voice] Audio permission granted');
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
+
+      const recording = new Audio.Recording();
+      await recording.prepareToRecordAsync({
+        ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
+        isMeteringEnabled: true,
+      });
+      await recording.startAsync();
+      console.log('[Voice] Wake word recording started');
+
+      recordingRef.current = recording;
+      recordingStartRef.current = Date.now();
+      silenceStartRef.current = null;
+      isWakeWordModeRef.current = true;
+      // Don't change status - stay in 'sleeping'
+
+      let speechDetected = false;
+      let speechStartTime: number | null = null;
+
+      // VAD for wake word - shorter timeout
+      meteringIntervalRef.current = setInterval(async () => {
+        if (!recordingRef.current) return;
+
+        try {
+          const status = await recordingRef.current.getStatusAsync();
+          if (status.isRecording && status.metering !== undefined) {
+            const level = status.metering;
+            const now = Date.now();
+            const recordingDuration = now - (recordingStartRef.current || now);
+
+            // Shorter max time for wake word detection
+            if (recordingDuration > VAD_CONFIG.WAKE_WORD_MAX_MS) {
+              console.log('[Voice] Wake word max time reached, restarting...');
+              // No speech detected in 5s, restart listening
+              stopMetering();
+              if (recordingRef.current) {
+                await recordingRef.current.stopAndUnloadAsync();
+                recordingRef.current = null;
+              }
+              // Restart wake word listening if still in sleeping mode
+              const currentStatus = useVoiceStore.getState().voiceStatus;
+              if (currentStatus === 'sleeping') {
+                setTimeout(() => startWakeWordListening(), 100);
+              }
+              return;
+            }
+
+            // Detect speech - log audio level periodically for debugging
+            if (recordingDuration % 1000 < VAD_CONFIG.METERING_INTERVAL_MS) {
+              console.log('[Voice] Wake word audio level:', level.toFixed(1), 'dB');
+            }
+
+            if (level >= VAD_CONFIG.SPEECH_THRESHOLD) {
+              if (!speechStartTime) speechStartTime = now;
+              else if (!speechDetected && now - speechStartTime > VAD_CONFIG.SPEECH_START_MS) {
+                speechDetected = true;
+                console.log('[Voice] Wake word listening: Speech detected!');
+              }
+              silenceStartRef.current = null;
+            } else if (level < VAD_CONFIG.SILENCE_THRESHOLD) {
+              speechStartTime = null;
+              if (speechDetected) {
+                if (!silenceStartRef.current) {
+                  silenceStartRef.current = now;
+                } else if (now - silenceStartRef.current > 1000) { // 1s silence after speech
+                  console.log('[Voice] Wake word listening: End of speech, sending for check');
+                  await stopWakeWordListening();
+                }
+              }
+            }
+          }
+        } catch (err) {
+          // Recording may have stopped
+        }
+      }, VAD_CONFIG.METERING_INTERVAL_MS);
+
+    } catch (err) {
+      console.error('[Voice-Terminal] Failed to start wake word listening:', err);
+      // Retry after delay
+      setTimeout(() => startWakeWordListening(), 2000);
+    }
+  };
+
+  // Stop wake word listening and send audio for wake word check
+  const stopWakeWordListening = async () => {
+    stopMetering();
+
+    if (!recordingRef.current || !activeTerminal) {
+      // Restart wake word listening if still sleeping
+      if (voiceStatus === 'sleeping') {
+        setTimeout(() => startWakeWordListening(), 500);
+      }
+      return;
+    }
+
+    try {
+      await recordingRef.current.stopAndUnloadAsync();
+      const uri = recordingRef.current.getURI();
+      recordingRef.current = null;
+      silenceStartRef.current = null;
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+      });
+
+      if (uri) {
+        console.log('[Voice] Wake word audio captured, sending to server...');
+        const response = await fetch(uri);
+        const blob = await response.blob();
+
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const base64 = (reader.result as string).split(',')[1];
+          const mimeType = blob.type || 'audio/m4a';
+          console.log('[Voice] Sending wake word audio for check, size:', base64.length);
+          // Send with wakeWordCheck flag
+          bridgeService.sendVoiceAudioToTerminal(
+            activeTerminal.id,
+            base64,
+            mimeType,
+            undefined, // no screenshot for wake word
+            true // wakeWordCheck = true
+          );
+        };
+        reader.readAsDataURL(blob);
+      } else {
+        // No audio, restart wake word listening
+        if (voiceStatus === 'sleeping') {
+          setTimeout(() => startWakeWordListening(), 500);
+        }
+      }
+    } catch (err) {
+      console.error('[Voice-Terminal] Failed to stop wake word listening:', err);
+      if (voiceStatus === 'sleeping') {
+        setTimeout(() => startWakeWordListening(), 1000);
+      }
+    }
   };
 
   const startListening = async () => {
-    if (!activeTerminal) return;
+    console.log('[Voice] startListening called, activeTerminal:', !!activeTerminal);
+
+    if (!activeTerminal) {
+      console.log('[Voice] No active terminal, skipping');
+      return;
+    }
+
+    // Mark as active mode
+    isWakeWordModeRef.current = false;
+    lastActivityRef.current = Date.now();
+
+    // Get current status from store to avoid stale closure
+    const currentStatus = useVoiceStore.getState().voiceStatus;
+    console.log('[Voice] Current status from store:', currentStatus);
 
     // Interrupt if speaking
-    if (voiceStatus === 'speaking' && soundRef.current) {
+    if (currentStatus === 'speaking' && soundRef.current) {
+      console.log('[Voice] Interrupting current speech');
       await soundRef.current.stopAsync();
       await soundRef.current.unloadAsync();
       soundRef.current = null;
     }
 
     try {
+      console.log('[Voice] Requesting audio permissions for listening...');
       const { granted } = await Audio.requestPermissionsAsync();
       if (!granted) {
+        console.log('[Voice] Permission denied');
         Alert.alert('Permission Denied', 'Microphone permission is required');
         return;
       }
@@ -606,11 +627,13 @@ export default function TerminalScreen() {
         isMeteringEnabled: true,
       });
       await recording.startAsync();
+      console.log('[Voice] Active listening recording started');
 
       recordingRef.current = recording;
       recordingStartRef.current = Date.now();
       silenceStartRef.current = null;
       setVoiceStatus('listening');
+      console.log('[Voice] Status set to listening');
       setAudioLevel(0);
 
       // Track if we've detected actual speech (not just noise)
@@ -678,7 +701,10 @@ export default function TerminalScreen() {
 
     } catch (err) {
       console.error('[Voice-Terminal] Failed to start listening:', err);
-      setVoiceStatus('idle');
+      // Go back to sleeping mode on error
+      setVoiceStatus('sleeping');
+      isWakeWordModeRef.current = true;
+      setTimeout(() => startWakeWordListening(), 1000);
     }
   };
 
@@ -687,7 +713,10 @@ export default function TerminalScreen() {
     setAudioLevel(0);
 
     if (!recordingRef.current || !activeTerminal) {
-      setVoiceStatus('idle');
+      // Go back to sleeping mode
+      setVoiceStatus('sleeping');
+      isWakeWordModeRef.current = true;
+      setTimeout(() => startWakeWordListening(), 500);
       return;
     }
 
@@ -714,68 +743,61 @@ export default function TerminalScreen() {
           const base64 = (reader.result as string).split(',')[1];
           const mimeType = blob.type || 'audio/m4a';
 
-          // Use the cached screenshot (captured before voice overlay appeared)
-          // and capture a fresh one for the next interaction
-          const screenCapture = lastScreenshotRef.current;
-
-          // Log screenshot usage
-          if (screenCapture) {
-            console.log('[Voice-Terminal] Using cached screenshot, size:', Math.round(screenCapture.length / 1024), 'KB');
-          } else {
-            console.log('[Voice-Terminal] No screenshot available');
+          // Capture screenshot of current screen for voice agent vision
+          let screenCapture: string | undefined;
+          try {
+            if (viewShotRef.current?.capture) {
+              const screenshotUri = await viewShotRef.current.capture();
+              const screenshotResponse = await fetch(screenshotUri);
+              const screenshotBlob = await screenshotResponse.blob();
+              const screenshotReader = new FileReader();
+              screenCapture = await new Promise<string>((resolve) => {
+                screenshotReader.onloadend = () => {
+                  const base64Screenshot = (screenshotReader.result as string).split(',')[1];
+                  resolve(base64Screenshot);
+                };
+                screenshotReader.readAsDataURL(screenshotBlob);
+              });
+            }
+          } catch (screenshotErr) {
+            console.log('[Voice-Terminal] Screenshot capture failed:', screenshotErr);
           }
 
-          // Get terminal content for context (last 2000 chars, strip ANSI codes)
-          const terminalContent = terminalContentRef.current
-            ? stripAnsi(terminalContentRef.current).slice(-2000)
-            : undefined;
-
-          // Get current app state
-          const appState = {
-            currentTab: 'terminal',
-            projectName: project?.name,
-            projectId: currentProjectId || undefined,
-            hasPreview: false,  // Could check preview state if needed
-            fileCount: undefined  // Could count files if needed
-          };
-
-          // Send to terminal with screenshot, terminal content, and app state
-          bridgeService.sendVoiceAudioToTerminal(
-            activeTerminal.id,
-            base64,
-            mimeType,
-            screenCapture,
-            terminalContent,
-            appState
-          );
-
-          // Capture fresh screenshot for next interaction (after TTS plays, overlay may be hidden)
-          setTimeout(async () => {
-            lastScreenshotRef.current = await captureScreenshot();
-          }, 500);
+          // Send to terminal with screenshot (will be transcribed and sent to voice agent)
+          bridgeService.sendVoiceAudioToTerminal(activeTerminal.id, base64, mimeType, screenCapture);
         };
         reader.readAsDataURL(blob);
       }
     } catch (err) {
       console.error('[Voice-Terminal] Failed to stop listening:', err);
-      setVoiceStatus('idle');
+      // Go back to sleeping mode on error
+      setVoiceStatus('sleeping');
+      isWakeWordModeRef.current = true;
+      setTimeout(() => startWakeWordListening(), 1000);
     }
   };
 
   const playAudio = async (base64Audio: string) => {
     try {
-      // Stop working chime when speaking starts
-      stopWorkingChime();
       setVoiceStatus('speaking');
 
       if (soundRef.current) {
         await soundRef.current.unloadAsync();
       }
 
+      // Always play through speaker (not earpiece)
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+      });
+
       const audioUri = `data:audio/mp3;base64,${base64Audio}`;
       const { sound } = await Audio.Sound.createAsync(
         { uri: audioUri },
-        { shouldPlay: true }
+        { shouldPlay: true, volume: 1.0 }
       );
 
       soundRef.current = sound;
@@ -783,11 +805,31 @@ export default function TerminalScreen() {
       sound.setOnPlaybackStatusUpdate((playbackStatus: AVPlaybackStatus) => {
         if (playbackStatus.isLoaded && playbackStatus.didJustFinish) {
           soundRef.current = null;
-          // Wait before auto-listening to give user time to think
-          setVoiceStatus('idle');
+          // After speaking, continue in active listening mode
+          // Only go to sleep after 1 minute of inactivity
+          console.log('[Voice] TTS finished, continuing active listening');
+          lastActivityRef.current = Date.now();
+          isWakeWordModeRef.current = false;
+
+          // Start inactivity timer - go to sleep after 1 minute
+          if (activeTimeoutRef.current) {
+            clearTimeout(activeTimeoutRef.current);
+          }
+          activeTimeoutRef.current = setTimeout(() => {
+            const currentStatus = useVoiceStore.getState().voiceStatus;
+            console.log('[Voice] Inactivity timeout, current status:', currentStatus);
+            if (currentStatus !== 'off') {
+              console.log('[Voice] Going to sleep mode after inactivity');
+              setVoiceStatus('sleeping');
+              isWakeWordModeRef.current = true;
+              startWakeWordListening();
+            }
+          }, VAD_CONFIG.ACTIVE_TIMEOUT_MS);
+
+          // Continue listening after a short delay
           setTimeout(() => {
-            // Only start listening if we're still in idle (not manually triggered)
-            if (voiceStatus === 'idle' || voiceStatus === 'off') {
+            const currentStatus = useVoiceStore.getState().voiceStatus;
+            if (currentStatus !== 'off' && currentStatus !== 'listening') {
               startListening();
             }
           }, VAD_CONFIG.POST_TTS_DELAY_MS);
@@ -795,20 +837,70 @@ export default function TerminalScreen() {
       });
     } catch (err) {
       console.error('[Voice] Failed to play audio:', err);
-      setVoiceStatus('idle');
+      // Continue listening on error
+      isWakeWordModeRef.current = false;
+      setTimeout(() => startListening(), 1000);
     }
   };
 
-  const handleVoiceMicPress = () => {
+  const handleVoiceMicPress = useCallback(() => {
     // Haptic feedback
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
-    if (voiceStatus === 'listening') {
+    // Get current status from store to avoid stale closure
+    const currentStatus = useVoiceStore.getState().voiceStatus;
+    console.log('[Voice] Mic press, current status:', currentStatus);
+
+    if (currentStatus === 'listening') {
+      // TAP while listening → send what was recorded
+      console.log('[Voice] Stopping listening early');
       stopListening();
-    } else if (voiceStatus === 'idle' || voiceStatus === 'speaking') {
+    } else if (currentStatus === 'sleeping') {
+      // TAP while sleeping → wake up and start listening
+      console.log('[Voice] Waking from sleep');
+      isWakeWordModeRef.current = false;
+      lastActivityRef.current = Date.now();
+      // Stop any current wake word recording
+      stopMetering();
+      if (recordingRef.current) {
+        recordingRef.current.stopAndUnloadAsync().catch(() => {});
+        recordingRef.current = null;
+      }
       startListening();
+    } else if (currentStatus === 'speaking') {
+      // TAP while speaking → interrupt and start listening
+      console.log('[Voice] Interrupting speech');
+      startListening();
+    } else if (currentStatus === 'processing') {
+      // TAP while processing → do nothing, wait for response
+      console.log('[Voice] Processing, please wait...');
     }
-  };
+  }, []);
+
+  // Register voice functions with store for tab bar access
+  useEffect(() => {
+    setToggleVoiceMode(() => toggleVoiceMode);
+    setHandleVoiceMicPress(() => handleVoiceMicPress);
+
+    return () => {
+      setToggleVoiceMode(null);
+      setHandleVoiceMicPress(null);
+    };
+  }, [toggleVoiceMode, handleVoiceMicPress, setToggleVoiceMode, setHandleVoiceMicPress]);
+
+  // Handle pending voice start from tab bar button (when navigating from another tab)
+  useEffect(() => {
+    console.log('[Chat] Pending voice check:', { pendingVoiceStart, hasTerminal: !!activeTerminal, voiceStatus });
+    if (pendingVoiceStart && activeTerminal && voiceStatus === 'off') {
+      console.log('[Chat] Starting voice mode from pending flag');
+      setPendingVoiceStart(false);
+      // Small delay to ensure terminal is fully ready
+      setTimeout(() => {
+        console.log('[Chat] Calling toggleVoiceMode now');
+        toggleVoiceMode();
+      }, 300);
+    }
+  }, [pendingVoiceStart, activeTerminal, voiceStatus, setPendingVoiceStart, toggleVoiceMode]);
 
   if (!project) {
     return (
@@ -842,166 +934,24 @@ export default function TerminalScreen() {
 
   return (
     <ViewShot ref={viewShotRef} style={styles.container} options={{ format: 'png', quality: 0.8 }}>
-      {/* Header */}
-      <View style={styles.header}>
-        <View style={styles.headerLeft}>
-          <Text style={styles.projectName}>{project.name}</Text>
-          <Text style={styles.projectPath}>{project.path}</Text>
-        </View>
-        <View style={styles.headerRight}>
-          {/* Voice Mode Toggle */}
-          <TouchableOpacity
-            style={[
-              styles.voiceToggle,
-              voiceStatus !== 'off' && styles.voiceToggleActive
-            ]}
-            onPress={toggleVoiceMode}
-            disabled={!activeTerminal}
-          >
-            <Mic color={voiceStatus !== 'off' ? '#FFF' : '#888'} size={16} />
-            <Text style={[
-              styles.voiceToggleText,
-              voiceStatus !== 'off' && styles.voiceToggleTextActive
-            ]}>
-              {voiceStatus !== 'off' ? 'Voice ON' : 'Voice'}
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={styles.newTerminalButton} onPress={handleNewTerminal}>
-            <Plus color="#FFF" size={16} />
-            <Text style={styles.newTerminalText}>New</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      {/* Voice Mode Overlay - ChatGPT-style with orb animations */}
-      {voiceStatus !== 'off' && (
-        <View style={styles.voiceOverlay}>
-          {/* Show transcription */}
+      {/* Voice Status Bar - compact display when voice is active */}
+      {voiceStatus !== 'off' && (voiceTranscript || voiceProgress) && (
+        <View style={styles.voiceStatusBar}>
           {voiceTranscript && (
-            <View style={styles.transcriptContainer}>
-              <Text style={styles.transcriptLabel}>You said:</Text>
-              <Text style={styles.transcriptText}>"{voiceTranscript}"</Text>
-            </View>
-          )}
-
-          {/* Show progress (command being sent) */}
-          {voiceProgress && (
-            <Text style={styles.progressText}>{voiceProgress}</Text>
-          )}
-
-          <View style={styles.voiceControls}>
-            {/* Status text */}
-            <Text style={styles.voiceStatusText}>
-              {voiceStatus === 'idle' ? 'Tap to speak' :
-               voiceStatus === 'listening' ? 'Listening...' :
-               voiceStatus === 'processing' ? 'Processing...' :
-               voiceStatus === 'working' ? 'Working...' :
-               'Speaking...'}
+            <Text style={styles.voiceStatusBarText} numberOfLines={2}>
+              <Text style={styles.voiceStatusBarLabel}>You: </Text>
+              {voiceTranscript}
             </Text>
-
-            {/* Orb container with rings */}
-            <View style={styles.orbContainer}>
-              {/* Concentric rings - only show when listening */}
-              {voiceStatus === 'listening' && (
-                <>
-                  <Animated.View style={[
-                    styles.orbRing,
-                    styles.orbRing3,
-                    {
-                      transform: [{ scale: ring3Anim }],
-                      opacity: ring3Opacity,
-                    }
-                  ]} />
-                  <Animated.View style={[
-                    styles.orbRing,
-                    styles.orbRing2,
-                    {
-                      transform: [{ scale: ring2Anim }],
-                      opacity: ring2Opacity,
-                    }
-                  ]} />
-                  <Animated.View style={[
-                    styles.orbRing,
-                    styles.orbRing1,
-                    {
-                      transform: [{ scale: ring1Anim }],
-                      opacity: ring1Opacity,
-                    }
-                  ]} />
-                </>
-              )}
-
-              {/* Audio level ring - reacts to voice */}
-              {voiceStatus === 'listening' && (
-                <View style={[
-                  styles.audioLevelRing,
-                  {
-                    transform: [{ scale: 1 + audioLevel * 0.3 }],
-                    opacity: 0.4 + audioLevel * 0.4,
-                  }
-                ]} />
-              )}
-
-              {/* Main mic button with animation */}
-              <Animated.View style={[
-                styles.micButtonWrapper,
-                { transform: [{ scale: pulseAnim }] },
-                voiceStatus === 'speaking' && {
-                  shadowColor: '#22C55E',
-                  shadowOpacity: 0.6,
-                  shadowRadius: 20,
-                },
-                voiceStatus === 'working' && {
-                  shadowColor: '#60A5FA',
-                  shadowOpacity: 0.5,
-                  shadowRadius: 15,
-                }
-              ]}>
-                <TouchableOpacity
-                  style={[
-                    styles.micButton,
-                    voiceStatus === 'listening' && styles.micButtonListening,
-                    voiceStatus === 'speaking' && styles.micButtonSpeaking,
-                    voiceStatus === 'processing' && styles.micButtonProcessing,
-                    voiceStatus === 'working' && styles.micButtonWorking,
-                  ]}
-                  onPress={handleVoiceMicPress}
-                  disabled={voiceStatus === 'processing' || voiceStatus === 'working'}
-                  activeOpacity={0.8}
-                >
-                  {voiceStatus === 'listening' ? (
-                    <MicOff size={28} color="#FFF" />
-                  ) : voiceStatus === 'speaking' ? (
-                    <Volume2 size={28} color="#FFF" />
-                  ) : voiceStatus === 'working' ? (
-                    <Loader2 size={28} color="#FFF" />
-                  ) : (
-                    <Mic size={28} color="#FFF" />
-                  )}
-                </TouchableOpacity>
-              </Animated.View>
-            </View>
-
-            {/* Control buttons row */}
-            <View style={styles.voiceButtonsRow}>
-              {/* Stop/Exit button */}
-              <TouchableOpacity
-                style={styles.stopButton}
-                onPress={() => {
-                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                  toggleVoiceMode();
-                }}
-              >
-                <Square size={16} color="#FF6B6B" fill="#FF6B6B" />
-                <Text style={styles.stopButtonText}>Exit</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
+          )}
+          {voiceProgress && (
+            <Text style={styles.voiceStatusBarProgress} numberOfLines={1}>
+              {voiceProgress}
+            </Text>
+          )}
         </View>
       )}
 
-      {/* Terminal Tabs */}
+      {/* Terminal Tabs - only show when multiple terminals */}
       {terminals.length > 1 && (
         <View style={styles.tabsContainer}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tabsContent}>
@@ -1012,14 +962,14 @@ export default function TerminalScreen() {
                 onPress={() => setActiveTerminalIndex(index)}
               >
                 <Text style={[styles.tabText, index === activeTerminalIndex && styles.tabTextActive]}>
-                  Terminal {index + 1}
+                  {index + 1}
                 </Text>
                 <TouchableOpacity
                   style={styles.tabClose}
                   onPress={() => closeTerminal(index)}
                   hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
                 >
-                  <X color={index === activeTerminalIndex ? '#FFF' : '#888'} size={12} />
+                  <X color={index === activeTerminalIndex ? '#FFF' : '#888'} size={10} />
                 </TouchableOpacity>
               </TouchableOpacity>
             ))}
@@ -1031,9 +981,8 @@ export default function TerminalScreen() {
       <Terminal
         output={activeTerminal?.output || ''}
         onInput={handleInput}
-        isConnected={!!activeTerminal}
-        sandbox={activeTerminal?.sandbox ?? projectSandbox}
         onResize={handleResize}
+        onNewTerminal={handleNewTerminal}
       />
     </ViewShot>
   );
@@ -1044,224 +993,59 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#1E1E1E',
   },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-    backgroundColor: '#2D2D2D',
-    borderBottomWidth: 1,
-    borderBottomColor: '#3D3D3D',
-  },
-  headerLeft: {
-    flex: 1,
-  },
-  headerRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  projectName: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#FFF',
-  },
-  projectPath: {
-    fontSize: 11,
-    color: '#888',
-    marginTop: 2,
-  },
-  voiceToggle: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    backgroundColor: '#3D3D3D',
-    borderRadius: 6,
-    gap: 4,
-  },
-  voiceToggleActive: {
-    backgroundColor: '#4CAF50',
-  },
-  voiceToggleText: {
-    color: '#888',
-    fontSize: 12,
-    fontWeight: '500',
-  },
-  voiceToggleTextActive: {
-    color: '#FFF',
-  },
-  newTerminalButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: colors.brandTiger,
-    borderRadius: 6,
-    gap: 4,
-  },
-  newTerminalText: {
-    color: '#FFF',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  voiceOverlay: {
+  voiceStatusBar: {
     backgroundColor: '#1A1A1A',
     borderBottomWidth: 1,
     borderBottomColor: '#2A2A2A',
-    paddingVertical: spacing.lg,
+    paddingVertical: spacing.sm,
     paddingHorizontal: spacing.md,
   },
-  voiceControls: {
-    alignItems: 'center',
-  },
-  voiceStatusText: {
-    color: '#888',
-    fontSize: 13,
-    fontWeight: '500',
-    marginBottom: spacing.lg,
-    letterSpacing: 0.5,
-  },
-  transcriptContainer: {
-    backgroundColor: 'rgba(34, 197, 94, 0.1)',
-    borderRadius: 12,
-    padding: spacing.md,
-    marginBottom: spacing.md,
-    borderWidth: 1,
-    borderColor: 'rgba(34, 197, 94, 0.2)',
-  },
-  transcriptLabel: {
-    color: '#22C55E',
-    fontSize: 11,
-    fontWeight: '600',
-    marginBottom: 4,
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-  },
-  transcriptText: {
+  voiceStatusBarText: {
     color: '#FFF',
-    fontSize: 15,
-    lineHeight: 22,
-  },
-  progressText: {
-    color: colors.brandTiger,
     fontSize: 13,
-    textAlign: 'center',
-    marginBottom: spacing.md,
-    paddingHorizontal: spacing.md,
-    fontWeight: '500',
+    lineHeight: 18,
   },
-  orbContainer: {
-    width: 160,
-    height: 160,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: spacing.lg,
-  },
-  orbRing: {
-    position: 'absolute',
-    borderRadius: 100,
-    borderWidth: 2,
-  },
-  orbRing1: {
-    width: 80,
-    height: 80,
-    borderColor: colors.brandTiger,
-  },
-  orbRing2: {
-    width: 80,
-    height: 80,
-    borderColor: colors.brandTiger,
-  },
-  orbRing3: {
-    width: 80,
-    height: 80,
-    borderColor: colors.brandTiger,
-  },
-  audioLevelRing: {
-    position: 'absolute',
-    width: 90,
-    height: 90,
-    borderRadius: 45,
-    backgroundColor: 'rgba(255, 107, 107, 0.3)',
-  },
-  micButtonWrapper: {
-    shadowColor: colors.brandTiger,
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.4,
-    shadowRadius: 15,
-    elevation: 8,
-  },
-  micButton: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-    backgroundColor: colors.brandTiger,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  micButtonListening: {
-    backgroundColor: '#FF6B6B',
-  },
-  micButtonSpeaking: {
-    backgroundColor: '#22C55E',
-  },
-  micButtonProcessing: {
-    backgroundColor: '#555',
-  },
-  micButtonWorking: {
-    backgroundColor: '#60A5FA',
-  },
-  voiceButtonsRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 16,
-  },
-  stopButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 20,
-    backgroundColor: 'rgba(255,107,107,0.15)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,107,107,0.3)',
-    gap: 6,
-  },
-  stopButtonText: {
-    color: '#FF6B6B',
-    fontSize: 13,
+  voiceStatusBarLabel: {
+    color: '#22C55E',
     fontWeight: '600',
+  },
+  voiceStatusBarProgress: {
+    color: colors.brandTiger,
+    fontSize: 12,
+    marginTop: 4,
+    fontWeight: '500',
   },
   tabsContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
     backgroundColor: '#252525',
     borderBottomWidth: 1,
     borderBottomColor: '#3D3D3D',
+    paddingRight: 8,
   },
   tabsContent: {
     flexDirection: 'row',
     paddingHorizontal: 8,
     paddingVertical: 6,
     gap: 4,
+    flex: 1,
   },
   tab: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
     backgroundColor: '#1E1E1E',
-    borderRadius: 6,
-    gap: 8,
+    borderRadius: 4,
+    gap: 6,
   },
   tabActive: {
     backgroundColor: colors.brandTiger,
   },
   tabText: {
     color: '#888',
-    fontSize: 12,
-    fontWeight: '500',
+    fontSize: 11,
+    fontWeight: '600',
   },
   tabTextActive: {
     color: '#FFF',

@@ -9,6 +9,8 @@ import {
   TextInput,
   Modal,
   ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Plus, FolderOpen, Trash2, Settings, RefreshCw, Wifi, WifiOff, Shield, ShieldOff } from 'lucide-react-native';
@@ -19,10 +21,8 @@ import { colors, spacing, radius, typography } from '../../theme';
 
 export default function ProjectsScreen() {
   const router = useRouter();
-  const { projects, addProject, setProjects, deleteProject, setCurrentProject } = useProjectStore();
+  const { projects, addProject, setProjects, deleteProject, setCurrentProject, showNewProjectModal, setShowNewProjectModal } = useProjectStore();
   const { bridgeServerUrl, isConnected, setIsConnected } = useSettingsStore();
-
-  const [showNewProjectModal, setShowNewProjectModal] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
   const [newProjectSandbox, setNewProjectSandbox] = useState(true); // Default to sandbox mode
   const [isLoading, setIsLoading] = useState(false);
@@ -267,7 +267,11 @@ export default function ProjectsScreen() {
         transparent
         onRequestClose={() => setShowNewProjectModal(false)}
       >
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView
+          style={styles.modalOverlay}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          keyboardVerticalOffset={Platform.OS === 'ios' ? -100 : 0}
+        >
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Create New Project</Text>
             <TextInput
@@ -324,7 +328,7 @@ export default function ProjectsScreen() {
               />
             </View>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       </Modal>
     </View>
   );

@@ -290,6 +290,22 @@ class BridgeService {
         }
         break;
 
+      case 'voice_wake_word':
+        // Wake word detected - switch from sleeping to active mode
+        if (response.terminalId) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          vtCallbacks?.onWakeWord?.(response.transcription || 'Hey Lora');
+        }
+        break;
+
+      case 'voice_no_wake_word':
+        // No wake word detected - continue sleeping
+        if (response.terminalId) {
+          const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          vtCallbacks?.onNoWakeWord?.();
+        }
+        break;
+
       case 'voice_progress':
         // Handle progress for both voice sessions and voice-terminal
         if (response.voiceSessionId && response.responseText) {
@@ -747,6 +763,8 @@ class BridgeService {
     onSpeaking?: (text: string, audioData: string) => void;
     onAppControl?: (control: { action: string; target?: string; params?: Record<string, unknown> }) => void;
     onWorking?: (workingState: { reason: string; followUpAction?: string }) => void;
+    onWakeWord?: (text: string) => void; // Called when wake word "Hey Lora" is detected
+    onNoWakeWord?: () => void; // Called when no wake word was detected (continue sleeping)
     onEnabled?: () => void;
     onDisabled?: () => void;
     onError?: (error: string) => void;
@@ -760,13 +778,17 @@ class BridgeService {
       onSpeaking?: (text: string, audioData: string) => void;
       onAppControl?: (control: { action: string; target?: string; params?: Record<string, unknown> }) => void;
       onWorking?: (workingState: { reason: string; followUpAction?: string }) => void;
+      onWakeWord?: (text: string) => void;
+      onNoWakeWord?: () => void;
       onEnabled?: () => void;
       onDisabled?: () => void;
       onError?: (error: string) => void;
     }
   ) {
+    console.log('[BridgeService] enableVoiceOnTerminal called for:', terminalId);
     this.voiceTerminalCallbacks.set(terminalId, callbacks);
     this.send({ type: 'voice_terminal_enable', terminalId });
+    console.log('[BridgeService] Sent voice_terminal_enable message');
   }
 
   disableVoiceOnTerminal(terminalId: string) {
@@ -786,7 +808,8 @@ class BridgeService {
       projectId?: string;
       hasPreview?: boolean;
       fileCount?: number;
-    }
+    },
+    wakeWordCheck?: boolean // If true, only check for wake word, don't process full command
   ) {
     this.send({
       type: 'voice_terminal_audio',
@@ -795,7 +818,8 @@ class BridgeService {
       audioMimeType: mimeType,
       screenCapture,  // Base64 PNG of phone screen for vision
       terminalContent, // Recent terminal output for context
-      appState  // Current app state
+      appState,  // Current app state
+      wakeWordCheck   // Flag to indicate this is just a wake word check
     } as any);  // Cast to any since WSMessage type doesn't include all fields
   }
 

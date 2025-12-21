@@ -80,6 +80,7 @@ interface Message {
     hasPreview?: boolean;
     fileCount?: number;
   };
+  wakeWordCheck?: boolean; // If true, only check for wake word "Hey Lora"
 }
 
 interface ProjectInfo {
@@ -96,7 +97,7 @@ interface FileInfo {
 }
 
 interface StreamResponse {
-  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
+  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_wake_word' | 'voice_no_wake_word' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ProjectInfo[];
@@ -1221,6 +1222,46 @@ wss.on('connection', (ws: WebSocket) => {
             return;
           }
 
+          // WAKE WORD CHECK - if wakeWordCheck flag is set, only check for wake word
+          if (message.wakeWordCheck) {
+            const wakeResult = voiceService.checkForWakeWord(transcription);
+
+            if (wakeResult.detected) {
+              // Wake word found! Send wake word detected response
+              const wakeResponse: StreamResponse = {
+                type: 'voice_wake_word',
+                terminalId: message.terminalId,
+                transcription: wakeResult.text,
+                responseText: wakeResult.remainder // Any additional text after wake word
+              };
+              ws.send(JSON.stringify(wakeResponse));
+              serverLog(`[Voice] Wake word detected: "${transcription}"`);
+
+              // If there's additional content after wake word, process it as a command
+              if (wakeResult.remainder && wakeResult.remainder.length > 2) {
+                // Play a short acknowledgment and then process the remainder
+                const ackText = 'Yes?';
+                const ttsAudio = await voiceService.textToSpeech(ackText);
+                const audioResponse: StreamResponse = {
+                  type: 'voice_terminal_speaking',
+                  terminalId: message.terminalId,
+                  responseText: ackText,
+                  audioData: ttsAudio.toString('base64'),
+                  audioMimeType: 'audio/mp3'
+                };
+                ws.send(JSON.stringify(audioResponse));
+              }
+            } else {
+              // No wake word - send no_wake_word response to continue sleeping
+              const noWakeResponse: StreamResponse = {
+                type: 'voice_no_wake_word',
+                terminalId: message.terminalId
+              };
+              ws.send(JSON.stringify(noWakeResponse));
+            }
+            return;
+          }
+
           // Send transcription to client (what the user said)
           const transcriptionResponse: StreamResponse = {
             type: 'voice_transcription',
@@ -1338,13 +1379,14 @@ wss.on('connection', (ws: WebSocket) => {
 
           // Handle CONVERSATIONAL - greetings, thanks, etc.
           if (agentResponse.type === 'conversational') {
-
-            const ttsAudioBuffer = await voiceService.textToSpeech(agentResponse.content);
+            // Use voiceResponse if provided, otherwise use content
+            const speechText = agentResponse.voiceResponse || agentResponse.content;
+            const ttsAudioBuffer = await voiceService.textToSpeech(speechText);
 
             const audioResponse: StreamResponse = {
               type: 'voice_terminal_speaking',
               terminalId: message.terminalId,
-              responseText: agentResponse.content,
+              responseText: speechText,
               audioData: ttsAudioBuffer.toString('base64'),
               audioMimeType: 'audio/mp3'
             };
@@ -1471,9 +1513,11 @@ wss.on('connection', (ws: WebSocket) => {
               results.push(result);
             }
 
-            const responseText = results.length > 1
-              ? `Done: ${results.join(' ')}`
-              : results[0] || 'Done.';
+            // Use voiceResponse if provided, otherwise generate from results
+            const responseText = agentResponse.voiceResponse
+              || (results.length > 1
+                ? `Done: ${results.join(' ')}`
+                : results[0] || 'Done.');
 
             // Generate voice response for control action
             const ttsAudio = await voiceService.textToSpeech(responseText);
@@ -1494,21 +1538,24 @@ wss.on('connection', (ws: WebSocket) => {
 
           // Handle APP_CONTROL - control the mobile app UI
           if (agentResponse.type === 'app_control' && agentResponse.appAction) {
+            // Use voiceResponse if provided, otherwise use content
+            const speechText = agentResponse.voiceResponse || agentResponse.content;
+
             // Send app control command to mobile app
             const appControlResponse: StreamResponse = {
               type: 'voice_app_control',
               terminalId: message.terminalId,
-              responseText: agentResponse.content,
+              responseText: speechText,
               appControl: agentResponse.appAction
             };
             ws.send(JSON.stringify(appControlResponse));
 
             // Also send voice response
-            const ttsAudio = await voiceService.textToSpeech(agentResponse.content);
+            const ttsAudio = await voiceService.textToSpeech(speechText);
             const audioResponse: StreamResponse = {
               type: 'voice_terminal_speaking',
               terminalId: message.terminalId,
-              responseText: agentResponse.content,
+              responseText: speechText,
               audioData: ttsAudio.toString('base64'),
               audioMimeType: 'audio/mp3'
             };
@@ -1551,6 +1598,20 @@ wss.on('connection', (ws: WebSocket) => {
           // Clear idle state - user is actively commanding
           session.voiceIdleWaiting = false;
           const promptText = agentResponse.content;
+
+          // If there's a voiceResponse, speak it FIRST before sending the command
+          // This lets the user know what's happening ("Let me check that for you")
+          if (agentResponse.voiceResponse) {
+            const ttsAudioBuffer = await voiceService.textToSpeech(agentResponse.voiceResponse);
+            const audioResponse: StreamResponse = {
+              type: 'voice_terminal_speaking',
+              terminalId: message.terminalId,
+              responseText: agentResponse.voiceResponse,
+              audioData: ttsAudioBuffer.toString('base64'),
+              audioMimeType: 'audio/mp3'
+            };
+            ws.send(JSON.stringify(audioResponse));
+          }
 
           // Send progress to client
           const progressResponse: StreamResponse = {

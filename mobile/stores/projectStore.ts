@@ -7,6 +7,7 @@ interface ProjectState {
   projects: Project[];
   currentProjectId: string | null;
   currentFile: string | null;
+  showNewProjectModal: boolean;
 
   // Computed
   currentProject: () => Project | null;
@@ -14,6 +15,7 @@ interface ProjectState {
 
   // Actions
   addProject: (project: Project) => void;
+  setShowNewProjectModal: (show: boolean) => void;
   setProjects: (projects: Project[]) => void;
   updateProject: (id: string, updates: Partial<Project>) => void;
   deleteProject: (id: string) => void;
@@ -33,6 +35,9 @@ export const useProjectStore = create<ProjectState>()(
       projects: [],
       currentProjectId: null,
       currentFile: null,
+      showNewProjectModal: false,
+
+      setShowNewProjectModal: (show: boolean) => set({ showNewProjectModal: show }),
 
       currentProject: () => {
         const { projects, currentProjectId } = get();

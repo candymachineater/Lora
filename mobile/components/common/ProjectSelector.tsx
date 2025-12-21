@@ -175,17 +175,19 @@ export function ProjectSelector() {
 
   return (
     <>
-      {/* Main Selector Button */}
-      <TouchableOpacity
-        style={styles.selectorButton}
-        onPress={() => setShowDropdown(true)}
-      >
-        <FolderOpen color={colors.brandTiger} size={16} />
-        <Text style={styles.selectorText} numberOfLines={1}>
-          {project?.name || 'Select Project'}
-        </Text>
-        <ChevronDown color={colors.mutedForeground} size={16} />
-      </TouchableOpacity>
+      {/* Main Selector Button - centered with dynamic width */}
+      <View style={styles.selectorWrapper}>
+        <TouchableOpacity
+          style={styles.selectorButton}
+          onPress={() => setShowDropdown(true)}
+        >
+          <FolderOpen color={colors.brandTiger} size={16} />
+          <Text style={styles.selectorText} numberOfLines={1}>
+            {project?.name || 'Select Project'}
+          </Text>
+          <ChevronDown color={colors.mutedForeground} size={16} />
+        </TouchableOpacity>
+      </View>
 
       {/* Dropdown Modal */}
       <Modal
@@ -374,23 +376,27 @@ export function ProjectSelector() {
 }
 
 const styles = StyleSheet.create({
+  selectorWrapper: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   selectorButton: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: colors.cardBackground,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
     borderRadius: radius.lg,
     borderWidth: 1,
     borderColor: colors.border,
-    gap: spacing.sm,
-    minWidth: 140,
-    maxWidth: 220,
+    gap: spacing.xs,
   },
   selectorText: {
     fontSize: 15,
     color: colors.foreground,
     fontWeight: '600',
+    maxWidth: 150,
   },
   modalOverlay: {
     flex: 1,

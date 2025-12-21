@@ -14,9 +14,8 @@ import { WebView, WebViewMessageEvent } from 'react-native-webview';
 interface TerminalProps {
   output: string;
   onInput: (input: string) => void;
-  isConnected: boolean;
-  sandbox: boolean;
   onResize?: (cols: number, rows: number) => void;
+  onNewTerminal?: () => void;
 }
 
 // xterm.js HTML content embedded as string
@@ -47,7 +46,8 @@ const XTERM_HTML = `<!DOCTYPE html>
       padding: 2px;
     }
     .xterm-viewport {
-      overflow-y: hidden !important;
+      overflow-y: auto !important;
+      -webkit-overflow-scrolling: touch;
     }
     /* Disable native touch scrolling - we handle it via JS */
     .xterm-screen {
@@ -312,18 +312,29 @@ const XTERM_HTML = `<!DOCTYPE html>
 export function Terminal({
   output,
   onInput,
-  isConnected,
-  sandbox,
   onResize,
+  onNewTerminal,
 }: TerminalProps) {
   const webViewRef = useRef<WebView>(null);
   const lastOutputRef = useRef<string>('');
+  const historyScrollRef = useRef<ScrollView>(null);
 
   // Modifier key states (toggleable)
   const [ctrlActive, setCtrlActive] = useState(false);
   const [shiftActive, setShiftActive] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const isReadyRef = useRef<boolean>(false);
   const pendingOutputRef = useRef<string>('');
+
+  // Strip ANSI codes for plain text history view
+  const stripAnsi = (text: string) => {
+    return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+               .replace(/\x1b\][^\x07]*\x07/g, '')
+               .replace(/\x1b\][^\x1b]*\x1b\\/g, '')
+               .replace(/\x1b[PX^_][^\x1b]*\x1b\\/g, '')
+               .replace(/\x1b\[[\?]?[0-9;]*[hlsr]/g, '')
+               .replace(/\r/g, '');
+  };
 
   // Send message to WebView
   const sendToWebView = useCallback((message: object) => {
@@ -333,22 +344,123 @@ export function Terminal({
     }
   }, []);
 
-  // Scroll button handlers - use sendToWebView to route through handleReactNativeMessage
+  // Scroll button handlers - use direct injection instead of sendToWebView to bypass isReady check
   const handleScrollUp = useCallback(() => {
-    sendToWebView({ type: 'scrollLines', lines: -5 });
-  }, [sendToWebView]);
+    console.log('[Terminal] handleScrollUp pressed');
+    if (webViewRef.current) {
+      const script = `
+        var buf = term.buffer.active;
+        var isAltBuffer = (term.buffer.active === term.buffer.alternate);
+        var before = { baseY: buf.baseY, viewportY: buf.viewportY, length: buf.length };
+
+        term.scrollLines(-10);
+
+        var after = { baseY: buf.baseY, viewportY: buf.viewportY };
+
+        // Also scroll viewport directly as fallback
+        var viewport = document.querySelector('.xterm-viewport');
+        var vpInfo = null;
+        if (viewport) {
+          var beforeScroll = viewport.scrollTop;
+          viewport.scrollTop -= 150; // ~10 lines worth of pixels
+          if (viewport.scrollTop < 0) viewport.scrollTop = 0;
+          vpInfo = { before: beforeScroll, after: viewport.scrollTop, max: viewport.scrollHeight - viewport.clientHeight };
+        }
+
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'debug',
+          msg: 'scrollUp: isAlt=' + isAltBuffer + ' buf=' + JSON.stringify(after) + ' vp=' + JSON.stringify(vpInfo)
+        }));
+        true;
+      `;
+      webViewRef.current.injectJavaScript(script);
+    }
+  }, []);
 
   const handleScrollDown = useCallback(() => {
-    sendToWebView({ type: 'scrollLines', lines: 5 });
-  }, [sendToWebView]);
+    console.log('[Terminal] handleScrollDown pressed');
+    if (webViewRef.current) {
+      const script = `
+        var buf = term.buffer.active;
+        var isAltBuffer = (term.buffer.active === term.buffer.alternate);
+        var before = { baseY: buf.baseY, viewportY: buf.viewportY, isAlt: isAltBuffer };
+
+        term.scrollLines(10);
+
+        var after = { baseY: buf.baseY, viewportY: buf.viewportY };
+
+        // Also scroll viewport directly as fallback
+        var viewport = document.querySelector('.xterm-viewport');
+        var vpInfo = null;
+        if (viewport) {
+          var beforeScroll = viewport.scrollTop;
+          viewport.scrollTop += 150; // ~10 lines worth of pixels
+          vpInfo = { before: beforeScroll, after: viewport.scrollTop, max: viewport.scrollHeight - viewport.clientHeight };
+        }
+
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'debug',
+          msg: 'scrollDown: isAlt=' + isAltBuffer + ' buf=' + JSON.stringify(after) + ' vp=' + JSON.stringify(vpInfo)
+        }));
+        true;
+      `;
+      webViewRef.current.injectJavaScript(script);
+    }
+  }, []);
 
   const handleScrollToTop = useCallback(() => {
-    sendToWebView({ type: 'scrollToTop' });
-  }, [sendToWebView]);
+    console.log('[Terminal] handleScrollToTop pressed');
+    if (webViewRef.current) {
+      const script = `
+        var buf = term.buffer.active;
+        var before = { baseY: buf.baseY, viewportY: buf.viewportY, cursorY: buf.cursorY, length: buf.length };
+        console.log('[WebView] BEFORE scrollToTop:', JSON.stringify(before));
+
+        // Flash green
+        document.body.style.backgroundColor = '#1a2e1a';
+        setTimeout(() => { document.body.style.backgroundColor = '#0C0C0C'; }, 150);
+
+        term.scrollToTop();
+
+        var after = { baseY: buf.baseY, viewportY: buf.viewportY, cursorY: buf.cursorY, length: buf.length };
+        console.log('[WebView] AFTER scrollToTop:', JSON.stringify(after));
+
+        // Also manually scroll the viewport element
+        var viewport = document.querySelector('.xterm-viewport');
+        if (viewport) {
+          console.log('[WebView] viewport scrollTop before:', viewport.scrollTop);
+          viewport.scrollTop = 0;
+          console.log('[WebView] viewport scrollTop after:', viewport.scrollTop);
+        }
+
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'debug',
+          msg: 'scrollToTop: before=' + JSON.stringify(before) + ' after=' + JSON.stringify(after) + ' maxScroll=' + buf.baseY
+        }));
+        true;
+      `;
+      webViewRef.current.injectJavaScript(script);
+    }
+  }, []);
 
   const handleScrollToBottom = useCallback(() => {
-    sendToWebView({ type: 'scrollToBottom' });
-  }, [sendToWebView]);
+    console.log('[Terminal] handleScrollToBottom pressed, isReady:', isReadyRef.current);
+    if (webViewRef.current) {
+      const script = `
+        console.log('[WebView] scrollToBottom called');
+        // Flash yellow
+        document.body.style.backgroundColor = '#2e2e1a';
+        setTimeout(() => { document.body.style.backgroundColor = '#0C0C0C'; }, 100);
+        term.scrollToBottom();
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'debug',
+          msg: 'scrollToBottom executed, viewportY: ' + term.buffer.active.viewportY + ', baseY: ' + term.buffer.active.baseY
+        }));
+        true;
+      `;
+      webViewRef.current.injectJavaScript(script);
+    }
+  }, []);
 
   // Handle new output - only send the delta, or clear if output is reset
   useEffect(() => {
@@ -409,7 +521,7 @@ export function Terminal({
           // Terminal is initialized, wait for ready
           break;
         case 'debug':
-          // Debug logging disabled to reduce noise
+          console.log('[Terminal Debug]', data.msg);
           break;
       }
     } catch (e) {
@@ -539,13 +651,6 @@ export function Terminal({
     setShiftActive(false);
   }, [onInput, ctrlActive, shiftActive]);
 
-  // Reset terminal when reconnecting
-  useEffect(() => {
-    if (isConnected && isReadyRef.current) {
-      // Don't reset, just keep existing content
-    }
-  }, [isConnected]);
-
   // Scroll to bottom when keyboard hides
   useEffect(() => {
     const keyboardDidHide = Keyboard.addListener('keyboardDidHide', () => {
@@ -573,75 +678,7 @@ export function Terminal({
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={100}
     >
-      {/* Status bar */}
-      <View style={styles.statusBar}>
-        <View style={styles.statusLeft}>
-          <View
-            style={[
-              styles.statusDot,
-              { backgroundColor: isConnected ? '#22C55E' : '#D10808' },
-            ]}
-          />
-          <Text style={styles.statusText}>
-            {isConnected ? 'Connected' : 'Disconnected'}
-          </Text>
-        </View>
-        <View style={styles.statusRight}>
-          <View
-            style={[
-              styles.sandboxBadge,
-              { backgroundColor: sandbox ? '#22C55E' : '#F59E0B' },
-            ]}
-          >
-            <Text style={[styles.sandboxText, !sandbox && { color: '#1C1C1C' }]}>
-              {sandbox ? 'Sandbox' : 'Full Access'}
-            </Text>
-          </View>
-        </View>
-      </View>
-
-
-      {/* xterm.js WebView */}
-      <View style={styles.terminalContainer}>
-        <WebView
-          ref={webViewRef}
-          source={{ html: XTERM_HTML }}
-          style={styles.webView}
-          onMessage={handleMessage}
-          javaScriptEnabled={true}
-          domStorageEnabled={true}
-          originWhitelist={['*']}
-          scrollEnabled={false}
-          bounces={false}
-          keyboardDisplayRequiresUserAction={false}
-          hideKeyboardAccessoryView={false}
-          allowsInlineMediaPlayback={true}
-          mediaPlaybackRequiresUserAction={false}
-          startInLoadingState={false}
-          scalesPageToFit={false}
-          showsHorizontalScrollIndicator={false}
-          showsVerticalScrollIndicator={false}
-          contentMode="mobile"
-          automaticallyAdjustContentInsets={false}
-        />
-        {/* Scroll buttons on the right side */}
-        <View style={styles.scrollButtonsContainer}>
-          <TouchableOpacity style={styles.scrollButton} onPress={handleScrollToTop}>
-            <Text style={styles.scrollButtonText}>⏫</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.scrollButton} onPress={handleScrollUp}>
-            <Text style={styles.scrollButtonText}>▲</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.scrollButton} onPress={handleScrollDown}>
-            <Text style={styles.scrollButtonText}>▼</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.scrollButton} onPress={handleScrollToBottom}>
-            <Text style={styles.scrollButtonText}>⏬</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      {/* Control buttons */}
+      {/* Control buttons - at top */}
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}
@@ -707,6 +744,81 @@ export function Terminal({
           <Text style={styles.controlButtonText}>→</Text>
         </TouchableOpacity>
       </ScrollView>
+
+      {/* xterm.js WebView */}
+      <View style={styles.terminalContainer}>
+        <WebView
+          ref={webViewRef}
+          source={{ html: XTERM_HTML }}
+          style={[styles.webView, showHistory && styles.hidden]}
+          onMessage={handleMessage}
+          javaScriptEnabled={true}
+          domStorageEnabled={true}
+          originWhitelist={['*']}
+          scrollEnabled={false}
+          bounces={false}
+          keyboardDisplayRequiresUserAction={false}
+          hideKeyboardAccessoryView={false}
+          allowsInlineMediaPlayback={true}
+          mediaPlaybackRequiresUserAction={false}
+          startInLoadingState={false}
+          scalesPageToFit={false}
+          showsHorizontalScrollIndicator={false}
+          showsVerticalScrollIndicator={false}
+          contentMode="mobile"
+          automaticallyAdjustContentInsets={false}
+        />
+
+        {/* History View - scrollable plain text view of all output */}
+        {showHistory && (
+          <ScrollView
+            ref={historyScrollRef}
+            style={styles.historyView}
+            contentContainerStyle={styles.historyContent}
+            showsVerticalScrollIndicator={true}
+          >
+            <Text style={styles.historyText} selectable>
+              {stripAnsi(output)}
+            </Text>
+          </ScrollView>
+        )}
+
+        {/* Floating action buttons */}
+        <View style={styles.scrollButtonsContainer}>
+          {/* New terminal button */}
+          {onNewTerminal && (
+            <TouchableOpacity
+              style={[styles.scrollButton, styles.newTerminalButton]}
+              onPress={onNewTerminal}
+            >
+              <Text style={styles.scrollButtonText}>+</Text>
+            </TouchableOpacity>
+          )}
+          {/* History toggle button */}
+          <TouchableOpacity
+            style={[styles.scrollButton, showHistory && styles.scrollButtonActive]}
+            onPress={() => setShowHistory(!showHistory)}
+          >
+            <Text style={styles.scrollButtonText}>{showHistory ? '⌨️' : '📜'}</Text>
+          </TouchableOpacity>
+          {showHistory && (
+            <>
+              <TouchableOpacity
+                style={styles.scrollButton}
+                onPress={() => historyScrollRef.current?.scrollTo({ y: 0, animated: true })}
+              >
+                <Text style={styles.scrollButtonText}>⏫</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.scrollButton}
+                onPress={() => historyScrollRef.current?.scrollToEnd({ animated: true })}
+              >
+                <Text style={styles.scrollButtonText}>⏬</Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+      </View>
     </KeyboardAvoidingView>
   );
 }
@@ -715,46 +827,6 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0C0C0C',
-  },
-  statusBar: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    backgroundColor: '#161616',
-    borderBottomWidth: 1,
-    borderBottomColor: '#2A2A2A',
-  },
-  statusLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginRight: 8,
-  },
-  statusText: {
-    color: '#999',
-    fontSize: 12,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  },
-  statusRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  sandboxBadge: {
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-    borderRadius: 12,
-  },
-  sandboxText: {
-    color: '#FFF',
-    fontSize: 11,
-    fontWeight: '600',
   },
   terminalContainer: {
     flex: 1,
@@ -788,15 +860,45 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#3A3A3A',
   },
+  newTerminalButton: {
+    backgroundColor: '#C53307',
+    borderColor: '#C53307',
+  },
+  scrollButtonActive: {
+    backgroundColor: '#0066CC',
+    borderColor: '#0088FF',
+  },
   scrollButtonText: {
     fontSize: 16,
     color: '#AAA',
   },
+  hidden: {
+    opacity: 0,
+    position: 'absolute',
+  },
+  historyView: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: '#0C0C0C',
+  },
+  historyContent: {
+    padding: 8,
+    paddingRight: 50,
+  },
+  historyText: {
+    color: '#CCCCCC',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontSize: 9,
+    lineHeight: 12,
+  },
   controlBar: {
     backgroundColor: '#161616',
     maxHeight: 52,
-    borderTopWidth: 1,
-    borderTopColor: '#2A2A2A',
+    borderBottomWidth: 1,
+    borderBottomColor: '#2A2A2A',
   },
   controlBarContent: {
     flexDirection: 'row',

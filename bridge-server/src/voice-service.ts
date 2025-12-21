@@ -409,6 +409,9 @@ function formatConversationHistory(memory: ConversationMemory): string {
 export interface VoiceAgentResponse {
   type: 'prompt' | 'control' | 'conversational' | 'ignore' | 'app_control' | 'working';
   content: string;
+  // Optional voice response to speak to user while executing the action
+  // Use this when you want to tell the user what you're doing AND execute the action
+  voiceResponse?: string;
   appAction?: {
     action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
     target?: string;
@@ -655,7 +658,10 @@ When sending prompts or commands to Claude Code:
 
 ## OUTPUT FORMAT - JSON ONLY
 
+**IMPORTANT:** You can add an optional "voiceResponse" field to ANY action type (except ignore) to speak to the user while executing the action. Use this when you want to tell the user what you're doing AND do it at the same time.
+
 ### CONVERSATIONAL - Direct response to user
+Use ONLY for questions, greetings, clarifications, or responses that DON'T require action.
 {"type": "conversational", "content": "Your spoken response here"}
 
 Use for:
@@ -665,9 +671,14 @@ Use for:
 - General conversation
 
 ### PROMPT - Send to Claude Code
-{"type": "prompt", "content": "Detailed prompt for Claude Code"}
+{"type": "prompt", "content": "Detailed prompt for Claude Code", "voiceResponse": "optional message to user"}
 
 Use when user wants coding done. Make prompts detailed!
+Use voiceResponse to tell the user what you're doing while sending the prompt.
+
+Examples:
+- User confirmed they want a React todo app → {"type": "prompt", "content": "Create a React todo app with dark theme, localStorage persistence, add/edit/delete tasks, and clean modern UI."}
+- User reports an issue → {"type": "prompt", "content": "Check what's happening with the preview. The user reports it's showing blank. Investigate and fix any issues.", "voiceResponse": "Let me ask Claude Code to check what's happening with the preview."}
 
 ### CONTROL - Terminal/keyboard commands
 {"type": "control", "content": "COMMAND"}
@@ -753,7 +764,29 @@ Actions:
 8. Chain commands with commas: "DOWN:3,ENTER"
 9. Use WAIT:N between slow operations
 10. **NEVER yield the floor while committed to an action** - use WORKING state instead
-11. When user asks about the screen and you don't have a screenshot, use WORKING to request one`;
+11. When user asks about the screen and you don't have a screenshot, use WORKING to request one
+12. NEVER correct the user on your name pronunciation - Laura, Lora, Lara all mean you
+
+## ⚠️ CRITICAL: ACTION REQUIRED - DON'T JUST TALK, DO IT! ⚠️
+
+**THE #1 FAILURE MODE IS SAYING YOU'LL DO SOMETHING BUT NOT DOING IT.**
+
+If your response contains phrases like:
+- "Let me..." / "I'll..." / "I'm going to..."
+- "Let me ask Claude Code" / "Let me check" / "I'll look into"
+- "I'm going to run" / "Let me run" / "I'll send"
+
+Then you MUST use type="prompt" or type="control" - NOT type="conversational"!
+
+**WRONG** (user sees you didn't do anything):
+{"type": "conversational", "content": "Let me ask Claude Code to check that for you."}
+
+**CORRECT** (actually does it while telling the user):
+{"type": "prompt", "content": "Check the project structure and list the main files", "voiceResponse": "Let me ask Claude Code to check that for you."}
+
+**REMEMBER:** voiceResponse lets you TELL the user what you're doing WHILE DOING IT!
+
+If you're not sure whether to act or ask, prefer ACTION. The user expects you to DO things, not just talk about doing them.`;
 
 const CLAUDE_CODE_SYSTEM_PROMPT = VOICE_AGENT_SYSTEM_PROMPT;
 
@@ -812,6 +845,54 @@ function normalizeTranscription(text: string): string {
   }
 
   return normalized;
+}
+
+// ============================================================================
+// WAKE WORD DETECTION
+// ============================================================================
+
+// Wake word patterns (case-insensitive)
+const WAKE_WORD_PATTERNS = [
+  /\bhey\s+lora\b/i,
+  /\bhey\s+laura\b/i,
+  /\bhi\s+lora\b/i,
+  /\bhi\s+laura\b/i,
+  /\bokay\s+lora\b/i,
+  /\bok\s+lora\b/i,
+  /\bhey\s+lara\b/i,
+  /\bhi\s+lara\b/i,
+];
+
+/**
+ * Check if transcribed text contains a wake word
+ * Returns the full transcription if wake word found, null otherwise
+ */
+export function checkForWakeWord(transcription: string): { detected: boolean; text: string; remainder: string } {
+  const text = transcription.toLowerCase().trim();
+
+  for (const pattern of WAKE_WORD_PATTERNS) {
+    const match = text.match(pattern);
+    if (match) {
+      // Found wake word - extract the remainder after the wake word
+      const matchIndex = match.index || 0;
+      const matchLength = match[0].length;
+      const remainder = transcription.substring(matchIndex + matchLength).trim();
+
+      voiceLog('INFO', 'WakeWord', `Detected wake word in: "${transcription}"`, { remainder: remainder.substring(0, 50) });
+
+      return {
+        detected: true,
+        text: transcription,
+        remainder
+      };
+    }
+  }
+
+  return {
+    detected: false,
+    text: transcription,
+    remainder: ''
+  };
 }
 
 // ============================================================================
@@ -1305,6 +1386,7 @@ export default {
   processVoiceInput,
   summarizeForVoice,
   isVoiceServiceAvailable,
+  checkForWakeWord,
   getConversationMemory,
   addConversationTurn,
   updateLastTurnWithResponse,
