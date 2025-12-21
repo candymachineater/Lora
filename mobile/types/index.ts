@@ -74,6 +74,14 @@ export interface WSMessage {
   audioMimeType?: string; // e.g., 'audio/wav', 'audio/m4a'
   text?: string; // For voice_text (text input instead of audio)
   screenCapture?: string; // Base64 PNG screenshot of phone screen
+  terminalContent?: string; // Recent terminal output for context
+  appState?: {  // Current app state for voice agent context
+    currentTab: string;
+    projectName?: string;
+    projectId?: string;
+    hasPreview?: boolean;
+    fileCount?: number;
+  };
 }
 
 export interface WSResponse {
@@ -97,7 +105,7 @@ export interface WSResponse {
   voiceEnabled?: boolean; // Voice mode status for terminal
   // App control from voice agent
   appControl?: {
-    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot';
+    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
   };

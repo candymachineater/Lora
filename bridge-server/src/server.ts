@@ -72,6 +72,14 @@ interface Message {
   audioMimeType?: string; // e.g., 'audio/wav', 'audio/m4a'
   text?: string; // For voice_text (text input instead of audio)
   screenCapture?: string; // Base64 encoded PNG screenshot of the phone screen
+  terminalContent?: string; // Recent terminal output for context
+  appState?: {  // Current app state for voice agent context
+    currentTab: string;
+    projectName?: string;
+    projectId?: string;
+    hasPreview?: boolean;
+    fileCount?: number;
+  };
 }
 
 interface ProjectInfo {
@@ -108,7 +116,7 @@ interface StreamResponse {
   voiceEnabled?: boolean; // Voice mode status for terminal
   // App control from voice agent
   appControl?: {
-    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot';
+    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
   };
@@ -1292,12 +1300,27 @@ wss.on('connection', (ws: WebSocket) => {
 
           // Process with Voice Agent LLM - it decides what to do
           const projectMeta = listProjects().find(p => p.id === session.projectId);
+
+          // Build comprehensive context for voice agent
+          // Use terminal content from mobile app if provided, otherwise use accumulated output
+          const terminalContext = message.terminalContent || session.voiceAccumulatedOutput.slice(-500);
+
+          // Build app state description
+          let appStateDesc = '';
+          if (message.appState) {
+            appStateDesc = `\n## App State:\n`;
+            appStateDesc += `- Current tab: ${message.appState.currentTab}\n`;
+            if (message.appState.projectName) {
+              appStateDesc += `- Project: ${message.appState.projectName}\n`;
+            }
+          }
+
           const agentResponse = await voiceService.processVoiceInput(
             transcription,
             message.terminalId,  // sessionId for conversation memory
             {
-              projectName: projectMeta?.name,
-              recentOutput: session.voiceAccumulatedOutput.slice(-500),
+              projectName: message.appState?.projectName || projectMeta?.name,
+              recentOutput: terminalContext + appStateDesc,
               claudeCodeState: stateDescription,
               screenCapture: message.screenCapture  // Phone screenshot if provided
             }

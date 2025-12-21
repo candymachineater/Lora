@@ -76,6 +76,8 @@ export default function TerminalScreen() {
   const ring3Opacity = useRef(new Animated.Value(0.1)).current;
   const glowAnim = useRef(new Animated.Value(0)).current;
   const viewShotRef = useRef<ViewShot>(null);
+  const lastScreenshotRef = useRef<string | undefined>(undefined);
+  const terminalContentRef = useRef<string>(''); // Store terminal output for voice context
 
   const project = currentProject();
   const activeTerminal = terminals[activeTerminalIndex];
@@ -361,6 +363,36 @@ export default function TerminalScreen() {
     createTerminal();
   }, [createTerminal]);
 
+  // Capture screenshot before voice overlay appears
+  const captureScreenshot = async (): Promise<string | undefined> => {
+    try {
+      if (viewShotRef.current?.capture) {
+        const screenshotUri = await viewShotRef.current.capture();
+        const screenshotResponse = await fetch(screenshotUri);
+        const screenshotBlob = await screenshotResponse.blob();
+        return new Promise<string>((resolve) => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64Screenshot = (reader.result as string).split(',')[1];
+            resolve(base64Screenshot);
+          };
+          reader.readAsDataURL(screenshotBlob);
+        });
+      }
+    } catch (err) {
+      console.log('[Voice-Terminal] Screenshot capture failed:', err);
+    }
+    return undefined;
+  };
+
+  // Keep track of terminal content for voice agent context
+  useEffect(() => {
+    if (activeTerminal?.output) {
+      // Store last 3000 chars of terminal output for context
+      terminalContentRef.current = activeTerminal.output.slice(-3000);
+    }
+  }, [activeTerminal?.output]);
+
   // Voice Mode Functions - now integrated directly with terminal
   const toggleVoiceMode = async () => {
     if (!activeTerminal) {
@@ -369,6 +401,11 @@ export default function TerminalScreen() {
     }
 
     if (voiceStatus === 'off') {
+      // Capture screenshot BEFORE voice overlay appears
+      console.log('[Voice-Terminal] Capturing screenshot before enabling voice mode...');
+      lastScreenshotRef.current = await captureScreenshot();
+      console.log('[Voice-Terminal] Screenshot captured:', lastScreenshotRef.current ? 'success' : 'failed');
+
       // Turn on voice mode for this terminal
       bridgeService.enableVoiceOnTerminal(activeTerminal.id, {
         onTranscription: (text) => {
@@ -386,7 +423,7 @@ export default function TerminalScreen() {
           setVoiceProgress('');
           playAudio(audioData);
         },
-        onAppControl: (control) => {
+        onAppControl: async (control) => {
           console.log('[Voice-Terminal] App control:', control);
           // Handle app control actions from voice agent
           if (control.action === 'navigate' && control.target) {
@@ -402,10 +439,29 @@ export default function TerminalScreen() {
             const route = tabMap[control.target.toLowerCase()];
             if (route) {
               router.push(route as any);
+              // Capture screenshot after navigation completes
+              setTimeout(async () => {
+                lastScreenshotRef.current = await captureScreenshot();
+                console.log('[Voice-Terminal] Screenshot captured after navigation');
+              }, 500);
             }
           } else if (control.action === 'take_screenshot') {
-            // Voice agent requested a fresh screenshot - will be sent with next audio
+            // Voice agent requested a fresh screenshot
             console.log('[Voice-Terminal] Screenshot requested by agent');
+            lastScreenshotRef.current = await captureScreenshot();
+            console.log('[Voice-Terminal] Fresh screenshot captured');
+          } else if (control.action === 'refresh_files') {
+            // Navigate to editor and refresh - files will auto-refresh
+            router.push('/(tabs)/editor' as any);
+            console.log('[Voice-Terminal] Navigating to editor to show files');
+          } else if (control.action === 'show_settings') {
+            // Open settings modal
+            router.push('/settings' as any);
+            console.log('[Voice-Terminal] Opening settings');
+          } else if (control.action === 'create_project') {
+            // Navigate to projects tab to create new project
+            router.push('/(tabs)' as any);
+            console.log('[Voice-Terminal] Navigating to projects');
           }
         },
         onEnabled: () => {
@@ -581,28 +637,45 @@ export default function TerminalScreen() {
           const base64 = (reader.result as string).split(',')[1];
           const mimeType = blob.type || 'audio/m4a';
 
-          // Capture screenshot of current screen for voice agent vision
-          let screenCapture: string | undefined;
-          try {
-            if (viewShotRef.current?.capture) {
-              const screenshotUri = await viewShotRef.current.capture();
-              const screenshotResponse = await fetch(screenshotUri);
-              const screenshotBlob = await screenshotResponse.blob();
-              const screenshotReader = new FileReader();
-              screenCapture = await new Promise<string>((resolve) => {
-                screenshotReader.onloadend = () => {
-                  const base64Screenshot = (screenshotReader.result as string).split(',')[1];
-                  resolve(base64Screenshot);
-                };
-                screenshotReader.readAsDataURL(screenshotBlob);
-              });
-            }
-          } catch (screenshotErr) {
-            console.log('[Voice-Terminal] Screenshot capture failed:', screenshotErr);
+          // Use the cached screenshot (captured before voice overlay appeared)
+          // and capture a fresh one for the next interaction
+          const screenCapture = lastScreenshotRef.current;
+
+          // Log screenshot usage
+          if (screenCapture) {
+            console.log('[Voice-Terminal] Using cached screenshot, size:', Math.round(screenCapture.length / 1024), 'KB');
+          } else {
+            console.log('[Voice-Terminal] No screenshot available');
           }
 
-          // Send to terminal with screenshot (will be transcribed and sent to voice agent)
-          bridgeService.sendVoiceAudioToTerminal(activeTerminal.id, base64, mimeType, screenCapture);
+          // Get terminal content for context (last 2000 chars, strip ANSI codes)
+          const terminalContent = terminalContentRef.current
+            ? stripAnsi(terminalContentRef.current).slice(-2000)
+            : undefined;
+
+          // Get current app state
+          const appState = {
+            currentTab: 'terminal',
+            projectName: project?.name,
+            projectId: currentProjectId || undefined,
+            hasPreview: false,  // Could check preview state if needed
+            fileCount: undefined  // Could count files if needed
+          };
+
+          // Send to terminal with screenshot, terminal content, and app state
+          bridgeService.sendVoiceAudioToTerminal(
+            activeTerminal.id,
+            base64,
+            mimeType,
+            screenCapture,
+            terminalContent,
+            appState
+          );
+
+          // Capture fresh screenshot for next interaction (after TTS plays, overlay may be hidden)
+          setTimeout(async () => {
+            lastScreenshotRef.current = await captureScreenshot();
+          }, 500);
         };
         reader.readAsDataURL(blob);
       }

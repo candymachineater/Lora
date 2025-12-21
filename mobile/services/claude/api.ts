@@ -765,14 +765,29 @@ class BridgeService {
     this.voiceTerminalCallbacks.delete(terminalId);
   }
 
-  sendVoiceAudioToTerminal(terminalId: string, audioData: string, mimeType: string = 'audio/wav', screenCapture?: string) {
+  sendVoiceAudioToTerminal(
+    terminalId: string,
+    audioData: string,
+    mimeType: string = 'audio/wav',
+    screenCapture?: string,
+    terminalContent?: string,
+    appState?: {
+      currentTab: string;
+      projectName?: string;
+      projectId?: string;
+      hasPreview?: boolean;
+      fileCount?: number;
+    }
+  ) {
     this.send({
       type: 'voice_terminal_audio',
       terminalId,
       audioData,
       audioMimeType: mimeType,
-      screenCapture  // Base64 PNG of phone screen for vision
-    });
+      screenCapture,  // Base64 PNG of phone screen for vision
+      terminalContent, // Recent terminal output for context
+      appState  // Current app state
+    } as any);  // Cast to any since WSMessage type doesn't include all fields
   }
 
   // Preview server management
