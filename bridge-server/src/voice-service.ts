@@ -407,7 +407,7 @@ function formatConversationHistory(memory: ConversationMemory): string {
 // ============================================================================
 
 export interface VoiceAgentResponse {
-  type: 'prompt' | 'control' | 'conversational' | 'ignore' | 'app_control' | 'working';
+  type: 'prompt' | 'control' | 'conversational' | 'ignore' | 'app_control' | 'working' | 'background_task';
   content: string;
   // Optional voice response to speak to user while executing the action
   // Use this when you want to tell the user what you're doing AND execute the action
@@ -431,6 +431,11 @@ export interface VoiceAgentResponse {
   workingState?: {
     reason: 'screenshot' | 'claude_action' | 'gathering_info' | 'analyzing';
     followUpAction?: 'take_screenshot' | 'wait_for_claude' | 'check_files';
+  };
+  // For background tasks - agent starts a Claude Code task but continues conversation
+  backgroundTask?: {
+    taskDescription: string;  // What Claude is doing (for notification later)
+    prompt: string;           // The actual prompt to send to Claude Code
   };
 }
 
@@ -739,6 +744,10 @@ Available commands:
 ### WORKING - Agent is gathering info/waiting (DO NOT YIELD FLOOR)
 {"type": "working", "content": "Status message to speak", "workingState": {"reason": "REASON", "followUpAction": "ACTION"}}
 
+**CRITICAL**: Use WORKING when you need to see something BEFORE you can respond properly:
+- User asks "what's on the screen?" → WORKING to get screenshot first
+- User asks "what did Claude say?" and you need fresh terminal output → WORKING
+
 Reasons:
 - "screenshot" - Taking/analyzing a screenshot
 - "claude_action" - Waiting for Claude Code response
@@ -751,6 +760,24 @@ Follow-up actions:
 - "check_files" - App will refresh and send file list
 
 Example: {"type": "working", "content": "One moment, let me see what's on screen.", "workingState": {"reason": "screenshot", "followUpAction": "take_screenshot"}}
+
+### BACKGROUND_TASK - Start Claude Code task while continuing conversation
+{"type": "background_task", "content": "I'll have Claude do that. Now, what were we talking about?", "backgroundTask": {"taskDescription": "Adding dark mode", "prompt": "Add dark mode toggle to the app settings"}}
+
+Use this when:
+- User explicitly says "in the background" or "come back to me" or similar
+- User wants to give you a task AND continue talking about something else
+- User says things like "ask Claude to X and then let's talk about Y"
+
+The system will:
+1. Send the prompt to Claude Code
+2. Speak your "content" response to the user immediately
+3. Return to listening for more conversation
+4. When Claude Code finishes (detected via hooks), notify the user
+
+Example flow:
+User: "Hey Lora, have Claude check what this project is about, and then come back to me - I want to tell you about my day"
+→ {"type": "background_task", "content": "I've sent that to Claude. So tell me about your day!", "backgroundTask": {"taskDescription": "checking project purpose", "prompt": "What is this project about? Give me a brief overview."}}
 
 ### APP_CONTROL - Control Lora app UI programmatically
 {"type": "app_control", "content": "Description", "appAction": {"action": "ACTION", "target": "TARGET", "params": {...}}}
@@ -816,11 +843,19 @@ Examples:
 - Vague: "build something cool"
 - New topic without context
 - Need clarification: "what kind of app?"
+- Pure conversation not about coding
 
-### When to SEND (prompt):
+### When to SEND (prompt) - BLOCKS until complete:
 - User confirmed: "yes, do it"
 - Clear request: "add a login page"
 - Follow-up: "now make it blue"
+- User wants to know what Claude does (will wait and report back)
+
+### When to use BACKGROUND_TASK:
+- User says "in the background", "come back to me", "while we talk"
+- User wants Claude to work AND continue a different conversation
+- Example: "ask Claude to add X, and let's discuss Y"
+- You send task to Claude but immediately return to user for conversation
 
 ### When to CONTROL:
 - Direct command: "press escape"
@@ -830,8 +865,9 @@ Examples:
 
 ### When to use WORKING:
 - User asks about screen: "what do you see?"
-- Before taking any action that requires feedback
-- When you need to gather information first
+- You need to SEE something before you can answer (screenshot, terminal state)
+- ONLY use when you need fresh information to respond properly
+- DO NOT use WORKING to "check the terminal" unless user specifically asked about terminal content
 
 ## RULES
 
@@ -929,51 +965,16 @@ function normalizeTranscription(text: string): string {
 }
 
 // ============================================================================
-// WAKE WORD DETECTION
+// VOICE INTERRUPT HANDLING
 // ============================================================================
 
-// Wake word patterns (case-insensitive)
-const WAKE_WORD_PATTERNS = [
-  /\bhey\s+lora\b/i,
-  /\bhey\s+laura\b/i,
-  /\bhi\s+lora\b/i,
-  /\bhi\s+laura\b/i,
-  /\bokay\s+lora\b/i,
-  /\bok\s+lora\b/i,
-  /\bhey\s+lara\b/i,
-  /\bhi\s+lara\b/i,
-];
-
 /**
- * Check if transcribed text contains a wake word
- * Returns the full transcription if wake word found, null otherwise
+ * Handle user interrupt of voice session
+ * Called when user taps the voice button to cancel
  */
-export function checkForWakeWord(transcription: string): { detected: boolean; text: string; remainder: string } {
-  const text = transcription.toLowerCase().trim();
-
-  for (const pattern of WAKE_WORD_PATTERNS) {
-    const match = text.match(pattern);
-    if (match) {
-      // Found wake word - extract the remainder after the wake word
-      const matchIndex = match.index || 0;
-      const matchLength = match[0].length;
-      const remainder = transcription.substring(matchIndex + matchLength).trim();
-
-      voiceLog('INFO', 'WakeWord', `Detected wake word in: "${transcription}"`, { remainder: remainder.substring(0, 50) });
-
-      return {
-        detected: true,
-        text: transcription,
-        remainder
-      };
-    }
-  }
-
-  return {
-    detected: false,
-    text: transcription,
-    remainder: ''
-  };
+export function handleInterrupt(terminalId: string): void {
+  voiceLog('INFO', 'INTERRUPT', `User interrupted voice session for ${terminalId}`);
+  // Any cleanup needed for the terminal's voice state can be added here
 }
 
 // ============================================================================
@@ -1113,7 +1114,15 @@ export async function textToSpeech(
 export async function processVoiceInput(
   userSpeech: string,
   sessionId?: string,
-  context?: { projectName?: string; recentOutput?: string; claudeCodeState?: string; screenCapture?: string }
+  context?: {
+    projectName?: string;
+    recentOutput?: string;
+    claudeCodeState?: string;
+    screenCapture?: string;
+    terminalContent?: string;  // Raw terminal output for observation
+    appState?: { currentTab: string; projectName?: string; projectId?: string; hasPreview?: boolean; fileCount?: number };
+    systemNote?: string;  // System instruction to inject (for follow-up after commands)
+  }
 ): Promise<VoiceAgentResponse> {
   voiceLog('AI', 'Agent', '┌─── PROCESSING VOICE INPUT ───');
   voiceLog('AI', 'Agent', `│ User said: "${userSpeech}"`);
@@ -1155,7 +1164,20 @@ export async function processVoiceInput(
     }
 
     if (context?.recentOutput) {
-      contextInfo += `\n## Recent Output (last 200 chars):\n${context.recentOutput.slice(-200)}\n`;
+      // Include more terminal output for better context (up to ~2000 tokens / 8000 chars)
+      const outputSlice = context.recentOutput.slice(-8000);
+      contextInfo += `\n## Recent Terminal Output (last ${outputSlice.length} chars):\n${outputSlice}\n`;
+    }
+
+    // Use terminalContent if provided (newer field for direct terminal observation)
+    if (context?.terminalContent && !context?.recentOutput) {
+      const outputSlice = context.terminalContent.slice(-8000);
+      contextInfo += `\n## Current Terminal Output:\n${outputSlice}\n`;
+    }
+
+    // Add system note if provided (for follow-up instructions)
+    if (context?.systemNote) {
+      contextInfo += `\n${context.systemNote}\n`;
     }
 
     voiceLog('AI', 'Agent', '│ Calling Claude Haiku 4.5...');
@@ -1467,7 +1489,7 @@ export default {
   processVoiceInput,
   summarizeForVoice,
   isVoiceServiceAvailable,
-  checkForWakeWord,
+  handleInterrupt,
   getConversationMemory,
   addConversationTurn,
   updateLastTurnWithResponse,

@@ -272,7 +272,7 @@ class BridgeService {
       case 'voice_terminal_speaking':
         if (response.terminalId && response.responseText && response.audioData) {
           const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
-          vtCallbacks?.onSpeaking?.(response.responseText, response.audioData);
+          vtCallbacks?.onSpeaking?.(response.responseText, response.audioData, response.isComplete);
         }
         break;
 
@@ -290,19 +290,21 @@ class BridgeService {
         }
         break;
 
-      case 'voice_wake_word':
-        // Wake word detected - switch from sleeping to active mode
-        if (response.terminalId) {
+      case 'voice_background_task_started':
+        if (response.terminalId && response.backgroundTaskId && response.backgroundTaskDescription) {
           const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
-          vtCallbacks?.onWakeWord?.(response.transcription || 'Hey Lora');
+          vtCallbacks?.onBackgroundTaskStarted?.(response.backgroundTaskId, response.backgroundTaskDescription);
         }
         break;
 
-      case 'voice_no_wake_word':
-        // No wake word detected - continue sleeping
-        if (response.terminalId) {
+      case 'voice_background_task_complete':
+        if (response.terminalId && response.backgroundTaskId) {
           const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
-          vtCallbacks?.onNoWakeWord?.();
+          vtCallbacks?.onBackgroundTaskComplete?.(
+            response.backgroundTaskId,
+            response.backgroundTaskDescription || 'Background task',
+            response.backgroundTaskResult || 'Completed'
+          );
         }
         break;
 
@@ -760,11 +762,11 @@ class BridgeService {
   private voiceTerminalCallbacks: Map<string, {
     onTranscription?: (text: string) => void;
     onProgress?: (text: string) => void;
-    onSpeaking?: (text: string, audioData: string) => void;
+    onSpeaking?: (text: string, audioData: string, isComplete?: boolean) => void;
     onAppControl?: (control: { action: string; target?: string; params?: Record<string, unknown> }) => void;
     onWorking?: (workingState: { reason: string; followUpAction?: string }) => void;
-    onWakeWord?: (text: string) => void; // Called when wake word "Hey Lora" is detected
-    onNoWakeWord?: () => void; // Called when no wake word was detected (continue sleeping)
+    onBackgroundTaskStarted?: (taskId: string, description: string) => void;
+    onBackgroundTaskComplete?: (taskId: string, description: string, result: string) => void;
     onEnabled?: () => void;
     onDisabled?: () => void;
     onError?: (error: string) => void;
@@ -775,11 +777,11 @@ class BridgeService {
     callbacks: {
       onTranscription?: (text: string) => void;
       onProgress?: (text: string) => void;
-      onSpeaking?: (text: string, audioData: string) => void;
+      onSpeaking?: (text: string, audioData: string, isComplete?: boolean) => void;
       onAppControl?: (control: { action: string; target?: string; params?: Record<string, unknown> }) => void;
       onWorking?: (workingState: { reason: string; followUpAction?: string }) => void;
-      onWakeWord?: (text: string) => void;
-      onNoWakeWord?: () => void;
+      onBackgroundTaskStarted?: (taskId: string, description: string) => void;
+      onBackgroundTaskComplete?: (taskId: string, description: string, result: string) => void;
       onEnabled?: () => void;
       onDisabled?: () => void;
       onError?: (error: string) => void;
@@ -808,8 +810,7 @@ class BridgeService {
       projectId?: string;
       hasPreview?: boolean;
       fileCount?: number;
-    },
-    wakeWordCheck?: boolean // If true, only check for wake word, don't process full command
+    }
   ) {
     this.send({
       type: 'voice_terminal_audio',
@@ -818,9 +819,16 @@ class BridgeService {
       audioMimeType: mimeType,
       screenCapture,  // Base64 PNG of phone screen for vision
       terminalContent, // Recent terminal output for context
-      appState,  // Current app state
-      wakeWordCheck   // Flag to indicate this is just a wake word check
+      appState  // Current app state
     } as any);  // Cast to any since WSMessage type doesn't include all fields
+  }
+
+  // Notify server that user interrupted voice session
+  sendVoiceInterrupt(terminalId: string) {
+    this.send({
+      type: 'voice_interrupt',
+      terminalId
+    });
   }
 
   // Preview server management

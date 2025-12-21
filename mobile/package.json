@@ -42,7 +42,7 @@
     "@types/react": "^19.1.10",
     "babel-plugin-transform-import-meta": "^2.3.3",
     "babel-preset-expo": "^54.0.9",
-    "typescript": "~5.9.2"
+    "typescript": "^5.4.5"
   },
   "private": true
 }

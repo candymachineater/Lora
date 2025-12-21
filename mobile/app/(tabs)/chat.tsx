@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView } from 'rea
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Terminal as TerminalIcon, X } from 'lucide-react-native';
 import { Audio, AVPlaybackStatus } from 'expo-av';
-import ViewShot, { captureRef } from 'react-native-view-shot';
+import ViewShot from 'react-native-view-shot';
 import * as Haptics from 'expo-haptics';
 import { useProjectStore, useSettingsStore, useVoiceStore } from '../../stores';
 import { bridgeService } from '../../services/claude/api';
@@ -17,24 +17,23 @@ interface TerminalSession {
   sandbox: boolean;
 }
 
-// VAD Configuration - Tuned for natural conversation flow
-// Based on OpenAI Realtime API best practices
+// VAD Configuration - Adaptive to environment noise level
 const VAD_CONFIG = {
-  // Audio level thresholds (dB)
-  SILENCE_THRESHOLD: -35, // dB level below which is considered silence (more negative = less sensitive)
-  SPEECH_THRESHOLD: -25, // dB level above which confirms speech is happening
+  // Adaptive threshold settings
+  // Speech threshold = noise floor + SPEECH_ABOVE_NOISE_DB
+  CALIBRATION_DURATION_MS: 800, // Measure ambient noise for first 800ms
+  SPEECH_ABOVE_NOISE_DB: 8, // Speech must be 8dB above noise floor (lowered from 12 for close-mic)
+  MIN_SPEECH_THRESHOLD: -30, // Never set threshold below this (too sensitive)
+  MAX_SPEECH_THRESHOLD: -10, // Never set threshold above this (too strict, was -5)
 
   // Timing settings
-  SILENCE_DURATION_MS: 2500, // 2.5s of silence after speech before stopping
-  SPEECH_START_MS: 300, // Must have 300ms of speech-level audio to confirm speaking
-  MIN_RECORDING_MS: 2000, // Minimum 2s recording before VAD kicks in (allows natural pauses)
+  SILENCE_DURATION_MS: 1500, // 1.5s of silence after speech before stopping
+  SPEECH_START_MS: 600, // Must have 600ms of sustained speech to confirm
+  MIN_RECORDING_MS: 2000, // Minimum 2s recording before VAD kicks in
   MAX_RECORDING_MS: 60000, // Maximum 60s recording to prevent runaway
   METERING_INTERVAL_MS: 100, // How often to check audio levels
-  POST_TTS_DELAY_MS: 2000, // Wait 2s after TTS ends before listening (user thinking time)
-
-  // Wake word settings
-  WAKE_WORD_MAX_MS: 5000, // Max 5s recording for wake word detection
-  ACTIVE_TIMEOUT_MS: 60000, // Return to sleeping after 60s of inactivity
+  POST_TTS_DELAY_MS: 500, // Wait 500ms after TTS ends before listening
+  NO_SPEECH_TIMEOUT_MS: 8000, // Turn off after 8s of no speech detected
 };
 
 export default function TerminalScreen() {
@@ -71,14 +70,15 @@ export default function TerminalScreen() {
 
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
+  const thinkingSoundRef = useRef<Audio.Sound | null>(null);
   const meteringIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const silenceStartRef = useRef<number | null>(null);
   const recordingStartRef = useRef<number | null>(null);
-  // Wake word tracking
-  const isWakeWordModeRef = useRef<boolean>(true); // true = sleeping mode, false = active mode
-  const activeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastActivityRef = useRef<number>(Date.now());
+  const noSpeechTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const viewShotRef = useRef<ViewShot>(null);
+  const workingScreenshotAttemptsRef = useRef<number>(0); // Limit working loop retries
+  const wasVoiceActiveRef = useRef<boolean>(false); // Track if voice was active for cleanup
+  const isTTSPlayingRef = useRef<boolean>(false); // Track if TTS is currently playing (prevent thinking sound overlap)
 
   const project = currentProject();
   const activeTerminal = terminals[activeTerminalIndex];
@@ -150,6 +150,81 @@ export default function TerminalScreen() {
     }
   }, [params.pendingPrompt, params.createNewTerminal]);
 
+  // Manage thinking/working sound based on voice status
+  // IMPORTANT: Don't start thinking sound while TTS is playing to avoid overlap
+  useEffect(() => {
+    if (voiceStatus === 'processing' || voiceStatus === 'working') {
+      // Only start thinking sound if TTS is NOT currently playing
+      if (!isTTSPlayingRef.current) {
+        playThinkingSound();
+      }
+    } else {
+      // Stop thinking sound when not in processing/working state
+      stopThinkingSound();
+    }
+
+    // Cleanup on unmount
+    return () => {
+      stopThinkingSound();
+    };
+  }, [voiceStatus]);
+
+  // Cleanup when voiceStatus changes to 'off' (e.g., from button press fallback)
+  // This ensures resources are cleaned up even if handleVoiceMicPress wasn't called
+  useEffect(() => {
+    // Track if voice was active
+    if (voiceStatus !== 'off') {
+      wasVoiceActiveRef.current = true;
+    }
+
+    // Only cleanup when transitioning from active to off
+    if (voiceStatus === 'off' && wasVoiceActiveRef.current) {
+      wasVoiceActiveRef.current = false;
+      console.log('[Voice] Status changed to off, running cleanup');
+
+      // Cleanup any active resources
+      const cleanup = async () => {
+        // Clear timeouts
+        if (noSpeechTimeoutRef.current) {
+          clearTimeout(noSpeechTimeoutRef.current);
+          noSpeechTimeoutRef.current = null;
+        }
+
+        // Stop metering
+        stopMetering();
+
+        // Stop any recording
+        if (recordingRef.current) {
+          try {
+            await recordingRef.current.stopAndUnloadAsync();
+          } catch (e) {
+            // Ignore - may already be stopped
+          }
+          recordingRef.current = null;
+        }
+
+        // Stop any audio playback
+        if (soundRef.current) {
+          try {
+            await soundRef.current.stopAsync();
+            await soundRef.current.unloadAsync();
+          } catch (e) {
+            // Ignore
+          }
+          soundRef.current = null;
+        }
+
+        // Notify server and disable voice on terminal
+        if (activeTerminal) {
+          bridgeService.sendVoiceInterrupt(activeTerminal.id);
+          bridgeService.disableVoiceOnTerminal(activeTerminal.id);
+        }
+      };
+
+      cleanup();
+    }
+  }, [voiceStatus, activeTerminal]);
+
   // Create terminal with initial prompt passed directly to Claude Code
   const createTerminalWithPrompt = async (prompt: string) => {
     if (!currentProjectId) return;
@@ -195,6 +270,45 @@ export default function TerminalScreen() {
     if (meteringIntervalRef.current) {
       clearInterval(meteringIntervalRef.current);
       meteringIntervalRef.current = null;
+    }
+  };
+
+  // Thinking/working sound - loops while processing
+  const playThinkingSound = async () => {
+    try {
+      // Stop any existing thinking sound first
+      await stopThinkingSound();
+
+      // Set audio mode for playback
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        playThroughEarpieceAndroid: false,
+      });
+
+      // Load and play the thinking sound with looping
+      const { sound } = await Audio.Sound.createAsync(
+        require('../../assets/thinking-chime.mp3'),
+        { isLooping: true, volume: 0.5 }
+      );
+      thinkingSoundRef.current = sound;
+      await sound.playAsync();
+      console.log('[Voice] Thinking sound started (looping)');
+    } catch (err) {
+      console.log('[Voice] Failed to play thinking sound:', err);
+    }
+  };
+
+  const stopThinkingSound = async () => {
+    if (thinkingSoundRef.current) {
+      try {
+        await thinkingSoundRef.current.stopAsync();
+        await thinkingSoundRef.current.unloadAsync();
+        console.log('[Voice] Thinking sound stopped');
+      } catch (err) {
+        // Ignore - sound may already be stopped
+      }
+      thinkingSoundRef.current = null;
     }
   };
 
@@ -291,10 +405,10 @@ export default function TerminalScreen() {
           console.log('[Voice-Terminal] Progress:', text);
           setVoiceProgress(text);
         },
-        onSpeaking: (text, audioData) => {
-          console.log('[Voice-Terminal] Speaking:', text);
+        onSpeaking: (text, audioData, isComplete) => {
+          console.log('[Voice-Terminal] Speaking:', text, 'isComplete:', isComplete);
           setVoiceProgress('');
-          playAudio(audioData);
+          playAudio(audioData, isComplete);
         },
         onAppControl: async (control) => {
           console.log('[Voice-Terminal] App control:', control);
@@ -447,76 +561,29 @@ export default function TerminalScreen() {
 
           // Handle follow-up actions
           if (workingState.followUpAction === 'take_screenshot') {
-            console.log('[Voice-Terminal] Taking screenshot for working state...');
-            // Capture screenshot and send it back to the agent
-            try {
-              if (viewShotRef.current) {
-                // Wait a moment for any animations/rendering to complete
-                await new Promise(resolve => setTimeout(resolve, 300));
+            // Terminal tab uses WebView (xterm.js) which cannot be captured by ViewShot
+            // This is normal - we use terminal output instead of screenshot for the Terminal tab
+            console.log('[Voice-Terminal] Using terminal output for context (Terminal tab)');
+            workingScreenshotAttemptsRef.current = 0;
 
-                // Use captureRef with explicit options for better quality
-                const screenshotUri = await captureRef(viewShotRef, {
-                  format: 'png',
-                  quality: 1,
-                  result: 'tmpfile',
-                });
-                console.log('[Voice-Terminal] Screenshot URI:', screenshotUri);
+            // Send terminal output to agent instead of screenshot
+            const terminalContent = activeTerminal?.output
+              ? activeTerminal.output.slice(-120000) // ~120k chars (~30k tokens) for context
+              : undefined;
 
-                const screenshotResponse = await fetch(screenshotUri);
-                const screenshotBlob = await screenshotResponse.blob();
-                console.log('[Voice-Terminal] Screenshot blob size:', screenshotBlob.size, 'bytes');
-
-                // Check if blob is too small (indicates capture failure)
-                if (screenshotBlob.size < 5000) {
-                  console.warn('[Voice-Terminal] Screenshot too small, may have failed');
-                }
-
-                const screenshotReader = new FileReader();
-                const screenCapture = await new Promise<string>((resolve) => {
-                  screenshotReader.onloadend = () => {
-                    const base64Screenshot = (screenshotReader.result as string).split(',')[1];
-                    console.log('[Voice-Terminal] Working screenshot base64 size:', Math.round(base64Screenshot.length / 1024), 'KB');
-                    resolve(base64Screenshot);
-                  };
-                  screenshotReader.readAsDataURL(screenshotBlob);
-                });
-
-                // Get terminal content for context
-                const terminalContent = activeTerminal?.output
-                  ? activeTerminal.output.slice(-2000)
-                  : undefined;
-
-                // Build app state
-                const appState = {
-                  currentTab: 'terminal',
-                  projectName: project?.name,
-                  projectId: project?.id,
-                };
-
-                console.log('[Voice-Terminal] Sending screenshot to agent for analysis...');
-
-                // Send a voice audio message with just the screenshot (no audio needed)
-                // The bridge service should recognize this as a screenshot-only follow-up
-                bridgeService.sendVoiceAudioToTerminal(
-                  activeTerminal.id,
-                  '', // Empty audio - this is a screenshot follow-up
-                  'audio/wav',
-                  screenCapture,
-                  terminalContent,
-                  appState
-                );
-              } else {
-                console.log('[Voice-Terminal] ViewShot ref not available for working screenshot');
-                // Go back to listening if we can't capture
-                setVoiceStatus('listening');
-                startListening();
+            bridgeService.sendVoiceAudioToTerminal(
+              activeTerminal.id,
+              '', // No audio
+              'audio/wav',
+              undefined, // No screenshot (Terminal tab uses terminal output instead)
+              terminalContent,
+              {
+                currentTab: 'terminal',
+                projectName: project?.name,
+                projectId: project?.id,
               }
-            } catch (err) {
-              console.error('[Voice-Terminal] Working screenshot failed:', err);
-              // Go back to listening on error
-              setVoiceStatus('listening');
-              startListening();
-            }
+            );
+            return;
           } else if (workingState.followUpAction === 'wait_for_claude') {
             // Agent is waiting for Claude Code response - stay in working state
             console.log('[Voice-Terminal] Waiting for Claude Code response...');
@@ -524,52 +591,38 @@ export default function TerminalScreen() {
           }
           // For other follow-up actions, stay in working state until agent responds
         },
-        onWakeWord: (text) => {
-          console.log('[Voice-Terminal] Wake word detected:', text);
-          // Haptic feedback for wake word
-          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-          // Switch to active mode
-          isWakeWordModeRef.current = false;
-          lastActivityRef.current = Date.now();
-          // If the wake word had additional content, show it as transcript
-          const wakeWords = ['hey lora', 'hey laura', 'hi lora', 'hi laura', 'okay lora', 'ok lora'];
-          let remainder = text.toLowerCase();
-          for (const ww of wakeWords) {
-            if (remainder.startsWith(ww)) {
-              remainder = text.substring(ww.length).trim();
-              break;
-            }
-          }
-          if (remainder.length > 2) {
-            setVoiceTranscript(remainder);
-            setVoiceStatus('processing');
-          } else {
-            // No additional content - start listening for command
-            setVoiceStatus('listening');
-            setTimeout(() => startListening(), 100);
-          }
+        onBackgroundTaskStarted: (taskId, description) => {
+          console.log('[Voice-Terminal] Background task started:', taskId, description);
+          // Optional: Show a subtle indicator that a background task is running
+          // For now we just log it - the agent already spoke about starting it
         },
-        onNoWakeWord: () => {
-          console.log('[Voice-Terminal] No wake word detected, continuing to sleep');
-          // Stay in sleeping mode, start listening again
-          setVoiceStatus('sleeping');
-          setTimeout(() => startWakeWordListening(), 500);
+        onBackgroundTaskComplete: async (taskId, description, result) => {
+          console.log('[Voice-Terminal] Background task complete:', taskId, description);
+
+          // Get current status - only notify if user is still in voice mode and listening
+          const currentStatus = useVoiceStore.getState().voiceStatus;
+          if (currentStatus !== 'off' && currentStatus !== 'speaking' && currentStatus !== 'processing') {
+            // Interrupt current listening to notify about completed task
+            setVoiceProgress(`✅ Claude finished: ${description}`);
+
+            // The server has already sent a summary, so we can construct a notification message
+            // and add it to the conversation context for the agent to reference
+            console.log('[Voice-Terminal] Task result summary:', result);
+          }
         },
         onEnabled: () => {
-          console.log('[Voice-Terminal] Voice mode enabled, starting active listening');
-          isWakeWordModeRef.current = false; // Start in active mode, not wake word mode
+          console.log('[Voice-Terminal] Voice mode enabled, starting listening');
           setVoiceTranscript('');
           setVoiceProgress('');
-          // Start in active listening mode immediately
-          // Only go to sleeping mode after first interaction completes
+          // Start listening immediately
           setTimeout(() => startListening(), 500);
         },
         onDisabled: () => {
           console.log('[Voice-Terminal] Voice mode disabled');
-          // Clear any active timeout
-          if (activeTimeoutRef.current) {
-            clearTimeout(activeTimeoutRef.current);
-            activeTimeoutRef.current = null;
+          // Clear any timeouts
+          if (noSpeechTimeoutRef.current) {
+            clearTimeout(noSpeechTimeoutRef.current);
+            noSpeechTimeoutRef.current = null;
           }
           setVoiceStatus('off');
         },
@@ -591,10 +644,7 @@ export default function TerminalScreen() {
           }
 
           Alert.alert('Voice Error', error);
-          // Go back to sleeping mode on error
-          setVoiceStatus('sleeping');
-          isWakeWordModeRef.current = true;
-          setTimeout(() => startWakeWordListening(), 1000);
+          setVoiceStatus('off');
         }
       });
     } else {
@@ -618,189 +668,21 @@ export default function TerminalScreen() {
     }
   }, [activeTerminal, voiceStatus, setVoiceStatus, setVoiceTranscript, setVoiceProgress]);
 
-  // Wake word listening mode - shorter timeout, only checks for "Hey Lora"
-  const startWakeWordListening = async () => {
-    console.log('[Voice] startWakeWordListening called, activeTerminal:', !!activeTerminal, 'voiceStatus:', voiceStatus);
+  // Helper to cleanup any active recording
+  const cleanupRecording = async () => {
+    stopMetering(); // Stop metering first
 
-    // Check current voice status from store directly to avoid stale closure
-    const currentStatus = useVoiceStore.getState().voiceStatus;
-    console.log('[Voice] Current status from store:', currentStatus);
-
-    if (!activeTerminal || currentStatus === 'off') {
-      console.log('[Voice] Skipping wake word listening - no terminal or voice off');
-      return;
-    }
-
-    // Stop any existing recording first to prevent conflict
     if (recordingRef.current) {
-      console.log('[Voice] Stopping existing recording before wake word listen');
+      const recordingToCleanup = recordingRef.current;
+      recordingRef.current = null; // Clear ref immediately to prevent race conditions
+
       try {
-        const status = await recordingRef.current.getStatusAsync();
-        if (status.isRecording) {
-          await recordingRef.current.stopAndUnloadAsync();
-        }
+        // Always try to stop and unload, regardless of current state
+        await recordingToCleanup.stopAndUnloadAsync();
+        console.log('[Voice] Cleaned up existing recording');
       } catch (e) {
-        console.log('[Voice] Error stopping existing recording:', e);
-      }
-      recordingRef.current = null;
-    }
-
-    // Clear metering interval if active
-    if (meteringIntervalRef.current) {
-      clearInterval(meteringIntervalRef.current);
-      meteringIntervalRef.current = null;
-    }
-
-    try {
-      console.log('[Voice] Requesting audio permissions...');
-      const { granted } = await Audio.requestPermissionsAsync();
-      if (!granted) {
-        console.log('[Voice] Audio permission denied');
-        return;
-      }
-      console.log('[Voice] Audio permission granted');
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-
-      const recording = new Audio.Recording();
-      await recording.prepareToRecordAsync({
-        ...Audio.RecordingOptionsPresets.HIGH_QUALITY,
-        isMeteringEnabled: true,
-      });
-      await recording.startAsync();
-      console.log('[Voice] Wake word recording started');
-
-      recordingRef.current = recording;
-      recordingStartRef.current = Date.now();
-      silenceStartRef.current = null;
-      isWakeWordModeRef.current = true;
-      // Don't change status - stay in 'sleeping'
-
-      let speechDetected = false;
-      let speechStartTime: number | null = null;
-
-      // VAD for wake word - shorter timeout
-      meteringIntervalRef.current = setInterval(async () => {
-        if (!recordingRef.current) return;
-
-        try {
-          const status = await recordingRef.current.getStatusAsync();
-          if (status.isRecording && status.metering !== undefined) {
-            const level = status.metering;
-            const now = Date.now();
-            const recordingDuration = now - (recordingStartRef.current || now);
-
-            // Shorter max time for wake word detection
-            if (recordingDuration > VAD_CONFIG.WAKE_WORD_MAX_MS) {
-              console.log('[Voice] Wake word max time reached, restarting...');
-              // No speech detected in 5s, restart listening
-              stopMetering();
-              if (recordingRef.current) {
-                await recordingRef.current.stopAndUnloadAsync();
-                recordingRef.current = null;
-              }
-              // Restart wake word listening if still in sleeping mode
-              const currentStatus = useVoiceStore.getState().voiceStatus;
-              if (currentStatus === 'sleeping') {
-                setTimeout(() => startWakeWordListening(), 100);
-              }
-              return;
-            }
-
-            // Detect speech - log audio level periodically for debugging
-            if (recordingDuration % 1000 < VAD_CONFIG.METERING_INTERVAL_MS) {
-              console.log('[Voice] Wake word audio level:', level.toFixed(1), 'dB');
-            }
-
-            if (level >= VAD_CONFIG.SPEECH_THRESHOLD) {
-              if (!speechStartTime) speechStartTime = now;
-              else if (!speechDetected && now - speechStartTime > VAD_CONFIG.SPEECH_START_MS) {
-                speechDetected = true;
-                console.log('[Voice] Wake word listening: Speech detected!');
-              }
-              silenceStartRef.current = null;
-            } else if (level < VAD_CONFIG.SILENCE_THRESHOLD) {
-              speechStartTime = null;
-              if (speechDetected) {
-                if (!silenceStartRef.current) {
-                  silenceStartRef.current = now;
-                } else if (now - silenceStartRef.current > 1000) { // 1s silence after speech
-                  console.log('[Voice] Wake word listening: End of speech, sending for check');
-                  await stopWakeWordListening();
-                }
-              }
-            }
-          }
-        } catch (err) {
-          // Recording may have stopped
-        }
-      }, VAD_CONFIG.METERING_INTERVAL_MS);
-
-    } catch (err) {
-      console.error('[Voice-Terminal] Failed to start wake word listening:', err);
-      // Retry after delay
-      setTimeout(() => startWakeWordListening(), 2000);
-    }
-  };
-
-  // Stop wake word listening and send audio for wake word check
-  const stopWakeWordListening = async () => {
-    stopMetering();
-
-    if (!recordingRef.current || !activeTerminal) {
-      // Restart wake word listening if still sleeping
-      if (voiceStatus === 'sleeping') {
-        setTimeout(() => startWakeWordListening(), 500);
-      }
-      return;
-    }
-
-    try {
-      await recordingRef.current.stopAndUnloadAsync();
-      const uri = recordingRef.current.getURI();
-      recordingRef.current = null;
-      silenceStartRef.current = null;
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
-        playsInSilentModeIOS: true,
-      });
-
-      if (uri) {
-        console.log('[Voice] Wake word audio captured, sending to server...');
-        const response = await fetch(uri);
-        const blob = await response.blob();
-
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          const mimeType = blob.type || 'audio/m4a';
-          console.log('[Voice] Sending wake word audio for check, size:', base64.length);
-          // Send with wakeWordCheck flag (no screenshot, terminal content, or app state needed for wake word check)
-          bridgeService.sendVoiceAudioToTerminal(
-            activeTerminal.id,
-            base64,
-            mimeType,
-            undefined,  // screenCapture
-            undefined,  // terminalContent
-            undefined,  // appState
-            true        // wakeWordCheck = true
-          );
-        };
-        reader.readAsDataURL(blob);
-      } else {
-        // No audio, restart wake word listening
-        if (voiceStatus === 'sleeping') {
-          setTimeout(() => startWakeWordListening(), 500);
-        }
-      }
-    } catch (err) {
-      console.error('[Voice-Terminal] Failed to stop wake word listening:', err);
-      if (voiceStatus === 'sleeping') {
-        setTimeout(() => startWakeWordListening(), 1000);
+        // Ignore - recording may already be stopped or not started
+        console.log('[Voice] Cleanup: recording already stopped or not started');
       }
     }
   };
@@ -813,13 +695,15 @@ export default function TerminalScreen() {
       return;
     }
 
-    // Mark as active mode
-    isWakeWordModeRef.current = false;
-    lastActivityRef.current = Date.now();
-
     // Get current status from store to avoid stale closure
     const currentStatus = useVoiceStore.getState().voiceStatus;
     console.log('[Voice] Current status from store:', currentStatus);
+
+    // Clear any no-speech timeout when starting to listen
+    if (noSpeechTimeoutRef.current) {
+      clearTimeout(noSpeechTimeoutRef.current);
+      noSpeechTimeoutRef.current = null;
+    }
 
     // Interrupt if speaking
     if (currentStatus === 'speaking' && soundRef.current) {
@@ -830,24 +714,7 @@ export default function TerminalScreen() {
     }
 
     // Stop any existing recording first to prevent conflict
-    if (recordingRef.current) {
-      console.log('[Voice] Stopping existing recording before starting new one');
-      try {
-        const status = await recordingRef.current.getStatusAsync();
-        if (status.isRecording) {
-          await recordingRef.current.stopAndUnloadAsync();
-        }
-      } catch (e) {
-        console.log('[Voice] Error stopping existing recording:', e);
-      }
-      recordingRef.current = null;
-    }
-
-    // Clear metering interval if active
-    if (meteringIntervalRef.current) {
-      clearInterval(meteringIntervalRef.current);
-      meteringIntervalRef.current = null;
-    }
+    await cleanupRecording();
 
     try {
       console.log('[Voice] Requesting audio permissions for listening...');
@@ -880,11 +747,15 @@ export default function TerminalScreen() {
       console.log('[Voice] Status set to listening');
       setAudioLevel(0);
 
-      // Track if we've detected actual speech (not just noise)
+      // Adaptive VAD state
       let speechDetected = false;
       let speechStartTime: number | null = null;
+      let calibrationSamples: number[] = [];
+      let noiseFloor: number | null = null;
+      let speechThreshold: number | null = null;
+      let lastLogTime = 0; // For periodic level logging
 
-      // VAD monitoring - Based on OpenAI Realtime best practices
+      // VAD monitoring with adaptive calibration
       meteringIntervalRef.current = setInterval(async () => {
         if (!recordingRef.current) return;
 
@@ -898,6 +769,45 @@ export default function TerminalScreen() {
             const now = Date.now();
             const recordingDuration = now - (recordingStartRef.current || now);
 
+            // CALIBRATION PHASE: Collect ambient noise samples
+            if (recordingDuration < VAD_CONFIG.CALIBRATION_DURATION_MS) {
+              calibrationSamples.push(level);
+              return; // Don't do speech detection during calibration
+            }
+
+            // Calculate noise floor once calibration is complete
+            if (noiseFloor === null && calibrationSamples.length > 0) {
+              // Use 25th percentile as noise floor (more robust to spikes than median)
+              const sorted = [...calibrationSamples].sort((a, b) => a - b);
+              const p25Index = Math.floor(sorted.length * 0.25);
+              noiseFloor = sorted[p25Index];
+
+              // Set speech threshold relative to noise floor
+              const rawThreshold = noiseFloor + VAD_CONFIG.SPEECH_ABOVE_NOISE_DB;
+              speechThreshold = Math.max(
+                VAD_CONFIG.MIN_SPEECH_THRESHOLD,
+                Math.min(VAD_CONFIG.MAX_SPEECH_THRESHOLD, rawThreshold)
+              );
+
+              const silenceThresh = noiseFloor + 5;
+              console.log(`[VAD] Calibrated! Noise floor: ${noiseFloor.toFixed(1)} dB (p25 of ${calibrationSamples.length} samples)`);
+              console.log(`[VAD] Thresholds - Speech: >${speechThreshold.toFixed(1)} dB, Silence: <${silenceThresh.toFixed(1)} dB`);
+            }
+
+            // Skip if not calibrated yet
+            if (speechThreshold === null) return;
+
+            // Silence threshold: when audio drops back to near noise floor levels
+            // Use noise floor + 5dB as "silence" (halfway between noise and speech)
+            const silenceThreshold = noiseFloor! + 5;
+
+            // Log audio level every 500ms for debugging
+            if (now - lastLogTime > 500) {
+              lastLogTime = now;
+              const status = level >= speechThreshold ? '🔊 SPEECH' : level < silenceThreshold ? '🔇 silence' : '📢 ambient';
+              console.log(`[VAD] Level: ${level.toFixed(1)} dB ${status} (threshold: ${speechThreshold.toFixed(1)})`);
+            }
+
             // Check for max recording time
             if (recordingDuration > VAD_CONFIG.MAX_RECORDING_MS) {
               console.log('[Voice-Terminal] VAD: Max recording time reached');
@@ -905,24 +815,28 @@ export default function TerminalScreen() {
               return;
             }
 
-            // Detect speech start (audio above speech threshold)
-            if (level >= VAD_CONFIG.SPEECH_THRESHOLD) {
+            // Detect speech start (audio above adaptive threshold)
+            if (level >= speechThreshold) {
+              // Clear the no-speech timeout as soon as any speech is detected
+              // This prevents the 8s auto-off from firing while user is speaking
+              if (noSpeechTimeoutRef.current) {
+                console.log('[VAD] Speech detected, clearing no-speech timeout');
+                clearTimeout(noSpeechTimeoutRef.current);
+                noSpeechTimeoutRef.current = null;
+              }
+
               if (!speechStartTime) {
                 speechStartTime = now;
               } else if (!speechDetected && now - speechStartTime > VAD_CONFIG.SPEECH_START_MS) {
-                // Confirmed speech after sustained audio above threshold
                 speechDetected = true;
-                console.log('[Voice-Terminal] VAD: Speech confirmed');
+                console.log(`[Voice-Terminal] VAD: Speech confirmed (level: ${level.toFixed(1)} dB > threshold: ${speechThreshold.toFixed(1)} dB)`);
               }
-              // Reset silence counter when speech detected
               silenceStartRef.current = null;
             }
             // Check for silence (only after speech has been detected)
-            else if (level < VAD_CONFIG.SILENCE_THRESHOLD) {
-              // Reset speech start if we go below silence threshold
+            else if (level < silenceThreshold) {
               speechStartTime = null;
 
-              // Only start counting silence after we've confirmed speech
               if (speechDetected) {
                 if (!silenceStartRef.current) {
                   silenceStartRef.current = now;
@@ -932,10 +846,8 @@ export default function TerminalScreen() {
                 }
               }
             }
-            // Audio between thresholds - ambiguous, maintain current state
             else {
-              speechStartTime = null; // Not clearly speech
-              // Don't reset silence timer for ambiguous levels
+              speechStartTime = null;
             }
           }
         } catch (err) {
@@ -945,27 +857,24 @@ export default function TerminalScreen() {
 
     } catch (err) {
       console.error('[Voice-Terminal] Failed to start listening:', err);
-      // Go back to sleeping mode on error
-      setVoiceStatus('sleeping');
-      isWakeWordModeRef.current = true;
-      setTimeout(() => startWakeWordListening(), 1000);
+      setVoiceStatus('off');
     }
   };
 
-  const stopListening = async () => {
+  const stopListening = async (sendAudio: boolean = true) => {
     stopMetering();
     setAudioLevel(0);
 
     if (!recordingRef.current || !activeTerminal) {
-      // Go back to sleeping mode
-      setVoiceStatus('sleeping');
-      isWakeWordModeRef.current = true;
-      setTimeout(() => startWakeWordListening(), 500);
       return;
     }
 
     try {
-      setVoiceStatus('processing');
+      if (sendAudio) {
+        setVoiceStatus('processing');
+        // Reset working screenshot counter for new user interaction
+        workingScreenshotAttemptsRef.current = 0;
+      }
 
       await recordingRef.current.stopAndUnloadAsync();
       const uri = recordingRef.current.getURI();
@@ -973,12 +882,15 @@ export default function TerminalScreen() {
       recordingStartRef.current = null;
       silenceStartRef.current = null;
 
+      // Reset audio mode for playback - add delay to ensure iOS audio system resets
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: false,
         playsInSilentModeIOS: true,
+        playThroughEarpieceAndroid: false,
       });
+      await new Promise(resolve => setTimeout(resolve, 100));
 
-      if (uri) {
+      if (uri && sendAudio) {
         const response = await fetch(uri);
         const blob = await response.blob();
 
@@ -987,40 +899,16 @@ export default function TerminalScreen() {
           const base64 = (reader.result as string).split(',')[1];
           const mimeType = blob.type || 'audio/m4a';
 
-          // Capture screenshot of current screen for voice agent vision
-          let screenCapture: string | undefined;
-          try {
-            if (viewShotRef.current) {
-              console.log('[Voice-Terminal] Capturing screenshot...');
-              // Use captureRef with explicit options for better quality
-              const screenshotUri = await captureRef(viewShotRef, {
-                format: 'png',
-                quality: 1,
-                result: 'tmpfile',
-              });
-              console.log('[Voice-Terminal] Screenshot URI:', screenshotUri);
-              const screenshotResponse = await fetch(screenshotUri);
-              const screenshotBlob = await screenshotResponse.blob();
-              console.log('[Voice-Terminal] Screenshot blob size:', screenshotBlob.size, 'bytes');
-              const screenshotReader = new FileReader();
-              screenCapture = await new Promise<string>((resolve) => {
-                screenshotReader.onloadend = () => {
-                  const base64Screenshot = (screenshotReader.result as string).split(',')[1];
-                  console.log('[Voice-Terminal] Screenshot base64 size:', Math.round(base64Screenshot.length / 1024), 'KB');
-                  resolve(base64Screenshot);
-                };
-                screenshotReader.readAsDataURL(screenshotBlob);
-              });
-            } else {
-              console.log('[Voice-Terminal] ViewShot ref not available');
-            }
-          } catch (screenshotErr) {
-            console.log('[Voice-Terminal] Screenshot capture failed:', screenshotErr);
-          }
+          // Note: Screenshot capture is skipped on Terminal tab because the Terminal
+          // component uses a WebView (xterm.js), and React Native ViewShot cannot
+          // capture WebView content on iOS. Instead, we rely on terminal output text.
+          // Screenshots would work on other tabs that use native React Native views.
+          console.log('[Voice-Terminal] Skipping screenshot (Terminal uses WebView which cannot be captured)');
+          const screenCapture: string | undefined = undefined;
 
-          // Get terminal content (last 2000 chars for context)
+          // Get terminal content (~120k chars for context, roughly 30k tokens)
           const terminalContent = activeTerminal?.output
-            ? activeTerminal.output.slice(-2000)
+            ? activeTerminal.output.slice(-120000)
             : undefined;
 
           // Build app state for context
@@ -1028,8 +916,8 @@ export default function TerminalScreen() {
             currentTab: 'terminal',
             projectName: project?.name,
             projectId: project?.id,
-            hasPreview: false, // TODO: check preview status
-            fileCount: 0, // TODO: get file count
+            hasPreview: false,
+            fileCount: 0,
           };
 
           // Send to terminal with screenshot, terminal content, and app state
@@ -1046,31 +934,51 @@ export default function TerminalScreen() {
       }
     } catch (err) {
       console.error('[Voice-Terminal] Failed to stop listening:', err);
-      // Go back to sleeping mode on error
-      setVoiceStatus('sleeping');
-      isWakeWordModeRef.current = true;
-      setTimeout(() => startWakeWordListening(), 1000);
+      setVoiceStatus('off');
     }
   };
 
-  const playAudio = async (base64Audio: string) => {
+  // isComplete=true means this is the final TTS response, return to listening after
+  // isComplete=false/undefined means more processing is coming (stay in working state)
+  const playAudio = async (base64Audio: string, isComplete?: boolean) => {
     try {
-      setVoiceStatus('speaking');
+      // Mark TTS as playing FIRST - prevents thinking sound from starting
+      isTTSPlayingRef.current = true;
+
+      // Stop thinking sound before TTS plays
+      await stopThinkingSound();
+
+      // Set status to 'speaking' for final responses, or stay in 'working' for interim
+      if (isComplete) {
+        console.log('[Voice] Playing final TTS response (will return to listening after)');
+        setVoiceStatus('speaking');
+      } else {
+        console.log('[Voice] Playing interim TTS (staying in working state)');
+        // Don't change status - stay in working or whatever current state is
+      }
 
       if (soundRef.current) {
         await soundRef.current.unloadAsync();
       }
 
-      // Always play through speaker (not earpiece) on both iOS and Android
+      // Clear any existing no-speech timeout
+      if (noSpeechTimeoutRef.current) {
+        clearTimeout(noSpeechTimeoutRef.current);
+        noSpeechTimeoutRef.current = null;
+      }
+
+      // CRITICAL: Set audio mode for playback BEFORE creating sound
+      // allowsRecordingIOS: false must be set to route audio to speaker
       await Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
+        allowsRecordingIOS: false,        // Disable recording mode to enable speaker output
         playsInSilentModeIOS: true,
         staysActiveInBackground: false,
         shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
-        // iOS-specific: use speaker for playback
-        interruptionModeIOS: 1, // INTERRUPTION_MODE_IOS_DO_NOT_MIX
+        playThroughEarpieceAndroid: false,  // Force speaker on Android
       });
+
+      // Small delay to let iOS audio system reset from recording mode
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       const audioUri = `data:audio/mp3;base64,${base64Audio}`;
       const { sound } = await Audio.Sound.createAsync(
@@ -1083,45 +991,58 @@ export default function TerminalScreen() {
       sound.setOnPlaybackStatusUpdate((playbackStatus: AVPlaybackStatus) => {
         if (playbackStatus.isLoaded && playbackStatus.didJustFinish) {
           soundRef.current = null;
-          // After speaking, continue in active listening mode
-          // Only go to sleep after 1 minute of inactivity
-          console.log('[Voice] TTS finished, continuing active listening');
-          lastActivityRef.current = Date.now();
-          isWakeWordModeRef.current = false;
+          // TTS finished - clear the flag so thinking sound can play again if needed
+          isTTSPlayingRef.current = false;
 
-          // Start inactivity timer - go to sleep after 1 minute
-          if (activeTimeoutRef.current) {
-            clearTimeout(activeTimeoutRef.current);
-          }
-          activeTimeoutRef.current = setTimeout(() => {
+          console.log('[Voice] TTS finished, isComplete:', isComplete);
+
+          // If this is NOT the final response (isComplete=false/undefined), stay in current state
+          // The server will send another response when Claude finishes
+          if (!isComplete) {
+            console.log('[Voice] Interim TTS finished, waiting for final response from server');
+            // Start thinking sound now since TTS is done (if we're in working state)
             const currentStatus = useVoiceStore.getState().voiceStatus;
-            console.log('[Voice] Inactivity timeout, current status:', currentStatus);
-            if (currentStatus !== 'off') {
-              console.log('[Voice] Going to sleep mode after inactivity');
-              setVoiceStatus('sleeping');
-              isWakeWordModeRef.current = true;
-              startWakeWordListening();
+            if (currentStatus === 'working' || currentStatus === 'processing') {
+              playThinkingSound();
             }
-          }, VAD_CONFIG.ACTIVE_TIMEOUT_MS);
+            return;
+          }
 
-          // Continue listening after a short delay
+          console.log('[Voice] Final TTS finished, continuing active listening');
+
+          // Start listening after a short delay
           setTimeout(() => {
             const currentStatus = useVoiceStore.getState().voiceStatus;
             if (currentStatus !== 'off' && currentStatus !== 'listening') {
               startListening();
+
+              // Set 8s no-speech timeout to auto turn off
+              noSpeechTimeoutRef.current = setTimeout(() => {
+                const status = useVoiceStore.getState().voiceStatus;
+                if (status === 'listening') {
+                  console.log('[Voice] No speech for 8s, turning off');
+                  stopListening(false);  // Don't send audio
+                  setVoiceStatus('off');
+                  // Notify server of interrupt
+                  if (activeTerminal) {
+                    bridgeService.sendVoiceInterrupt(activeTerminal.id);
+                  }
+                }
+              }, VAD_CONFIG.NO_SPEECH_TIMEOUT_MS);
             }
           }, VAD_CONFIG.POST_TTS_DELAY_MS);
         }
       });
     } catch (err) {
       console.error('[Voice] Failed to play audio:', err);
-      // Continue listening on error
-      isWakeWordModeRef.current = false;
+      // Clear TTS playing flag on error
+      isTTSPlayingRef.current = false;
+      // Try to continue listening on error
       setTimeout(() => startListening(), 1000);
     }
   };
 
-  const handleVoiceMicPress = useCallback(() => {
+  const handleVoiceMicPress = useCallback(async () => {
     // Haptic feedback
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
@@ -1129,31 +1050,52 @@ export default function TerminalScreen() {
     const currentStatus = useVoiceStore.getState().voiceStatus;
     console.log('[Voice] Mic press, current status:', currentStatus);
 
-    if (currentStatus === 'listening') {
-      // TAP while listening → send what was recorded
-      console.log('[Voice] Stopping listening early');
-      stopListening();
-    } else if (currentStatus === 'sleeping') {
-      // TAP while sleeping → wake up and start listening
-      console.log('[Voice] Waking from sleep');
-      isWakeWordModeRef.current = false;
-      lastActivityRef.current = Date.now();
-      // Stop any current wake word recording
-      stopMetering();
-      if (recordingRef.current) {
-        recordingRef.current.stopAndUnloadAsync().catch(() => {});
-        recordingRef.current = null;
+    // Any active state → interrupt and turn off
+    if (currentStatus !== 'off') {
+      console.log('[Voice] Interrupting voice mode');
+
+      // Clear TTS playing flag
+      isTTSPlayingRef.current = false;
+
+      // Clear timeouts
+      if (noSpeechTimeoutRef.current) {
+        clearTimeout(noSpeechTimeoutRef.current);
+        noSpeechTimeoutRef.current = null;
       }
-      startListening();
-    } else if (currentStatus === 'speaking') {
-      // TAP while speaking → interrupt and start listening
-      console.log('[Voice] Interrupting speech');
-      startListening();
-    } else if (currentStatus === 'processing') {
-      // TAP while processing → do nothing, wait for response
-      console.log('[Voice] Processing, please wait...');
+
+      // Stop any audio playback (TTS)
+      if (soundRef.current) {
+        try {
+          await soundRef.current.stopAsync();
+          await soundRef.current.unloadAsync();
+        } catch (e) {
+          // Ignore
+        }
+        soundRef.current = null;
+      }
+
+      // Stop thinking sound
+      await stopThinkingSound();
+
+      // Stop any recording
+      await cleanupRecording();
+
+      // Notify server of interruption
+      if (activeTerminal) {
+        bridgeService.sendVoiceInterrupt(activeTerminal.id);
+      }
+
+      // Turn off voice mode
+      setVoiceStatus('off');
+      setVoiceTranscript('');
+      setVoiceProgress('');
+
+      // Disable voice on terminal
+      if (activeTerminal) {
+        bridgeService.disableVoiceOnTerminal(activeTerminal.id);
+      }
     }
-  }, []);
+  }, [activeTerminal, setVoiceStatus, setVoiceTranscript, setVoiceProgress]);
 
   // Register voice functions with store for tab bar access
   useEffect(() => {
@@ -1212,25 +1154,13 @@ export default function TerminalScreen() {
 
   return (
     <ViewShot ref={viewShotRef} style={styles.container} options={{ format: 'png', quality: 0.8 }}>
-      {/* Voice Status Bar - compact display when voice is active */}
-      {voiceStatus !== 'off' && (voiceTranscript || voiceProgress || voiceStatus === 'working') && (
+      {/* Voice Transcript Bar - show what user said (status moved to voice button) */}
+      {voiceStatus !== 'off' && voiceTranscript && (
         <View style={styles.voiceStatusBar}>
-          {voiceTranscript && (
-            <Text style={styles.voiceStatusBarText} numberOfLines={2}>
-              <Text style={styles.voiceStatusBarLabel}>You: </Text>
-              {voiceTranscript}
-            </Text>
-          )}
-          {voiceProgress && (
-            <Text style={styles.voiceStatusBarProgress} numberOfLines={1}>
-              {voiceProgress}
-            </Text>
-          )}
-          {voiceStatus === 'working' && !voiceProgress && (
-            <Text style={styles.voiceStatusBarProgress} numberOfLines={1}>
-              ⏳ Working...
-            </Text>
-          )}
+          <Text style={styles.voiceStatusBarText} numberOfLines={2}>
+            <Text style={styles.voiceStatusBarLabel}>You: </Text>
+            {voiceTranscript}
+          </Text>
         </View>
       )}
 
@@ -1291,12 +1221,6 @@ const styles = StyleSheet.create({
   voiceStatusBarLabel: {
     color: '#22C55E',
     fontWeight: '600',
-  },
-  voiceStatusBarProgress: {
-    color: colors.brandTiger,
-    fontSize: 12,
-    marginTop: 4,
-    fontWeight: '500',
   },
   tabsContainer: {
     flexDirection: 'row',

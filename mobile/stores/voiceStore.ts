@@ -1,10 +1,11 @@
 import { create } from 'zustand';
 
-// Voice status with wake word support
-// 'sleeping' = waiting for wake word "Hey Lora"
+// Voice status
 // 'listening' = actively recording user speech
+// 'processing' = sending to server, waiting for response
+// 'speaking' = playing TTS response
 // 'working' = agent is gathering info (screenshot, waiting for Claude)
-export type VoiceStatus = 'off' | 'sleeping' | 'listening' | 'processing' | 'speaking' | 'working';
+export type VoiceStatus = 'off' | 'listening' | 'processing' | 'speaking' | 'working';
 
 interface VoiceState {
   voiceStatus: VoiceStatus;
