@@ -117,7 +117,17 @@ interface StreamResponse {
   voiceEnabled?: boolean; // Voice mode status for terminal
   // App control from voice agent
   appControl?: {
-    action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
+    action:
+      | 'navigate'           // Go to a tab (target: projects, terminal, editor, preview, settings)
+      | 'take_screenshot'    // Capture current screen
+      | 'send_input'         // Send text to terminal (params.text)
+      | 'send_control'       // Send control key (params.key: ESCAPE, CTRL_C, UP, DOWN, etc)
+      | 'new_terminal'       // Create new terminal tab
+      | 'close_terminal'     // Close current terminal tab
+      | 'switch_terminal'    // Switch terminal (params.index or params.direction: next/prev)
+      | 'refresh_files'      // Refresh file list in editor
+      | 'show_settings'      // Open settings modal
+      | 'scroll';            // Scroll terminal (params.direction: up/down, params.count)
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
   };

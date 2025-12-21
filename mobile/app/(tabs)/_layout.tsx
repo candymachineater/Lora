@@ -15,6 +15,7 @@ const VOICE_COLORS = {
   listening: colors.success,        // Green - listening to you now
   processing: colors.success,       // Green - thinking (same as listening for simplicity)
   speaking: colors.brandSapphire,   // Blue - Lora is talking
+  working: colors.brandTiger,       // Orange - agent is gathering info (screenshot, etc)
 };
 
 // Voice button component for center tab

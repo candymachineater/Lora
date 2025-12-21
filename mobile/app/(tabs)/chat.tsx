@@ -296,26 +296,139 @@ export default function TerminalScreen() {
           setVoiceProgress('');
           playAudio(audioData);
         },
-        onAppControl: (control) => {
+        onAppControl: async (control) => {
           console.log('[Voice-Terminal] App control:', control);
+          const params = control.params as Record<string, unknown> | undefined;
+
           // Handle app control actions from voice agent
-          if (control.action === 'navigate' && control.target) {
-            // Navigate to different tabs
-            const tabMap: Record<string, string> = {
-              'terminal': '/(tabs)/chat',
-              'chat': '/(tabs)/chat',
-              'preview': '/(tabs)/preview',
-              'projects': '/(tabs)',
-              'voice': '/(tabs)/voice',
-              'editor': '/(tabs)/editor',
-            };
-            const route = tabMap[control.target.toLowerCase()];
-            if (route) {
-              router.push(route as any);
-            }
-          } else if (control.action === 'take_screenshot') {
-            // Voice agent requested a fresh screenshot - will be sent with next audio
-            console.log('[Voice-Terminal] Screenshot requested by agent');
+          switch (control.action) {
+            case 'navigate':
+              // Navigate to different tabs
+              if (control.target) {
+                const tabMap: Record<string, string> = {
+                  'terminal': '/(tabs)/chat',
+                  'chat': '/(tabs)/chat',
+                  'preview': '/(tabs)/preview',
+                  'projects': '/(tabs)',
+                  'editor': '/(tabs)/editor',
+                  'settings': '/settings',
+                };
+                const route = tabMap[control.target.toLowerCase()];
+                if (route) {
+                  router.push(route as any);
+                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                }
+              }
+              break;
+
+            case 'take_screenshot':
+              // Voice agent requested a fresh screenshot - capture and log it
+              console.log('[Voice-Terminal] Screenshot requested by agent');
+              if (viewShotRef.current?.capture) {
+                try {
+                  const uri = await viewShotRef.current.capture();
+                  console.log('[Voice-Terminal] Screenshot captured on demand:', uri);
+                } catch (err) {
+                  console.log('[Voice-Terminal] On-demand screenshot failed:', err);
+                }
+              }
+              break;
+
+            case 'send_input':
+              // Send text input to terminal
+              if (params?.text && activeTerminal) {
+                bridgeService.sendTerminalInput(activeTerminal.id, String(params.text));
+                console.log('[Voice-Terminal] Sent input to terminal:', params.text);
+              }
+              break;
+
+            case 'send_control':
+              // Send control key to terminal (escape, ctrl+c, arrows, etc)
+              if (params?.key && activeTerminal) {
+                const key = String(params.key).toUpperCase();
+                let input = '';
+                switch (key) {
+                  case 'ESCAPE': input = '\x1b'; break;
+                  case 'CTRL_C': input = '\x03'; break;
+                  case 'CTRL_D': input = '\x04'; break;
+                  case 'ENTER': input = '\r'; break;
+                  case 'TAB': input = '\t'; break;
+                  case 'UP': input = '\x1b[A'; break;
+                  case 'DOWN': input = '\x1b[B'; break;
+                  case 'LEFT': input = '\x1b[C'; break;
+                  case 'RIGHT': input = '\x1b[D'; break;
+                  case 'YES': input = 'y\r'; break;
+                  case 'NO': input = 'n\r'; break;
+                }
+                if (input) {
+                  bridgeService.sendTerminalInput(activeTerminal.id, input);
+                  console.log('[Voice-Terminal] Sent control key:', key);
+                }
+              }
+              break;
+
+            case 'new_terminal':
+              // Create a new terminal tab
+              createTerminal();
+              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+              console.log('[Voice-Terminal] Creating new terminal');
+              break;
+
+            case 'close_terminal':
+              // Close current terminal
+              if (terminals.length > 1 && activeTerminalIndex >= 0) {
+                closeTerminal(activeTerminalIndex);
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                console.log('[Voice-Terminal] Closed current terminal');
+              }
+              break;
+
+            case 'switch_terminal':
+              // Switch to a specific terminal tab (by index or direction)
+              if (params?.index !== undefined) {
+                const idx = Number(params.index);
+                if (idx >= 0 && idx < terminals.length) {
+                  setActiveTerminalIndex(idx);
+                }
+              } else if (params?.direction === 'next') {
+                setActiveTerminalIndex((prev) => (prev + 1) % terminals.length);
+              } else if (params?.direction === 'prev') {
+                setActiveTerminalIndex((prev) => (prev - 1 + terminals.length) % terminals.length);
+              }
+              break;
+
+            case 'toggle_voice':
+              // Toggle voice mode on/off
+              console.log('[Voice-Terminal] Voice toggle requested');
+              // Don't actually toggle - just acknowledge (agent shouldn't turn itself off)
+              break;
+
+            case 'refresh_files':
+              // Refresh file list - navigate to editor to trigger refresh
+              router.push('/(tabs)/editor' as any);
+              console.log('[Voice-Terminal] Refreshing files by navigating to editor');
+              break;
+
+            case 'show_settings':
+              // Open settings modal
+              router.push('/settings' as any);
+              console.log('[Voice-Terminal] Opening settings');
+              break;
+
+            case 'scroll':
+              // Scroll terminal (handled by sending Page Up/Down)
+              if (params?.direction && activeTerminal) {
+                const scrollInput = params.direction === 'up' ? '\x1b[5~' : '\x1b[6~'; // Page Up/Down
+                const count = Number(params.count) || 1;
+                for (let i = 0; i < count; i++) {
+                  bridgeService.sendTerminalInput(activeTerminal.id, scrollInput);
+                }
+                console.log('[Voice-Terminal] Scrolled', params.direction, count, 'times');
+              }
+              break;
+
+            default:
+              console.log('[Voice-Terminal] Unknown app control action:', control.action);
           }
         },
         onWakeWord: (text) => {
@@ -559,13 +672,15 @@ export default function TerminalScreen() {
           const base64 = (reader.result as string).split(',')[1];
           const mimeType = blob.type || 'audio/m4a';
           console.log('[Voice] Sending wake word audio for check, size:', base64.length);
-          // Send with wakeWordCheck flag
+          // Send with wakeWordCheck flag (no screenshot, terminal content, or app state needed for wake word check)
           bridgeService.sendVoiceAudioToTerminal(
             activeTerminal.id,
             base64,
             mimeType,
-            undefined, // no screenshot for wake word
-            true // wakeWordCheck = true
+            undefined,  // screenCapture
+            undefined,  // terminalContent
+            undefined,  // appState
+            true        // wakeWordCheck = true
           );
         };
         reader.readAsDataURL(blob);
@@ -747,6 +862,7 @@ export default function TerminalScreen() {
           let screenCapture: string | undefined;
           try {
             if (viewShotRef.current?.capture) {
+              console.log('[Voice-Terminal] Capturing screenshot...');
               const screenshotUri = await viewShotRef.current.capture();
               const screenshotResponse = await fetch(screenshotUri);
               const screenshotBlob = await screenshotResponse.blob();
@@ -754,17 +870,41 @@ export default function TerminalScreen() {
               screenCapture = await new Promise<string>((resolve) => {
                 screenshotReader.onloadend = () => {
                   const base64Screenshot = (screenshotReader.result as string).split(',')[1];
+                  console.log('[Voice-Terminal] Screenshot captured, size:', Math.round(base64Screenshot.length / 1024), 'KB');
                   resolve(base64Screenshot);
                 };
                 screenshotReader.readAsDataURL(screenshotBlob);
               });
+            } else {
+              console.log('[Voice-Terminal] ViewShot ref not available');
             }
           } catch (screenshotErr) {
             console.log('[Voice-Terminal] Screenshot capture failed:', screenshotErr);
           }
 
-          // Send to terminal with screenshot (will be transcribed and sent to voice agent)
-          bridgeService.sendVoiceAudioToTerminal(activeTerminal.id, base64, mimeType, screenCapture);
+          // Get terminal content (last 2000 chars for context)
+          const terminalContent = activeTerminal?.output
+            ? activeTerminal.output.slice(-2000)
+            : undefined;
+
+          // Build app state for context
+          const appState = {
+            currentTab: 'terminal',
+            projectName: project?.name,
+            projectId: project?.id,
+            hasPreview: false, // TODO: check preview status
+            fileCount: 0, // TODO: get file count
+          };
+
+          // Send to terminal with screenshot, terminal content, and app state
+          bridgeService.sendVoiceAudioToTerminal(
+            activeTerminal.id,
+            base64,
+            mimeType,
+            screenCapture,
+            terminalContent,
+            appState
+          );
         };
         reader.readAsDataURL(blob);
       }
