@@ -431,6 +431,77 @@ export default function TerminalScreen() {
               console.log('[Voice-Terminal] Unknown app control action:', control.action);
           }
         },
+        onWorking: async (workingState) => {
+          console.log('[Voice-Terminal] Working state:', workingState);
+          // Agent is gathering info - don't return to listening yet
+          setVoiceStatus('working');
+
+          // Handle follow-up actions
+          if (workingState.followUpAction === 'take_screenshot') {
+            console.log('[Voice-Terminal] Taking screenshot for working state...');
+            // Capture screenshot and send it back to the agent
+            try {
+              if (viewShotRef.current?.capture) {
+                const screenshotUri = await viewShotRef.current.capture();
+                const screenshotResponse = await fetch(screenshotUri);
+                const screenshotBlob = await screenshotResponse.blob();
+                const screenshotReader = new FileReader();
+                const screenCapture = await new Promise<string>((resolve) => {
+                  screenshotReader.onloadend = () => {
+                    const base64Screenshot = (screenshotReader.result as string).split(',')[1];
+                    console.log('[Voice-Terminal] Working screenshot captured, size:', Math.round(base64Screenshot.length / 1024), 'KB');
+                    resolve(base64Screenshot);
+                  };
+                  screenshotReader.readAsDataURL(screenshotBlob);
+                });
+
+                // Get terminal content for context
+                const terminalContent = activeTerminal?.output
+                  ? activeTerminal.output.slice(-2000)
+                  : undefined;
+
+                // Build app state
+                const appState = {
+                  currentTab: 'terminal',
+                  projectName: project?.name,
+                  projectId: project?.id,
+                };
+
+                // Create a minimal audio buffer to trigger the agent with the screenshot
+                // The agent is waiting for a follow-up with the screenshot
+                // We'll send a special "screenshot ready" signal as empty audio
+                // Actually, we need to send a proper message - let's use a text-based approach
+                console.log('[Voice-Terminal] Sending screenshot to agent for analysis...');
+
+                // Send a voice audio message with just the screenshot (no audio needed)
+                // The bridge service should recognize this as a screenshot-only follow-up
+                bridgeService.sendVoiceAudioToTerminal(
+                  activeTerminal.id,
+                  '', // Empty audio - this is a screenshot follow-up
+                  'audio/wav',
+                  screenCapture,
+                  terminalContent,
+                  appState
+                );
+              } else {
+                console.log('[Voice-Terminal] ViewShot ref not available for working screenshot');
+                // Go back to listening if we can't capture
+                setVoiceStatus('listening');
+                startListening();
+              }
+            } catch (err) {
+              console.error('[Voice-Terminal] Working screenshot failed:', err);
+              // Go back to listening on error
+              setVoiceStatus('listening');
+              startListening();
+            }
+          } else if (workingState.followUpAction === 'wait_for_claude') {
+            // Agent is waiting for Claude Code response - stay in working state
+            console.log('[Voice-Terminal] Waiting for Claude Code response...');
+            // The response will come through normal terminal output handling
+          }
+          // For other follow-up actions, stay in working state until agent responds
+        },
         onWakeWord: (text) => {
           console.log('[Voice-Terminal] Wake word detected:', text);
           // Haptic feedback for wake word

@@ -1156,7 +1156,7 @@ wss.on('connection', (ws: WebSocket) => {
         return;
       }
 
-      if (message.type === 'voice_terminal_audio' && message.terminalId && message.audioData) {
+      if (message.type === 'voice_terminal_audio' && message.terminalId) {
         const session = terminals.get(message.terminalId);
         if (!session) {
           const response: StreamResponse = {
@@ -1169,67 +1169,85 @@ wss.on('connection', (ws: WebSocket) => {
         }
 
         try {
-          // Decode and transcribe audio
-          const audioBuffer = Buffer.from(message.audioData, 'base64');
-          const mimeType = message.audioMimeType || 'audio/wav';
+          // Check if this is a screenshot-only follow-up (from working state)
+          const isScreenshotFollowUp = (!message.audioData || message.audioData.length < 100) && message.screenCapture;
 
+          let transcription: string;
 
-          // Cooldown check - ignore audio that comes too soon after we sent TTS
-          // This prevents picking up our own audio playback
-          const TTS_COOLDOWN_MS = 3000; // 3 seconds after TTS before accepting new audio
-          const timeSinceTTS = Date.now() - session.voiceLastTTSTime;
-          if (session.voiceLastTTSTime > 0 && timeSinceTTS < TTS_COOLDOWN_MS) {
+          if (isScreenshotFollowUp) {
+            // This is a screenshot follow-up from working state
+            serverLog('[Voice] Processing screenshot-only follow-up');
+            transcription = '[Screenshot captured - please analyze what you see on the screen]';
+          } else if (!message.audioData) {
+            // No audio data and no screenshot - nothing to process
             return;
-          }
+          } else {
+            // Normal audio processing
+            // Decode and transcribe audio
+            const audioBuffer = Buffer.from(message.audioData, 'base64');
+            const mimeType = message.audioMimeType || 'audio/wav';
 
-          // Minimum audio size check - very small files are likely noise/silence
-          // M4A typically needs at least ~20KB for a second of speech
-          const MIN_AUDIO_SIZE = 15000; // 15KB minimum
-          if (audioBuffer.length < MIN_AUDIO_SIZE) {
-            return;
-          }
 
-          const transcription = await voiceService.transcribeAudio(audioBuffer, mimeType);
+            // Cooldown check - ignore audio that comes too soon after we sent TTS
+            // This prevents picking up our own audio playback
+            const TTS_COOLDOWN_MS = 3000; // 3 seconds after TTS before accepting new audio
+            const timeSinceTTS = Date.now() - session.voiceLastTTSTime;
+            if (session.voiceLastTTSTime > 0 && timeSinceTTS < TTS_COOLDOWN_MS) {
+              return;
+            }
+
+            // Minimum audio size check - very small files are likely noise/silence
+            // M4A typically needs at least ~20KB for a second of speech
+            const MIN_AUDIO_SIZE = 15000; // 15KB minimum
+            if (audioBuffer.length < MIN_AUDIO_SIZE) {
+              return;
+            }
+
+            transcription = await voiceService.transcribeAudio(audioBuffer, mimeType);
+          }
 
           if (!transcription || !transcription.trim()) {
             serverLog('[Voice] Empty transcription, ignoring');
             return;
           }
 
-          // Filter out common Whisper hallucinations on silence/noise
-          const WHISPER_HALLUCINATIONS = [
-            'thank you for watching',
-            'thanks for watching',
-            'subscribe',
-            'like and subscribe',
-            'see you next time',
-            'goodbye',
-            'thank you',
-            'you',
-            'bye',
-            'the end',
-            '...',
-            'hmm',
-            'um',
-            'uh',
-          ];
-          const lowerTrim = transcription.toLowerCase().trim();
-          if (WHISPER_HALLUCINATIONS.some(h => lowerTrim === h || lowerTrim === h + '.')) {
-            serverLog(`[Voice] Filtered Whisper hallucination: "${transcription}"`);
-            return;
-          }
+          // Skip audio filtering for screenshot follow-ups (they have synthetic transcription)
+          if (!isScreenshotFollowUp) {
+            // Filter out common Whisper hallucinations on silence/noise
+            const WHISPER_HALLUCINATIONS = [
+              'thank you for watching',
+              'thanks for watching',
+              'subscribe',
+              'like and subscribe',
+              'see you next time',
+              'goodbye',
+              'thank you',
+              'you',
+              'bye',
+              'the end',
+              '...',
+              'hmm',
+              'um',
+              'uh',
+            ];
+            const lowerTrim = transcription.toLowerCase().trim();
+            if (WHISPER_HALLUCINATIONS.some(h => lowerTrim === h || lowerTrim === h + '.')) {
+              serverLog(`[Voice] Filtered Whisper hallucination: "${transcription}"`);
+              return;
+            }
 
-          // Require minimum word count for meaningful input (at least 2 words)
-          const wordCount = transcription.trim().split(/\s+/).length;
-          if (wordCount < 2) {
-            serverLog(`[Voice] Too short (${wordCount} word): "${transcription}"`);
-            return;
-          }
+            // Require minimum word count for meaningful input (at least 2 words)
+            const wordCount = transcription.trim().split(/\s+/).length;
+            if (wordCount < 2) {
+              serverLog(`[Voice] Too short (${wordCount} word): "${transcription}"`);
+              return;
+            }
 
-          // If we're in idle waiting after TTS, require more substantial input (3+ words)
-          if (session.voiceIdleWaiting && wordCount < 3) {
-            serverLog(`[Voice] Waiting for more substantial input (got ${wordCount} words)`);
-            return;
+            // If we're in idle waiting after TTS, require more substantial input (3+ words)
+            if (session.voiceIdleWaiting && wordCount < 3) {
+              serverLog(`[Voice] Waiting for more substantial input (got ${wordCount} words)`);
+              return;
+            }
           }
 
           // WAKE WORD CHECK - if wakeWordCheck flag is set, only check for wake word
