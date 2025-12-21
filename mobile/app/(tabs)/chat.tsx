@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView, Animated, Easing } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
-import { Terminal as TerminalIcon, Plus, X, Mic, MicOff, Volume2, Square } from 'lucide-react-native';
+import { Terminal as TerminalIcon, Plus, X, Mic, MicOff, Volume2, Square, Loader2 } from 'lucide-react-native';
 import { Audio, AVPlaybackStatus } from 'expo-av';
 import ViewShot from 'react-native-view-shot';
 import * as Haptics from 'expo-haptics';
@@ -17,7 +17,7 @@ interface TerminalSession {
   sandbox: boolean;
 }
 
-type VoiceStatus = 'off' | 'idle' | 'listening' | 'processing' | 'speaking';
+type VoiceStatus = 'off' | 'idle' | 'listening' | 'processing' | 'speaking' | 'working';
 
 // VAD Configuration - Tuned for natural conversation flow
 // Based on OpenAI Realtime API best practices
@@ -63,6 +63,8 @@ export default function TerminalScreen() {
 
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
+  const workingChimeSoundRef = useRef<Audio.Sound | null>(null);
+  const workingChimeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const meteringIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const silenceStartRef = useRef<number | null>(null);
   const recordingStartRef = useRef<number | null>(null);
@@ -167,6 +169,27 @@ export default function TerminalScreen() {
       return () => {
         breathe.stop();
         glow.stop();
+      };
+    } else if (voiceStatus === 'working') {
+      // Slow, calm pulse for working state
+      const workingPulse = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, { toValue: 1.05, duration: 1500, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
+          Animated.timing(pulseAnim, { toValue: 1, duration: 1500, useNativeDriver: true, easing: Easing.inOut(Easing.ease) }),
+        ])
+      );
+      // Subtle glow for working
+      const workingGlow = Animated.loop(
+        Animated.sequence([
+          Animated.timing(glowAnim, { toValue: 0.6, duration: 2000, useNativeDriver: false }),
+          Animated.timing(glowAnim, { toValue: 0.3, duration: 2000, useNativeDriver: false }),
+        ])
+      );
+      workingPulse.start();
+      workingGlow.start();
+      return () => {
+        workingPulse.stop();
+        workingGlow.stop();
       };
     } else {
       pulseAnim.setValue(1);
@@ -291,6 +314,39 @@ export default function TerminalScreen() {
     if (meteringIntervalRef.current) {
       clearInterval(meteringIntervalRef.current);
       meteringIntervalRef.current = null;
+    }
+  };
+
+  // Working chime - a subtle, airy sound played periodically while agent is working
+  // Using a simple sine wave tone that sounds like a gentle glass chime
+  const playWorkingChime = async () => {
+    try {
+      // Create a simple beep tone using Expo Audio
+      // The chime is created using a short audio buffer that sounds glass-like
+      // For now, we use a haptic feedback as a subtle cue since we don't have a chime asset
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    } catch (err) {
+      console.log('[Voice] Chime playback error:', err);
+    }
+  };
+
+  const startWorkingChime = () => {
+    // Play immediately
+    playWorkingChime();
+    // Then repeat every 3 seconds
+    workingChimeIntervalRef.current = setInterval(() => {
+      playWorkingChime();
+    }, 3000);
+  };
+
+  const stopWorkingChime = () => {
+    if (workingChimeIntervalRef.current) {
+      clearInterval(workingChimeIntervalRef.current);
+      workingChimeIntervalRef.current = null;
+    }
+    if (workingChimeSoundRef.current) {
+      workingChimeSoundRef.current.unloadAsync();
+      workingChimeSoundRef.current = null;
     }
   };
 
@@ -464,6 +520,26 @@ export default function TerminalScreen() {
             console.log('[Voice-Terminal] Navigating to projects');
           }
         },
+        onWorking: async (workingState) => {
+          console.log('[Voice-Terminal] Working state:', workingState);
+          setVoiceStatus('working');
+          setVoiceProgress('');
+
+          // Start the working chime
+          startWorkingChime();
+
+          // Handle follow-up actions
+          if (workingState.followUpAction === 'take_screenshot') {
+            // Capture screenshot and send it back
+            const screenshot = await captureScreenshot();
+            if (screenshot && activeTerminal) {
+              lastScreenshotRef.current = screenshot;
+              // Terminal content and app state will be sent with next voice audio
+              console.log('[Voice-Terminal] Screenshot captured for working state');
+            }
+          }
+          // Other follow-up actions (wait_for_claude, check_files) are handled by the server
+        },
         onEnabled: () => {
           console.log('[Voice-Terminal] Voice mode enabled');
           setVoiceStatus('idle');
@@ -488,6 +564,7 @@ export default function TerminalScreen() {
 
       // Now do async cleanup
       stopMetering();
+      stopWorkingChime();
       if (recordingRef.current) {
         await recordingRef.current.stopAndUnloadAsync();
         recordingRef.current = null;
@@ -687,6 +764,8 @@ export default function TerminalScreen() {
 
   const playAudio = async (base64Audio: string) => {
     try {
+      // Stop working chime when speaking starts
+      stopWorkingChime();
       setVoiceStatus('speaking');
 
       if (soundRef.current) {
@@ -817,6 +896,7 @@ export default function TerminalScreen() {
               {voiceStatus === 'idle' ? 'Tap to speak' :
                voiceStatus === 'listening' ? 'Listening...' :
                voiceStatus === 'processing' ? 'Processing...' :
+               voiceStatus === 'working' ? 'Working...' :
                'Speaking...'}
             </Text>
 
@@ -871,6 +951,11 @@ export default function TerminalScreen() {
                   shadowColor: '#22C55E',
                   shadowOpacity: 0.6,
                   shadowRadius: 20,
+                },
+                voiceStatus === 'working' && {
+                  shadowColor: '#60A5FA',
+                  shadowOpacity: 0.5,
+                  shadowRadius: 15,
                 }
               ]}>
                 <TouchableOpacity
@@ -879,15 +964,18 @@ export default function TerminalScreen() {
                     voiceStatus === 'listening' && styles.micButtonListening,
                     voiceStatus === 'speaking' && styles.micButtonSpeaking,
                     voiceStatus === 'processing' && styles.micButtonProcessing,
+                    voiceStatus === 'working' && styles.micButtonWorking,
                   ]}
                   onPress={handleVoiceMicPress}
-                  disabled={voiceStatus === 'processing'}
+                  disabled={voiceStatus === 'processing' || voiceStatus === 'working'}
                   activeOpacity={0.8}
                 >
                   {voiceStatus === 'listening' ? (
                     <MicOff size={28} color="#FFF" />
                   ) : voiceStatus === 'speaking' ? (
                     <Volume2 size={28} color="#FFF" />
+                  ) : voiceStatus === 'working' ? (
+                    <Loader2 size={28} color="#FFF" />
                   ) : (
                     <Mic size={28} color="#FFF" />
                   )}
@@ -1121,6 +1209,9 @@ const styles = StyleSheet.create({
   },
   micButtonProcessing: {
     backgroundColor: '#555',
+  },
+  micButtonWorking: {
+    backgroundColor: '#60A5FA',
   },
   voiceButtonsRow: {
     flexDirection: 'row',

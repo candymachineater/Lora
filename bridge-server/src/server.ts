@@ -96,7 +96,7 @@ interface FileInfo {
 }
 
 interface StreamResponse {
-  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
+  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
   content?: string;
   error?: string;
   projects?: ProjectInfo[];
@@ -119,6 +119,11 @@ interface StreamResponse {
     action: 'navigate' | 'press_button' | 'scroll' | 'take_screenshot' | 'refresh_files' | 'show_settings' | 'create_project';
     target?: string; // tab name, button id, etc.
     params?: Record<string, unknown>;
+  };
+  // Working state from voice agent (agent is still in control, playing waiting sound)
+  workingState?: {
+    reason: 'screenshot' | 'claude_action' | 'gathering_info' | 'analyzing';
+    followUpAction?: 'take_screenshot' | 'wait_for_claude' | 'check_files';
   };
   // Preview-related fields
   previewUrl?: string;
@@ -1512,6 +1517,33 @@ wss.on('connection', (ws: WebSocket) => {
             // Set TTS cooldown
             session.voiceLastTTSTime = Date.now();
             session.voiceIdleWaiting = true;
+            return;
+          }
+
+          // Handle WORKING - agent is gathering info/waiting, don't yield floor
+          if (agentResponse.type === 'working' && agentResponse.workingState) {
+            // Send TTS for the status message (e.g., "One moment, let me check that")
+            const ttsAudio = await voiceService.textToSpeech(agentResponse.content);
+            const audioResponse: StreamResponse = {
+              type: 'voice_terminal_speaking',
+              terminalId: message.terminalId,
+              responseText: agentResponse.content,
+              audioData: ttsAudio.toString('base64'),
+              audioMimeType: 'audio/mp3'
+            };
+            ws.send(JSON.stringify(audioResponse));
+
+            // Send working state to client - this triggers the working chime and follow-up action
+            const workingResponse: StreamResponse = {
+              type: 'voice_working',
+              terminalId: message.terminalId,
+              workingState: agentResponse.workingState
+            };
+            ws.send(JSON.stringify(workingResponse));
+
+            // Don't set idle state - agent is still in control
+            session.voiceLastTTSTime = Date.now();
+            session.voiceIdleWaiting = false;
             return;
           }
 
