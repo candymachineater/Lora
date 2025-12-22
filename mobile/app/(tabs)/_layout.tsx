@@ -206,9 +206,16 @@ function VoiceTabButton() {
 
     // Read current status directly from store to avoid stale closure
     const currentStatus = useVoiceStore.getState().voiceStatus;
+    const pendingStart = useVoiceStore.getState().pendingVoiceStart;
     const micPressHandler = useVoiceStore.getState().handleVoiceMicPress;
 
-    console.log('[VoiceButton] Pressed, status:', currentStatus, 'handler:', !!micPressHandler);
+    console.log('[VoiceButton] Pressed, status:', currentStatus, 'pending:', pendingStart, 'handler:', !!micPressHandler);
+
+    // Ignore presses if voice is already starting (pending)
+    if (pendingStart) {
+      console.log('[VoiceButton] Ignoring press - voice mode is already starting');
+      return;
+    }
 
     if (currentStatus === 'off') {
       // TAP when OFF → Start voice mode

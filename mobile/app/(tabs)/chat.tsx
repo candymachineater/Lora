@@ -781,6 +781,8 @@ export default function TerminalScreen() {
           console.log('[Voice-Terminal] Voice mode enabled, starting listening');
           setVoiceTranscript('');
           setVoiceProgress('');
+          // Clear pending flag to prevent duplicate enable attempts
+          setPendingVoiceStart(false);
           // Start listening immediately
           setTimeout(() => startListening(), 500);
         },
@@ -1309,7 +1311,10 @@ export default function TerminalScreen() {
         toggleVoiceMode();
       }, 300);
     }
-  }, [pendingVoiceStart, activeTerminal, voiceStatus, setPendingVoiceStart, toggleVoiceMode]);
+    // Note: Don't include toggleVoiceMode in deps - it's not a dependency, we're calling it
+    // Including it causes infinite loops since toggleVoiceMode recreates on every render
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingVoiceStart, activeTerminal, voiceStatus, setPendingVoiceStart]);
 
   if (!project) {
     return (

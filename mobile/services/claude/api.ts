@@ -257,6 +257,7 @@ class BridgeService {
       case 'voice_terminal_enabled':
         if (response.terminalId) {
           const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          console.log('[BridgeService] voice_terminal_enabled received for:', response.terminalId, 'hasCallbacks:', !!vtCallbacks, 'hasOnEnabled:', !!vtCallbacks?.onEnabled);
           vtCallbacks?.onEnabled?.();
         }
         break;
