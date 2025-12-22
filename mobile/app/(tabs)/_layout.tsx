@@ -206,9 +206,16 @@ function VoiceTabButton() {
 
     // Read current status directly from store to avoid stale closure
     const currentStatus = useVoiceStore.getState().voiceStatus;
+    const pendingStart = useVoiceStore.getState().pendingVoiceStart;
     const micPressHandler = useVoiceStore.getState().handleVoiceMicPress;
 
-    console.log('[VoiceButton] Pressed, status:', currentStatus, 'handler:', !!micPressHandler);
+    console.log('[VoiceButton] Pressed, status:', currentStatus, 'pending:', pendingStart, 'handler:', !!micPressHandler);
+
+    // Ignore presses if voice is already starting (pending)
+    if (pendingStart) {
+      console.log('[VoiceButton] Ignoring press - voice mode is already starting');
+      return;
+    }
 
     if (currentStatus === 'off') {
       // TAP when OFF → Start voice mode
@@ -221,13 +228,25 @@ function VoiceTabButton() {
 
       if (micPressHandler) {
         // Use the registered handler for proper cleanup
-        micPressHandler();
+        console.log('[VoiceButton] Calling handler...');
+        try {
+          micPressHandler();
+          console.log('[VoiceButton] Handler called successfully');
+        } catch (error) {
+          console.error('[VoiceButton] Handler error:', error);
+          // Force status to off on error
+          useVoiceStore.getState().setVoiceStatus('off');
+          useVoiceStore.getState().setVoiceTranscript('');
+          useVoiceStore.getState().setVoiceProgress('');
+        }
       } else {
-        // Fallback: at least set status to off if handler not available
-        console.log('[VoiceButton] No handler available, forcing status to off');
+        // Fallback: handler not available (chat component unmounted)
+        // Navigate to chat tab to trigger proper cleanup
+        console.log('[VoiceButton] No handler available, navigating to chat for cleanup');
         useVoiceStore.getState().setVoiceStatus('off');
         useVoiceStore.getState().setVoiceTranscript('');
         useVoiceStore.getState().setVoiceProgress('');
+        router.push('/(tabs)/chat');
       }
     }
   };

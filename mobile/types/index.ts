@@ -6,6 +6,7 @@ export interface Project {
   path?: string; // Path on PC (from bridge server)
   files: ProjectFile[];
   sandbox: boolean; // true = sandboxed to project, false = full filesystem access (set at creation)
+  projectType: 'mobile' | 'web'; // Type of project (mobile = Expo/React Native, web = React + Vite)
   createdAt: Date;
   updatedAt: Date;
 }
@@ -15,6 +16,7 @@ export interface ServerProject {
   id: string;
   name: string;
   path: string;
+  projectType: 'mobile' | 'web';
   createdAt: string;
 }
 
@@ -56,9 +58,10 @@ export interface Message {
 
 // WebSocket message types
 export interface WSMessage {
-  type: 'ping' | 'cancel' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'preview_start' | 'preview_stop' | 'preview_status';
+  type: 'ping' | 'cancel' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'screenshot_captured' | 'preview_start' | 'preview_stop' | 'preview_status';
   projectName?: string;
   projectId?: string;
+  projectType?: 'mobile' | 'web';
   filePath?: string;
   content?: string; // For save_file
   terminalId?: string;

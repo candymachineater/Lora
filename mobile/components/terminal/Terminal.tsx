@@ -10,6 +10,7 @@ import {
   ScrollView,
 } from 'react-native';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
+import { Plus, Keyboard as KeyboardIcon, ScrollText, ChevronsUp, ChevronsDown } from 'lucide-react-native';
 
 interface TerminalProps {
   output: string;
@@ -791,7 +792,7 @@ export function Terminal({
               style={[styles.scrollButton, styles.newTerminalButton]}
               onPress={onNewTerminal}
             >
-              <Text style={styles.scrollButtonText}>+</Text>
+              <Plus color="#FFF" size={20} />
             </TouchableOpacity>
           )}
           {/* History toggle button */}
@@ -799,7 +800,11 @@ export function Terminal({
             style={[styles.scrollButton, showHistory && styles.scrollButtonActive]}
             onPress={() => setShowHistory(!showHistory)}
           >
-            <Text style={styles.scrollButtonText}>{showHistory ? '⌨️' : '📜'}</Text>
+            {showHistory ? (
+              <KeyboardIcon color="#FFF" size={18} />
+            ) : (
+              <ScrollText color="#AAA" size={18} />
+            )}
           </TouchableOpacity>
           {showHistory && (
             <>
@@ -807,13 +812,13 @@ export function Terminal({
                 style={styles.scrollButton}
                 onPress={() => historyScrollRef.current?.scrollTo({ y: 0, animated: true })}
               >
-                <Text style={styles.scrollButtonText}>⏫</Text>
+                <ChevronsUp color="#AAA" size={18} />
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.scrollButton}
                 onPress={() => historyScrollRef.current?.scrollToEnd({ animated: true })}
               >
-                <Text style={styles.scrollButtonText}>⏬</Text>
+                <ChevronsDown color="#AAA" size={18} />
               </TouchableOpacity>
             </>
           )}

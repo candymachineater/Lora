@@ -118,7 +118,8 @@ sudo ufw allow 8765/tcp
 - Voice agent powered by Claude Haiku 4.5 for intent classification
 - Conversation memory with auto-compaction at 200k tokens
 - Screen capture support (receives phone screenshots for vision context)
-- Five response types: `prompt`, `control`, `conversational`, `ignore`, `app_control`
+- Six response types: `prompt`, `control`, `conversational`, `ignore`, `app_control`, `action_sequence`
+- `action_sequence` enables multi-step operations (switch terminal + send command)
 - App control allows voice agent to navigate tabs and interact with mobile UI
 
 **Claude State Service** (`src/claude-state-service.ts`):
@@ -204,6 +205,56 @@ Messages between mobile app and bridge server use JSON with a `type` field:
 - `voice_app_control` - App UI control command (navigate tabs, press buttons)
 - `error` - Error messages
 
+## Voice Agent Architecture (Critical Implementation Details)
+
+### Multi-Action Sequences (`action_sequence` type)
+The voice agent supports executing multiple actions sequentially (e.g., "go to terminal 1 and tell Claude to do X"):
+
+**Server-side (`server.ts:1463-1605`):**
+- Actions execute in order with tracking of `targetTmuxSession`
+- When `switch_terminal` is detected, all subsequent actions use the new terminal
+- Each action waits for completion before starting the next
+- Final response uses `presentClaudeResponse()` for contextual attribution
+
+**Client-side (`chat.tsx:445-560`):**
+- `onAppControl` callback handles app control actions
+- `switch_terminal` MUST navigate to Chat tab first: `router.push('/(tabs)/chat')`
+- Then switches terminal index with haptic feedback
+- Other actions: `navigate`, `send_input`, `send_control`, `new_terminal`, `close_terminal`, `take_screenshot`
+
+**WebSocket Message Format:**
+```typescript
+// Server → Client (CRITICAL: field name is appControl, not appAction)
+{
+  type: 'voice_app_control',
+  terminalId: string,
+  appControl: {  // NOT appAction!
+    action: string,
+    target?: string,
+    params?: Record<string, unknown>
+  }
+}
+```
+
+### Voice Response Attribution
+- Use `presentClaudeResponse()` instead of `summarizeForVoice()` when presenting Claude Code's responses
+- The voice agent intelligently varies attribution based on conversation context
+- Never hard-code attribution like "Claude Code said:" - let the agent decide naturally
+- Pass the user's original request as context for proper attribution
+
+### JSON Parsing (Programmatic, Not AI-Reliant)
+Voice agent responses use bulletproof JSON extraction (`voice-service.ts:1102-1134`):
+- Finds first `{` and extracts complete JSON using brace depth tracking
+- State machine parser handles escaped characters and strings correctly
+- Self-correction: If validation fails, error is sent back to AI for retry
+- Multi-step detection uses regex patterns, not AI instructions
+
+### Conversation Memory
+- Memory keyed by **projectId** (not terminalId) for persistence across terminals
+- Auto-compaction at 200k tokens → 25k tokens
+- Maintains `importantInfo` array for critical context
+- Recent turns always preserved (minimum 5 turns after compaction)
+
 ## Code Conventions
 
 - TypeScript throughout both projects
@@ -212,6 +263,12 @@ Messages between mobile app and bridge server use JSON with a `type` field:
 - Zustand with persist middleware for state that survives app restarts
 - expo-file-system new API: `Paths`, `Directory`, `File` classes (not legacy documentDirectory)
 - ANSI escape sequence parsing for terminal colors (16-color and 24-bit RGB)
+
+### Voice Service Conventions
+- All voice agent fixes MUST be programmatic, not relying on AI instructions
+- Use validation with semantic checks and self-correction retry loops
+- Session IDs for voice: use `projectId` for cross-terminal persistence
+- Model selection: Claude Haiku 4.5 (`claude-haiku-4-5-20251001`) for voice agent, user-configurable for Claude Code
 
 ## Terminal Implementation Notes
 
@@ -233,6 +290,9 @@ tail -f /tmp/lora-hook-debug.log
 ```bash
 tail -f logs/bridge-server.log
 tail -f logs/terminal.log
+
+# Filter for bridge server only when running unified dev
+tail -f /tmp/lora-dev.log | grep "^\[bridge\]"
 ```
 
 ### Check if Hooks are Working
@@ -243,3 +303,29 @@ ls -la /tmp/lora-hooks-ready-*
 # Current Claude state
 cat /tmp/lora-claude-state-lora-{projectId}.json
 ```
+
+### Common Issues and Fixes
+
+**Voice agent not switching terminals:**
+- Check WebSocket message field name: must be `appControl` not `appAction`
+- Verify mobile app callback receives the message: check for log `[Voice-Terminal] App control:`
+- Ensure `switch_terminal` navigates to Chat tab first before switching terminal index
+
+**Terminal commands going to wrong terminal in action sequences:**
+- Verify `targetTmuxSession` is updated when `switch_terminal` is detected
+- All subsequent prompt actions must use `targetTmuxSession`, not `session.tmuxSessionName`
+
+**Voice agent responses not attributed to Claude Code:**
+- Use `presentClaudeResponse()` with user's request as context
+- Never hard-code "Claude Code said:" - let agent decide based on conversation flow
+
+**JSON parsing errors from voice agent:**
+- Ensure using programmatic extraction (`extractFirstJsonObject`) not regex
+- Validation errors should trigger self-correction retry, not fail
+- Check multi-step regex patterns match the user's input correctly
+
+**Voice mode can't be terminated by pressing voice button:**
+- The voice button can terminate voice mode in ANY state (listening, processing, working, speaking)
+- If user navigates away from Terminal tab while voice is active, pressing the button will navigate back to Terminal for cleanup
+- The chat component cleanup effect ensures voice is disabled on all terminals when mounting with voice off
+- Check logs for `[VoiceButton] Interrupting voice mode` and `[Voice] Status changed to off, running cleanup`

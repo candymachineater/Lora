@@ -13,7 +13,7 @@ import {
   Platform,
 } from 'react-native';
 import { useRouter } from 'expo-router';
-import { Plus, FolderOpen, Trash2, Settings, RefreshCw, Wifi, WifiOff, Shield, ShieldOff } from 'lucide-react-native';
+import { Plus, FolderOpen, Trash2, Settings, RefreshCw, Wifi, WifiOff, Shield, ShieldOff, Smartphone, Globe } from 'lucide-react-native';
 import { useProjectStore, useSettingsStore } from '../../stores';
 import { bridgeService } from '../../services/claude/api';
 import { EmptyState, Button } from '../../components/common';
@@ -25,6 +25,7 @@ export default function ProjectsScreen() {
   const { bridgeServerUrl, isConnected, setIsConnected } = useSettingsStore();
   const [newProjectName, setNewProjectName] = useState('');
   const [newProjectSandbox, setNewProjectSandbox] = useState(true); // Default to sandbox mode
+  const [newProjectType, setNewProjectType] = useState<'mobile' | 'web'>('mobile'); // Default to mobile
   const [isLoading, setIsLoading] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
 
@@ -47,6 +48,7 @@ export default function ProjectsScreen() {
               path: p.path,
               files: [],
               sandbox: existing?.sandbox ?? true, // Preserve existing or default to sandbox
+              projectType: p.projectType, // Sync from server
               createdAt: new Date(p.createdAt),
               updatedAt: new Date(p.createdAt),
             };
@@ -65,6 +67,7 @@ export default function ProjectsScreen() {
               path: p.path,
               files: [],
               sandbox: existing?.sandbox ?? true, // Preserve existing or default to sandbox
+              projectType: p.projectType, // Sync from server
               createdAt: new Date(p.createdAt),
               updatedAt: new Date(p.createdAt),
             };
@@ -94,13 +97,14 @@ export default function ProjectsScreen() {
     try {
       if (bridgeService.isConnected()) {
         // Create on bridge server
-        const serverProject = await bridgeService.createProject(newProjectName.trim());
+        const serverProject = await bridgeService.createProject(newProjectName.trim(), newProjectType);
         const project = {
           id: serverProject.id,
           name: serverProject.name,
           path: serverProject.path,
           files: [],
           sandbox: newProjectSandbox, // Use the selected sandbox mode
+          projectType: serverProject.projectType, // From server response
           createdAt: new Date(serverProject.createdAt),
           updatedAt: new Date(serverProject.createdAt),
         };
@@ -114,6 +118,7 @@ export default function ProjectsScreen() {
 
       setNewProjectName('');
       setNewProjectSandbox(true); // Reset to default
+      setNewProjectType('mobile'); // Reset to default
       setShowNewProjectModal(false);
       router.push('/chat');
     } catch (err) {
@@ -232,10 +237,24 @@ export default function ProjectsScreen() {
               activeOpacity={0.7}
             >
               <View style={styles.projectIcon}>
-                <FolderOpen color={colors.brandTiger} size={24} />
+                {item.projectType === 'web' ? (
+                  <Globe color={colors.brandTiger} size={24} />
+                ) : (
+                  <Smartphone color={colors.brandTiger} size={24} />
+                )}
               </View>
               <View style={styles.projectInfo}>
-                <Text style={styles.projectName}>{item.name}</Text>
+                <View style={styles.projectHeader}>
+                  <Text style={styles.projectName}>{item.name}</Text>
+                  <View style={[
+                    styles.typeBadge,
+                    item.projectType === 'web' ? styles.webBadge : styles.mobileBadge
+                  ]}>
+                    <Text style={styles.typeBadgeText}>
+                      {item.projectType === 'web' ? 'WEB' : 'MOBILE'}
+                    </Text>
+                  </View>
+                </View>
                 <Text style={styles.projectMeta} numberOfLines={1}>
                   {item.path || `Updated ${formatDate(item.updatedAt)}`}
                 </Text>
@@ -282,6 +301,52 @@ export default function ProjectsScreen() {
               onChangeText={setNewProjectName}
               autoFocus
             />
+
+            {/* Project Type Selector */}
+            <View style={styles.projectTypeSelector}>
+              <Text style={styles.selectorLabel}>Project Type</Text>
+              <View style={styles.projectTypeOptions}>
+                <TouchableOpacity
+                  style={[
+                    styles.typeOption,
+                    newProjectType === 'mobile' && styles.typeOptionSelected
+                  ]}
+                  onPress={() => setNewProjectType('mobile')}
+                >
+                  <Smartphone
+                    color={newProjectType === 'mobile' ? colors.brandTiger : colors.mutedForeground}
+                    size={20}
+                  />
+                  <Text style={[
+                    styles.typeOptionText,
+                    newProjectType === 'mobile' && styles.typeOptionTextSelected
+                  ]}>
+                    Mobile App
+                  </Text>
+                  <Text style={styles.typeOptionSubtext}>Expo / React Native</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[
+                    styles.typeOption,
+                    newProjectType === 'web' && styles.typeOptionSelected
+                  ]}
+                  onPress={() => setNewProjectType('web')}
+                >
+                  <Globe
+                    color={newProjectType === 'web' ? colors.brandTiger : colors.mutedForeground}
+                    size={20}
+                  />
+                  <Text style={[
+                    styles.typeOptionText,
+                    newProjectType === 'web' && styles.typeOptionTextSelected
+                  ]}>
+                    Web App
+                  </Text>
+                  <Text style={styles.typeOptionSubtext}>React + Vite</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
 
             {/* Sandbox Mode Toggle */}
             <TouchableOpacity
@@ -487,5 +552,67 @@ const styles = StyleSheet.create({
     width: 12,
     height: 12,
     borderRadius: 6,
+  },
+  projectTypeSelector: {
+    marginBottom: spacing.lg,
+  },
+  selectorLabel: {
+    ...typography.caption,
+    color: colors.foreground,
+    fontWeight: '600',
+    marginBottom: spacing.sm,
+  },
+  projectTypeOptions: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+  },
+  typeOption: {
+    flex: 1,
+    backgroundColor: colors.cardBackground,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    borderWidth: 2,
+    borderColor: colors.border,
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
+  typeOptionSelected: {
+    borderColor: colors.brandTiger,
+    backgroundColor: colors.secondary,
+  },
+  typeOptionText: {
+    ...typography.caption,
+    color: colors.mutedForeground,
+    fontWeight: '500',
+  },
+  typeOptionTextSelected: {
+    color: colors.brandTiger,
+    fontWeight: '600',
+  },
+  typeOptionSubtext: {
+    ...typography.caption,
+    fontSize: 10,
+    color: colors.mutedForeground,
+  },
+  projectHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  typeBadge: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  webBadge: {
+    backgroundColor: '#3b82f6',
+  },
+  mobileBadge: {
+    backgroundColor: '#10b981',
+  },
+  typeBadgeText: {
+    color: '#fff',
+    fontSize: 10,
+    fontWeight: '600',
   },
 });

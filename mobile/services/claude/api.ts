@@ -257,6 +257,7 @@ class BridgeService {
       case 'voice_terminal_enabled':
         if (response.terminalId) {
           const vtCallbacks = this.voiceTerminalCallbacks.get(response.terminalId);
+          console.log('[BridgeService] voice_terminal_enabled received for:', response.terminalId, 'hasCallbacks:', !!vtCallbacks, 'hasOnEnabled:', !!vtCallbacks?.onEnabled);
           vtCallbacks?.onEnabled?.();
         }
         break;
@@ -447,14 +448,14 @@ class BridgeService {
   }
 
   // Project management
-  async createProject(name: string): Promise<ServerProject> {
+  async createProject(name: string, projectType: 'mobile' | 'web' = 'mobile'): Promise<ServerProject> {
     return new Promise((resolve, reject) => {
       if (!this.isConnected()) {
         reject(new Error('Not connected'));
         return;
       }
       this.pendingResolvers.set('project_created', resolve);
-      this.send({ type: 'create_project', projectName: name });
+      this.send({ type: 'create_project', projectName: name, projectType });
       setTimeout(() => {
         if (this.pendingResolvers.has('project_created')) {
           this.pendingResolvers.delete('project_created');
