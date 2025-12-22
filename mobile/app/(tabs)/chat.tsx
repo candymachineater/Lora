@@ -22,14 +22,14 @@ const VAD_CONFIG = {
   // Adaptive threshold settings
   // Speech threshold = noise floor + SPEECH_ABOVE_NOISE_DB
   CALIBRATION_DURATION_MS: 800, // Measure ambient noise for first 800ms
-  SPEECH_ABOVE_NOISE_DB: 8, // Speech must be 8dB above noise floor (lowered from 12 for close-mic)
+  SPEECH_ABOVE_NOISE_DB: 8, // Speech must be 8dB above noise floor (optimized for mobile close-mic)
   MIN_SPEECH_THRESHOLD: -30, // Never set threshold below this (too sensitive)
   MAX_SPEECH_THRESHOLD: -10, // Never set threshold above this (too strict, was -5)
 
   // Timing settings
-  SILENCE_DURATION_MS: 1500, // 1.5s of silence after speech before stopping
+  SILENCE_DURATION_MS: 700, // 700ms of silence after speech before stopping
   SPEECH_START_MS: 600, // Must have 600ms of sustained speech to confirm
-  MIN_RECORDING_MS: 2000, // Minimum 2s recording before VAD kicks in
+  MIN_RECORDING_MS: 1200, // Minimum 1.2s recording before VAD kicks in
   MAX_RECORDING_MS: 60000, // Maximum 60s recording to prevent runaway
   METERING_INTERVAL_MS: 100, // How often to check audio levels
   POST_TTS_DELAY_MS: 500, // Wait 500ms after TTS ends before listening
@@ -38,7 +38,7 @@ const VAD_CONFIG = {
 
 export default function TerminalScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ pendingPrompt?: string; createNewTerminal?: string }>();
+  const params = useLocalSearchParams<{ pendingPrompt?: string; createNewTerminal?: string; timestamp?: string }>();
 
   const { currentProjectId, projects, currentProject, currentFile } = useProjectStore();
   const { bridgeServerUrl, isConnected, setIsConnected, voiceAgentModel } = useSettingsStore();
@@ -106,7 +106,7 @@ export default function TerminalScreen() {
     }
   }, [bridgeServerUrl]);
 
-  // Create initial terminal when project changes
+  // Clean up terminals when project changes
   useEffect(() => {
     if (!currentProjectId || !bridgeService.isConnected()) return;
 
@@ -125,15 +125,21 @@ export default function TerminalScreen() {
       setVoiceStatus('off');
     }
 
-    if (terminals.length === 0) {
-      createTerminal();
-    }
-
     return () => {
       terminals.forEach((t) => bridgeService.closeTerminal(t.id));
       stopMetering();
     };
   }, [currentProjectId, isConnected]);
+
+  // Create initial terminal when needed (separate effect to avoid race condition)
+  useEffect(() => {
+    if (!currentProjectId || !bridgeService.isConnected()) return;
+
+    if (terminals.length === 0) {
+      console.log('[Terminal] No terminals found, creating initial terminal for project:', currentProjectId);
+      createTerminal();
+    }
+  }, [currentProjectId, isConnected, terminals.length, createTerminal]);
 
   // Cleanup on unmount only
   useEffect(() => {
@@ -144,17 +150,19 @@ export default function TerminalScreen() {
 
   // Handle pending prompt from preview (console logs to send to Claude)
   useEffect(() => {
-    if (params.pendingPrompt && !pendingPromptSentRef.current) {
+    if (params.pendingPrompt && params.timestamp) {
+      // Reset the sent flag for each new timestamp (each button click)
       pendingPromptRef.current = params.pendingPrompt;
       pendingPromptSentRef.current = false;
 
       // If requested to create new terminal, do so
       if (params.createNewTerminal === 'true') {
-        console.log('[Terminal] Creating new terminal for pending prompt');
+        console.log('[Terminal] Creating new terminal for pending prompt (timestamp:', params.timestamp, ')');
         createTerminalWithPrompt(params.pendingPrompt);
+        pendingPromptSentRef.current = true;
       }
     }
-  }, [params.pendingPrompt, params.createNewTerminal]);
+  }, [params.pendingPrompt, params.createNewTerminal, params.timestamp]);
 
   // Manage thinking/working sound based on voice status
   // IMPORTANT: Don't start thinking sound while TTS is playing to avoid overlap

@@ -11,7 +11,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Audio, AVPlaybackStatus } from 'expo-av';
-import { Mic, MicOff, Volume2, AlertCircle, Square, FolderOpen } from 'lucide-react-native';
+import { Mic, MicOff, Volume2, AlertCircle, Square, FolderOpen, RefreshCw, Hand } from 'lucide-react-native';
 import { colors, spacing, typography } from '../../theme';
 import { useProjectStore } from '../../stores/projectStore';
 import { useSettingsStore } from '../../stores/settingsStore';
@@ -426,9 +426,19 @@ export default function VoiceScreen() {
           style={styles.modeToggle}
           onPress={() => setContinuousMode(!continuousMode)}
         >
-          <Text style={styles.modeToggleText}>
-            {continuousMode ? '🔄 Continuous' : '👆 Manual'}
-          </Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            {continuousMode ? (
+              <>
+                <RefreshCw size={14} color={colors.mutedForeground} />
+                <Text style={styles.modeToggleText}>Continuous</Text>
+              </>
+            ) : (
+              <>
+                <Hand size={14} color={colors.mutedForeground} />
+                <Text style={styles.modeToggleText}>Manual</Text>
+              </>
+            )}
+          </View>
         </TouchableOpacity>
       </View>
 

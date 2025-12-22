@@ -175,7 +175,7 @@ async function compactMemory(sessionId: string): Promise<void> {
   try {
     const response = await anthropic.messages.create({
       model: MODEL,
-      max_tokens: 4000,  // Allow more detailed summaries for complex conversations
+      max_tokens: 40000,  // Allow more detailed summaries for complex conversations
       temperature: 0.2,
       system: `You are creating a memory summary for an AI voice assistant called Lora. This summary will be used to maintain context across a long conversation.
 
@@ -407,11 +407,22 @@ function formatConversationHistory(memory: ConversationMemory): string {
 // ============================================================================
 
 export interface VoiceAgentResponse {
-  type: 'prompt' | 'control' | 'conversational' | 'ignore' | 'app_control' | 'working' | 'background_task';
+  type: 'prompt' | 'control' | 'conversational' | 'ignore' | 'app_control' | 'working' | 'background_task' | 'action_sequence';
   content: string;
   // Optional voice response to speak to user while executing the action
   // Use this when you want to tell the user what you're doing AND execute the action
   voiceResponse?: string;
+  // For action_sequence: array of actions to execute in order
+  actions?: Array<{
+    type: 'prompt' | 'control' | 'app_control';
+    content: string;
+    description: string; // What this action does (for error reporting)
+    appAction?: {
+      action: string;
+      target?: string;
+      params?: Record<string, unknown>;
+    };
+  }>;
   appAction?: {
     action:
       | 'navigate'           // Go to a tab (target: projects, terminal, editor, preview, settings)
@@ -668,13 +679,26 @@ Use this context to:
 - Reference specific output or errors
 - Make informed decisions about actions
 
-## SCREEN VISION
+## SCREEN VISION - CRITICAL HONESTY POLICY
+
+**NEVER HALLUCINATE VISUAL CONTENT. BE HONEST ABOUT WHAT YOU CAN AND CANNOT SEE.**
 
 When you receive a screenshot:
 - Describe what you see if asked
 - Use visual context for better responses
 - Notice errors, prompts, UI state
 - Reference specific elements: "I see Claude is asking for permission..."
+
+**If you DON'T receive a valid screenshot:**
+- SAY SO IMMEDIATELY: "I wasn't able to capture the screenshot" or "The screenshot didn't come through"
+- DO NOT describe what you think might be there
+- DO NOT make up visual details
+- Offer to try again: "Would you like me to try capturing the screen again?"
+
+**How to know if screenshot is valid:**
+- You'll receive it as an image in your message content
+- If you see the image, describe it accurately
+- If you DON'T see the image, admit it - don't guess!
 
 ## TURN-TAKING POLICY - CRITICAL
 
@@ -710,6 +734,12 @@ When sending prompts or commands to Claude Code:
 4. You receive the result and summarize it for the user
 
 ## OUTPUT FORMAT - JSON ONLY
+
+**CRITICAL RULES:**
+1. Output EXACTLY ONE JSON object - never multiple objects in one response
+2. NEVER second-guess yourself or say "Wait, let me revise" - stick with your first decision
+3. NEVER output explanatory text after the JSON object
+4. NEVER wrap in markdown code fences
 
 **IMPORTANT:** You can add an optional "voiceResponse" field to ANY action type (except ignore) to speak to the user while executing the action. Use this when you want to tell the user what you're doing AND do it at the same time.
 
@@ -786,8 +816,68 @@ Example flow:
 User: "Hey Lora, have Claude check what this project is about, and then come back to me - I want to tell you about my day"
 → {"type": "background_task", "content": "I've sent that to Claude. So tell me about your day!", "backgroundTask": {"taskDescription": "checking project purpose", "prompt": "What is this project about? Give me a brief overview."}}
 
+### ACTION_SEQUENCE - Execute multiple actions in order (POWERFUL!)
+{"type": "action_sequence", "content": "Summary of what you'll do", "voiceResponse": "What to tell user", "actions": [ACTION1, ACTION2, ...]}
+
+**⚠️ CRITICAL: USE ACTION_SEQUENCE when user requests multiple steps!**
+
+**Patterns that require action_sequence:**
+- "Go to X and do Y" → action_sequence
+- "Switch to X and do Y" → action_sequence
+- "Terminal X and do Y" → action_sequence
+- "Navigate to X and do Y" → action_sequence
+- "Open X and do Y" → action_sequence
+- "Check X and then do Y" → action_sequence
+
+**Examples:**
+- "Go to Terminal 2 and tell Claude to fix the bug" → action_sequence
+- "Switch to the preview tab, reload it, and send errors to Claude" → action_sequence
+- "Open App.tsx, check what it does, then improve it" → action_sequence
+- "Navigate to Terminal 1 and ask Claude to improve the UI" → action_sequence
+
+**How it works:**
+1. You specify 2-5 actions to execute in sequence
+2. The system executes them ONE BY ONE
+3. If an action fails, the system reports the failure and stops
+4. Results from all actions are collected and reported to user
+
+**Action format:**
+Each action needs:
+- type: 'prompt', 'control', or 'app_control'
+- content: The actual command/content
+- description: Human-readable description (for error reporting)
+- appAction: (if type='app_control') The app action to perform
+
+**Example 1:** "Go to Terminal 2 and tell Claude to fix the TypeScript errors"
+Response: action_sequence with 2 actions - first switch_terminal to index 1, then prompt to fix TypeScript errors
+
+**Example 2:** "Check the preview and send errors to Claude"
+Response: action_sequence with 2 actions - first navigate to preview, then send_to_claude
+
+**Benefits:**
+- Executes complex multi-step workflows automatically
+- Programmatic error handling (if step 1 fails, you'll know before step 2)
+- Clear feedback on what succeeded and what failed
+- No need for user to repeat themselves
+
 ### APP_CONTROL - Control Lora app UI programmatically
 {"type": "app_control", "content": "Description", "appAction": {"action": "ACTION", "target": "TARGET", "params": {...}}}
+
+**TERMINAL SWITCHING - BEST PRACTICES:**
+
+Each terminal runs its own independent Claude Code instance. All terminals can do the same work.
+
+**WHEN TO SWITCH TERMINALS:**
+- User wants to VIEW what's happening on a specific terminal ("show me Terminal 2")
+- User wants to MANAGE terminals (close, create new ones)
+- User explicitly requests switching to a specific terminal
+
+**EFFICIENCY TIP:**
+If user says "go to Terminal 1 and do X", consider whether switching is necessary.
+- If they just want X done, you can do it in the current terminal (faster, fewer steps)
+- If they specifically need Terminal 1 for a reason (checking its state, continuing work there), then switch
+
+Your conversation memory is SHARED across all terminals in the project, so switching won't lose context.
 
 **COMPLETE ACTION REFERENCE:**
 
@@ -908,10 +998,26 @@ Examples:
 - Pure conversation not about coding
 
 ### When to SEND (prompt) - BLOCKS until complete:
-- User confirmed: "yes, do it"
-- Clear request: "add a login page"
-- Follow-up: "now make it blue"
-- User wants to know what Claude does (will wait and report back)
+⚠️ THIS IS THE MOST COMMON ACTION! Use this when user wants coding work done.
+
+**CRITICAL PATTERN RECOGNITION:**
+If user says ANY of these phrases, use type="prompt":
+- "tell Claude Code to..."
+- "ask Claude Code to..."
+- "have Claude Code..."
+- "get Claude to..."
+- "Claude should..."
+- "improve/fix/add/create/update..."
+
+Examples:
+- "tell Claude Code to improve the UI" → PROMPT (NOT control!)
+- "ask Claude to fix this error" → PROMPT
+- "have Claude add dark mode" → PROMPT
+- "improve the design" → PROMPT
+- "create a new feature" → PROMPT
+
+When using PROMPT, enhance the user's request with technical details:
+- User: "improve the UI" → Prompt: "Redesign the UI with 2025 design trends: ample whitespace, subtle shadows, smooth animations, consistent 8px spacing grid, modern sans-serif typography, accessible color contrast (WCAG AA), mobile-first responsive design"
 
 ### When to use BACKGROUND_TASK:
 - User says "in the background", "come back to me", "while we talk"
@@ -920,10 +1026,15 @@ Examples:
 - You send task to Claude but immediately return to user for conversation
 
 ### When to CONTROL:
-- Direct command: "press escape"
-- Navigation: "go down and select"
-- Slash command: "run resume"
-- Confirmation: "yes" or "no"
+⚠️ ONLY for controlling Claude Code's TERMINAL INTERFACE - NOT for coding tasks!
+
+Use ONLY when user wants to:
+- Press specific keys: "press escape", "hit enter", "ctrl-c"
+- Navigate menus: "go down", "arrow up", "select the second option"
+- Answer prompts: "say yes", "decline"
+- Run slash commands: "/clear", "/resume"
+
+DO NOT USE CONTROL for coding tasks like "tell Claude to do X" - that's a PROMPT!
 
 ### When to use WORKING:
 - User asks about screen: "what do you see?" AND you have NO screenshot
@@ -1189,6 +1300,7 @@ export async function processVoiceInput(
     terminalContent?: string;  // Raw terminal output for observation
     appState?: { currentTab: string; projectName?: string; projectId?: string; hasPreview?: boolean; fileCount?: number; currentFile?: string; terminalCount?: number; activeTerminalIndex?: number };
     systemNote?: string;  // System instruction to inject (for follow-up after commands)
+    isSystemPrompt?: boolean;  // Flag to skip semantic validation (for AI-generated follow-ups)
   },
   model?: string  // Optional model override (e.g., claude-haiku-4-5-20251001, claude-sonnet-4-5-20250514)
 ): Promise<VoiceAgentResponse> {
@@ -1205,9 +1317,117 @@ export async function processVoiceInput(
 
   const startTime = Date.now();
 
+  // Validate the parsed response programmatically
+  function validateResponse(response: VoiceAgentResponse, userInput: string): { valid: boolean; error?: string } {
+    // Check required fields
+    if (!response.type) {
+      return { valid: false, error: 'Missing required field: type' };
+    }
+
+    if (!response.content && response.type !== 'ignore') {
+      return { valid: false, error: 'Missing required field: content' };
+    }
+
+    // Validate type is one of the allowed values
+    const validTypes = ['prompt', 'control', 'conversational', 'ignore', 'app_control', 'working', 'background_task', 'action_sequence'];
+    if (!validTypes.includes(response.type)) {
+      return { valid: false, error: `Invalid type: ${response.type}. Must be one of: ${validTypes.join(', ')}` };
+    }
+
+    // Validate action_sequence has actions array
+    if (response.type === 'action_sequence') {
+      if (!response.actions || !Array.isArray(response.actions)) {
+        return { valid: false, error: 'action_sequence type requires actions array' };
+      }
+      if (response.actions.length === 0) {
+        return { valid: false, error: 'action_sequence requires at least 1 action' };
+      }
+      if (response.actions.length > 5) {
+        return { valid: false, error: 'action_sequence cannot exceed 5 actions (too complex)' };
+      }
+      // Validate each action in the sequence
+      for (let i = 0; i < response.actions.length; i++) {
+        const action = response.actions[i];
+
+        // Check type is required, and either description or content (both work)
+        if (!action.type) {
+          return { valid: false, error: `Action ${i + 1} missing required field: type` };
+        }
+        if (!action.description && !action.content) {
+          return { valid: false, error: `Action ${i + 1} missing required field: description or content` };
+        }
+
+        // Validate action type
+        if (!['prompt', 'control', 'app_control'].includes(action.type)) {
+          return { valid: false, error: `Action ${i + 1} has invalid type: ${action.type}` };
+        }
+
+        // For app_control, either content or appAction is required
+        if (action.type === 'app_control') {
+          if (!action.content && !action.appAction) {
+            return { valid: false, error: `Action ${i + 1} (app_control) requires either content or appAction` };
+          }
+        } else {
+          // For prompt and control, content is required
+          if (!action.content) {
+            return { valid: false, error: `Action ${i + 1} (${action.type}) missing required field: content` };
+          }
+        }
+      }
+    }
+
+    // Validate app_control has appAction
+    if (response.type === 'app_control' && !response.appAction) {
+      return { valid: false, error: 'app_control type requires appAction field' };
+    }
+
+    // Validate working has workingState
+    if (response.type === 'working' && !response.workingState) {
+      return { valid: false, error: 'working type requires workingState field' };
+    }
+
+    // Validate background_task has backgroundTask
+    if (response.type === 'background_task' && !response.backgroundTask) {
+      return { valid: false, error: 'background_task type requires backgroundTask field' };
+    }
+
+    // Semantic validation: does the response make sense for the input?
+    // SKIP semantic validation for system-generated prompts (they're not actual user voice)
+    const isSystemPrompt = context?.isSystemPrompt === true;
+
+    if (!isSystemPrompt) {
+      const lowerInput = userInput.toLowerCase();
+
+      // If user says "tell Claude to do X", response should be prompt, not control
+      if ((lowerInput.includes('tell claude') || lowerInput.includes('ask claude') || lowerInput.includes('have claude'))
+          && response.type === 'control') {
+        return { valid: false, error: 'User requested coding task but you returned control. Use type=prompt for "tell Claude to..." requests.' };
+      }
+
+      // If user says "go to X and do Y" or "switch to X and do Y", it should be action_sequence
+      const multiStepPatterns = [
+        /go to (terminal|tab).*and (tell|ask|have|send|do)/i,
+        /switch to (terminal|tab).*and (tell|ask|have|send|do)/i,
+        /(terminal|tab) \d+.*and (tell|ask|have|send|do)/i,
+        /navigate to.*and (then )?(tell|ask|have|send|do)/i,
+        /(open|check|view).*and (then )?(tell|ask|have|send|do)/i
+      ];
+
+      const isMultiStep = multiStepPatterns.some(pattern => pattern.test(userInput));
+      if (isMultiStep && response.type !== 'action_sequence') {
+        return {
+          valid: false,
+          error: `User requested multiple steps ("go to X and do Y") but you returned ${response.type}. Use type=action_sequence for multi-step requests.`
+        };
+      }
+    }
+
+    return { valid: true };
+  }
+
   // Helper function to call the AI
   // Note: anthropic is checked above, this inner function requires it to be non-null
-  async function callAgent(includeImage: boolean): Promise<VoiceAgentResponse> {
+  async function callAgent(includeImage: boolean, retryContext?: { previousResponse: string; error: string }): Promise<VoiceAgentResponse> {
     if (!anthropic) {
       throw new Error('Anthropic client not available');
     }
@@ -1312,17 +1532,37 @@ export async function processVoiceInput(
     }
 
     // Add text prompt
-    messageContent.push({
-      type: 'text',
-      text: `${contextInfo}
+    let promptText = `${contextInfo}
 User just said: "${userSpeech}"
 
-Output JSON only:`
+IMPORTANT: Output ONLY the raw JSON object. Do NOT wrap in markdown code fences. Do NOT include any text before or after the JSON.`;
+
+    // Add retry context if this is a correction attempt
+    if (retryContext) {
+      promptText += `
+
+⚠️ ERROR IN YOUR PREVIOUS RESPONSE ⚠️
+Your previous response had an error and needs to be corrected.
+
+Previous response:
+${retryContext.previousResponse}
+
+Error:
+${retryContext.error}
+
+Please provide a CORRECTED response that fixes this error. Output only valid JSON.`;
+    }
+
+    promptText += `\n\nYour response:`;
+
+    messageContent.push({
+      type: 'text',
+      text: promptText
     });
 
     const result = await anthropic.messages.create({
       model: activeModel,  // Use passed model or default (defined at function start)
-      max_tokens: 300,  // Allow more detailed responses when context is complex
+      max_tokens: 5024,  // Increased to allow detailed prompts with technical specifications
       system: CLAUDE_CODE_SYSTEM_PROMPT,
       messages: [{
         role: 'user',
@@ -1334,16 +1574,100 @@ Output JSON only:`
     const duration = Date.now() - startTime;
 
     voiceLog('AI', 'Agent', `│ AI responded in ${duration}ms`);
+    voiceLog('AI', 'Agent', `│ Response length: ${responseText.length} chars`);
+    voiceLog('AI', 'Agent', `│ Stop reason: ${result.stop_reason}`);
 
-    // Parse JSON response
-    let jsonStr = responseText;
-    if (jsonStr.includes('```')) {
-      const match = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
-      if (match) jsonStr = match[1].trim();
+    // Check if response was truncated due to max_tokens
+    if (result.stop_reason === 'max_tokens') {
+      voiceLog('ERROR', 'Agent', `Response was TRUNCATED! Increase max_tokens.`);
     }
 
-    const parsed = JSON.parse(jsonStr) as VoiceAgentResponse;
+    // Extract the FIRST complete JSON object programmatically
+    // This handles cases where the AI outputs multiple objects or extra text
+    function extractFirstJsonObject(text: string): string | null {
+      const firstBrace = text.indexOf('{');
+      if (firstBrace === -1) return null;
 
+      let depth = 0;
+      let inString = false;
+      let escapeNext = false;
+
+      for (let i = firstBrace; i < text.length; i++) {
+        const char = text[i];
+
+        if (escapeNext) {
+          escapeNext = false;
+          continue;
+        }
+
+        if (char === '\\') {
+          escapeNext = true;
+          continue;
+        }
+
+        if (char === '"') {
+          inString = !inString;
+          continue;
+        }
+
+        if (!inString) {
+          if (char === '{') {
+            depth++;
+          } else if (char === '}') {
+            depth--;
+            if (depth === 0) {
+              // Found the matching closing brace
+              return text.substring(firstBrace, i + 1);
+            }
+          }
+        }
+      }
+
+      return null; // No complete object found
+    }
+
+    const jsonStr = extractFirstJsonObject(responseText);
+
+    if (!jsonStr) {
+      voiceLog('ERROR', 'Agent', `No complete JSON object found in response`);
+      voiceLog('ERROR', 'Agent', `Response length: ${responseText.length}`);
+      voiceLog('ERROR', 'Agent', `First 500 chars: ${responseText.substring(0, 500)}`);
+      voiceLog('ERROR', 'Agent', `Last 500 chars: ${responseText.substring(Math.max(0, responseText.length - 500))}`);
+      throw new Error('No complete JSON object found in agent response');
+    }
+
+    voiceLog('AI', 'Agent', `│ Extracted JSON length: ${jsonStr.length} chars`);
+
+    let parsed: VoiceAgentResponse;
+
+    try {
+      parsed = JSON.parse(jsonStr) as VoiceAgentResponse;
+    } catch (parseError) {
+      voiceLog('ERROR', 'Agent', `JSON parse failed: ${parseError}`);
+      voiceLog('ERROR', 'Agent', `JSON string length: ${jsonStr.length}`);
+      voiceLog('ERROR', 'Agent', `Extracted JSON: ${jsonStr}`);
+      throw new Error('Failed to parse agent response as JSON');
+    }
+
+    // Validate the response programmatically
+    const validation = validateResponse(parsed, userSpeech);
+
+    if (!validation.valid) {
+      voiceLog('ERROR', 'Agent', `❌ Response validation failed: ${validation.error}`);
+      voiceLog('AI', 'Agent', `│ Parsed type: ${parsed.type}, content: "${parsed.content?.substring(0, 100)}"`);
+
+      // If this is already a retry, don't retry again to avoid infinite loops
+      if (retryContext) {
+        voiceLog('ERROR', 'Agent', `Already retried once, giving up`);
+        throw new Error(`Validation failed after retry: ${validation.error}`);
+      }
+
+      // Retry with error context - let the AI fix its mistake
+      voiceLog('AI', 'Agent', `│ 🔄 Attempting self-correction...`);
+      throw new Error(`VALIDATION_FAILED:${validation.error}:${responseText}`);
+    }
+
+    voiceLog('AI', 'Agent', `│ ✅ Validation passed`);
     voiceLog('AI', 'Agent', `│ Decision: ${parsed.type.toUpperCase()}`);
     voiceLog('AI', 'Agent', `│ Content: "${parsed.content}"`);
     voiceLog('AI', 'Agent', '└───────────────────────────────');
@@ -1360,12 +1684,33 @@ Output JSON only:`
     return parsed;
   }
 
+  // Check if image is available (used in try/catch below)
+  const hasImage = !!context?.screenCapture;
+
   try {
     // First try with image if available
-    const hasImage = !!context?.screenCapture;
     return await callAgent(hasImage);
   } catch (error) {
     const errorStr = String(error);
+
+    // Check if this is a validation failure that needs self-correction
+    if (errorStr.startsWith('VALIDATION_FAILED:')) {
+      const parts = errorStr.split(':');
+      const validationError = parts[1];
+      const previousResponse = parts.slice(2).join(':');
+
+      voiceLog('AI', 'Agent', `│ 🔄 Self-correction attempt: ${validationError}`);
+
+      try {
+        return await callAgent(hasImage, {
+          previousResponse: previousResponse.substring(0, 1000), // Limit size
+          error: validationError
+        });
+      } catch (retryError) {
+        voiceLog('ERROR', 'Agent', `Self-correction failed: ${retryError}`);
+        return { type: 'conversational', content: "Sorry, I had trouble understanding that request. Could you rephrase it?" };
+      }
+    }
 
     // If image processing failed, retry without the image
     if (context?.screenCapture && (errorStr.includes('Could not process image') || errorStr.includes('image'))) {
@@ -1421,11 +1766,10 @@ export async function summarizeForVoice(
 
     const result = await anthropic.messages.create({
       model: model || MODEL,  // Use passed model or default
-      max_tokens: 150,
+      max_tokens: 550,
       system: `You convert AI coding assistant output to speech-friendly text.
 
 Rules:
-- Use first person: "I created...", "I found..."
 - No code syntax, file paths, or technical formatting
 - Natural conversational language
 - Spell out: API→"A P I", JSON→"jason", HTML→"H T M L"
@@ -1567,11 +1911,73 @@ export async function processVoiceCommand(
   return { text: responseText, audio: audioBuffer };
 }
 
+/**
+ * Present Claude Code's response to the user with contextual attribution
+ * The voice agent decides how to naturally present the response based on conversation context
+ */
+export async function presentClaudeResponse(
+  claudeResponse: string,
+  sessionId: string,
+  userRequest: string
+): Promise<string> {
+  if (!anthropic) {
+    // Fallback if no AI available
+    return await summarizeForVoice(claudeResponse, sessionId, 'brief');
+  }
+
+  try {
+    voiceLog('AI', 'Present', `Generating contextual response presentation`);
+
+    const memory = conversationMemory.get(sessionId) || { turns: [] };
+    const recentHistory = memory.turns.slice(-3).map((t: ConversationTurn) =>
+      `User: ${t.userSaid}\nAgent: ${t.voiceResponse || t.agentAction.content || ''}`
+    ).join('\n\n');
+
+    const result = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 300,
+      system: `You are the Lora voice assistant. Claude Code (a separate AI coding agent) just responded to the user's request.
+Your job: Present Claude Code's response to the user naturally, in a way that fits the conversation context.
+
+Rules:
+- Attribute the response to Claude Code naturally (e.g., "Claude Code says...", "It responded that...", "According to Claude Code...")
+- The attribution should fit the conversation flow - not always the same phrase
+- Keep it brief and natural
+- Make it speech-friendly (no code syntax, spell out acronyms)
+- If Claude Code's response is long/technical, summarize briefly
+- Output ONLY your spoken response to the user`,
+      messages: [{
+        role: 'user',
+        content: `Recent conversation:
+${recentHistory}
+
+User just said: "${userRequest}"
+
+Claude Code responded:
+${claudeResponse.substring(0, 1000)}
+
+How should you present this response to the user?`
+      }]
+    });
+
+    const presentation = result.content[0].type === 'text' ? result.content[0].text : claudeResponse;
+    const formatted = formatForSpeech(presentation);
+
+    voiceLog('AI', 'Present', `Generated: "${formatted.substring(0, 80)}..."`);
+    return formatted;
+  } catch (error) {
+    voiceLog('ERROR', 'Present', `Failed to generate presentation: ${error}`);
+    // Fallback to simple summarization
+    return await summarizeForVoice(claudeResponse, sessionId, 'brief');
+  }
+}
+
 export default {
   transcribeAudio,
   textToSpeech,
   processVoiceInput,
   summarizeForVoice,
+  presentClaudeResponse,
   isVoiceServiceAvailable,
   handleInterrupt,
   getConversationMemory,

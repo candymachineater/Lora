@@ -448,14 +448,14 @@ class BridgeService {
   }
 
   // Project management
-  async createProject(name: string): Promise<ServerProject> {
+  async createProject(name: string, projectType: 'mobile' | 'web' = 'mobile'): Promise<ServerProject> {
     return new Promise((resolve, reject) => {
       if (!this.isConnected()) {
         reject(new Error('Not connected'));
         return;
       }
       this.pendingResolvers.set('project_created', resolve);
-      this.send({ type: 'create_project', projectName: name });
+      this.send({ type: 'create_project', projectName: name, projectType });
       setTimeout(() => {
         if (this.pendingResolvers.has('project_created')) {
           this.pendingResolvers.delete('project_created');

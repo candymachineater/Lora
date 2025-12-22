@@ -7,6 +7,8 @@ import * as path from 'path';
 import * as pty from 'node-pty';
 import * as voiceService from './voice-service';
 import * as tmuxService from './tmux-service';
+import { getTemplate } from './templates';
+import { ProjectType } from './templates/types';
 
 const PORT = parseInt(process.env.PORT || '8765');
 const PROJECTS_DIR = process.env.PROJECTS_DIR || path.join(__dirname, '../../projects');
@@ -53,9 +55,10 @@ fs.writeFileSync(serverLogFile, `=== Bridge Server Started at ${getTimestamp()} 
 fs.writeFileSync(terminalLogFile, `=== Terminal Logs Started at ${getTimestamp()} ===\n`);
 
 interface Message {
-  type: 'ping' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'preview_start' | 'preview_stop' | 'preview_status';
+  type: 'ping' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'screenshot_captured' | 'preview_start' | 'preview_stop' | 'preview_status';
   projectName?: string;
   projectId?: string;
+  projectType?: ProjectType;
   filePath?: string;
   content?: string; // For save_file
   terminalId?: string;
@@ -91,6 +94,7 @@ interface ProjectInfo {
   id: string;
   name: string;
   path: string;
+  projectType: ProjectType;
   createdAt: string;
 }
 
@@ -196,6 +200,8 @@ interface TerminalSession {
   backgroundTasks: BackgroundTask[];
   // WebSocket for sending notifications (stored for background task callbacks)
   ws?: WebSocket;
+  // Pending screenshot resolver for take_screenshot actions
+  pendingScreenshotResolver?: (screenshot: string) => void;
 }
 
 // Home directory for non-sandboxed access
@@ -400,14 +406,29 @@ async function startPreviewServer(
     });
   }
 
+  // Detect project type from .lora.json
+  let projectType: ProjectType = 'mobile';
+  const metaPath = path.join(projectPath, '.lora.json');
+  if (fs.existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      projectType = meta.projectType || 'mobile';
+    } catch (err) {
+      serverError(`Failed to read project type:`, err);
+    }
+  }
+
+  const template = getTemplate(projectType);
+
   // Find an available port
   const port = await findAvailablePort(nextPreviewPort);
   nextPreviewPort = port + 1; // Update for next time
 
-  serverLog(`🚀 Starting preview server for ${projectId} on port ${port}`);
+  serverLog(`🚀 Starting ${template.name} preview for ${projectId} on port ${port}`);
 
-  // Start expo web server with explicit port
-  const expoProcess = spawn('npx', ['expo', 'start', '--web', '--port', port.toString()], {
+  // Start dev server with template's command
+  const devCmd = template.getDevCommand(port);
+  const expoProcess = spawn(devCmd[0], devCmd.slice(1), {
     cwd: projectPath,
     stdio: 'pipe',
     env: { ...process.env, BROWSER: 'none', CI: '1' }  // Don't open browser, run non-interactive
@@ -519,10 +540,12 @@ function getPreviewStatus(projectId: string): { running: boolean; url?: string; 
  * Used when voice mode is enabled on a terminal
  * @param isComplete - If true, this is the final response and client should return to listening
  */
-async function processTerminalVoiceResponse(ws: WebSocket, terminalId: string, response: string, session?: TerminalSession, isComplete: boolean = true): Promise<void> {
+async function processTerminalVoiceResponse(ws: WebSocket, terminalId: string, response: string, session?: TerminalSession, isComplete: boolean = true, userRequest?: string): Promise<void> {
   try {
-    // Summarize for voice with session context
-    const voiceText = await voiceService.summarizeForVoice(response, terminalId, 'brief');
+    // Use contextual presentation if we have the user's request, otherwise simple summarization
+    const voiceText = userRequest
+      ? await voiceService.presentClaudeResponse(response, session?.projectId || terminalId, userRequest)
+      : await voiceService.summarizeForVoice(response, terminalId, 'brief');
 
     if (voiceText && voiceText.length > 10) {
       // Generate TTS
@@ -615,6 +638,7 @@ function listProjects(): ProjectInfo[] {
         id: entry.name,
         name: meta.name,
         path: projectPath,
+        projectType: (meta as any).projectType || 'mobile', // Default to mobile for backward compatibility
         createdAt: meta.createdAt
       });
     }
@@ -690,155 +714,49 @@ function deleteProject(projectId: string): boolean {
 }
 
 // Create a new project with Expo template for easy previews
-function createProjectWithTemplate(projectId: string, projectName: string): void {
+function createProjectWithTemplate(projectId: string, projectName: string, projectType: ProjectType = 'mobile'): void {
   const projectPath = getProjectPath(projectId);
 
   // Create project directory
   fs.mkdirSync(projectPath, { recursive: true });
 
-  // Create .lora.json metadata
-  const meta = {
-    name: projectName,
-    createdAt: new Date().toISOString()
-  };
-  fs.writeFileSync(path.join(projectPath, '.lora.json'), JSON.stringify(meta, null, 2));
+  // Get template for project type
+  const template = getTemplate(projectType);
 
-  // Create package.json with Expo dependencies
-  const packageJson = {
-    name: projectId,
-    version: '1.0.0',
-    main: 'index.js',
-    scripts: {
-      start: 'expo start',
-      android: 'expo start --android',
-      ios: 'expo start --ios',
-      web: 'expo start --web'
-    },
-    dependencies: {
-      'expo': '~54.0.0',
-      'expo-status-bar': '~3.0.0',
-      'react': '19.1.0',
-      'react-dom': '19.1.0',
-      'react-native': '0.81.5',
-      'react-native-web': '^0.21.0',
-      'react-native-safe-area-context': '^5.0.0',
-      '@react-navigation/native': '^7.0.0'
-    },
-    devDependencies: {
-      '@types/react': '~19.1.0',
-      'babel-preset-expo': '^54.0.0',
-      'typescript': '~5.9.0'
-    }
-  };
-  fs.writeFileSync(path.join(projectPath, 'package.json'), JSON.stringify(packageJson, null, 2));
-
-  // Create app.json for Expo
-  const appJson = {
-    expo: {
-      name: projectName,
-      slug: projectId,
-      version: '1.0.0',
-      orientation: 'portrait',
-      userInterfaceStyle: 'light',
-      splash: {
-        backgroundColor: '#ffffff'
-      },
-      ios: {
-        supportsTablet: true
-      },
-      android: {
-        adaptiveIcon: {
-          backgroundColor: '#ffffff'
-        }
-      }
-    }
-  };
-  fs.writeFileSync(path.join(projectPath, 'app.json'), JSON.stringify(appJson, null, 2));
-
-  // Create babel.config.js
-  const babelConfig = `module.exports = function(api) {
-  api.cache(true);
-  return {
-    presets: ['babel-preset-expo'],
-  };
-};
-`;
-  fs.writeFileSync(path.join(projectPath, 'babel.config.js'), babelConfig);
-
-  // Create tsconfig.json
-  const tsConfig = {
-    extends: 'expo/tsconfig.base',
-    compilerOptions: {
-      strict: true
-    }
-  };
-  fs.writeFileSync(path.join(projectPath, 'tsconfig.json'), JSON.stringify(tsConfig, null, 2));
-
-  // Create App.tsx with a simple starter template
-  const appTsx = `import React from 'react';
-import { StyleSheet, Text, View, SafeAreaView, StatusBar } from 'react-native';
-
-export default function App() {
-  return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="dark-content" />
-      <View style={styles.content}>
-        <Text style={styles.title}>Welcome to ${projectName}</Text>
-        <Text style={styles.subtitle}>Start building your app!</Text>
-      </View>
-    </SafeAreaView>
+  // Generate .lora.json metadata
+  const metadata = template.generateMetadata(projectName);
+  fs.writeFileSync(
+    path.join(projectPath, '.lora.json'),
+    JSON.stringify(metadata, null, 2)
   );
-}
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#fff',
-  },
-  content: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 20,
-  },
-  title: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#333',
-    marginBottom: 10,
-  },
-  subtitle: {
-    fontSize: 16,
-    color: '#666',
-  },
-});
-`;
-  fs.writeFileSync(path.join(projectPath, 'App.tsx'), appTsx);
+  // Generate all template files
+  const files = template.generateFiles(projectId, projectName);
+  for (const file of files) {
+    const filePath = path.join(projectPath, file.path);
+    const fileDir = path.dirname(filePath);
 
-  // Create index.js entry point (required for Expo Go)
-  const indexJs = `import { registerRootComponent } from 'expo';
-import App from './App';
+    // Create directories for nested files (e.g., src/App.tsx)
+    if (!fs.existsSync(fileDir)) {
+      fs.mkdirSync(fileDir, { recursive: true });
+    }
 
-registerRootComponent(App);
-`;
-  fs.writeFileSync(path.join(projectPath, 'index.js'), indexJs);
-
-  // Create .gitignore
-  const gitignore = `node_modules/
-.expo/
-dist/
-*.log
-`;
-  fs.writeFileSync(path.join(projectPath, '.gitignore'), gitignore);
+    fs.writeFileSync(filePath, file.content);
+  }
 
   // Set up sandbox configuration for Claude Code isolation
   tmuxService.setupProjectSandbox(projectPath);
 
-  serverLog(`📁 Created project with template: ${projectName} (${projectId})`);
+  // Generate CLAUDE.md
+  const claudeMd = template.generateClaudeMd(projectPath);
+  fs.writeFileSync(path.join(projectPath, 'CLAUDE.md'), claudeMd);
+
+  serverLog(`📁 Created ${template.name}: ${projectName} (${projectId})`);
 
   // Run npm install in background to install dependencies
   serverLog(`📦 Installing dependencies for ${projectId}...`);
-  const npmInstall = spawn('npm', ['install'], {
+  const installCmd = template.getInstallCommand();
+  const npmInstall = spawn(installCmd[0], installCmd.slice(1), {
     cwd: projectPath,
     stdio: 'pipe',
     shell: true
@@ -848,12 +766,12 @@ dist/
     if (code === 0) {
       serverLog(`✅ Dependencies installed for ${projectId}`);
     } else {
-      serverLog(`⚠️ npm install exited with code ${code} for ${projectId}`);
+      serverLog(`⚠️ Install exited with code ${code} for ${projectId}`);
     }
   });
 
   npmInstall.on('error', (err) => {
-    serverLog(`❌ npm install failed for ${projectId}: ${err.message}`);
+    serverLog(`❌ Install failed for ${projectId}: ${err.message}`);
   });
 }
 
@@ -881,11 +799,12 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       if (message.type === 'create_project' && message.projectName) {
+        const projectType = message.projectType || 'mobile';
         const projectId = createProjectId(message.projectName);
         const projectPath = getProjectPath(projectId);
 
-        // Create project with Expo template for easy previews
-        createProjectWithTemplate(projectId, message.projectName);
+        // Create project with template
+        createProjectWithTemplate(projectId, message.projectName, projectType);
 
         const response: StreamResponse = {
           type: 'project_created',
@@ -893,6 +812,7 @@ wss.on('connection', (ws: WebSocket) => {
             id: projectId,
             name: message.projectName,
             path: projectPath,
+            projectType: projectType,
             createdAt: new Date().toISOString()
           }
         };
@@ -1005,12 +925,25 @@ wss.on('connection', (ws: WebSocket) => {
               isReusingSession = true;
               serverLog(`♻️  Reconnecting terminal ${terminalId} to existing Claude session: ${tmuxSessionName}`);
             } else {
-              // No existing session - create new tmux session
-              serverLog(`🖥️  Creating new terminal ${terminalId} for project ${projectId}`);
-              const tmuxSession = await tmuxService.createSession(terminalId, projectPath, {
-                autoStartClaude: false
-              });
-              tmuxSessionName = tmuxSession.sessionName;
+              // No registry entry - check if tmux session still exists (server restart case)
+              const expectedSessionName = `lora-${projectId}`;
+              const tmuxSessionExists = await tmuxService.sessionExists(expectedSessionName);
+
+              if (tmuxSessionExists) {
+                // Tmux session exists from before server restart - reuse it
+                tmuxSessionName = expectedSessionName;
+                isReusingSession = true;
+                serverLog(`♻️  Reconnecting terminal ${terminalId} to existing tmux session: ${tmuxSessionName}`);
+                // Re-register to claudeSessionRegistry so future reconnects work
+                registerClaudeSession(projectId, tmuxSessionName);
+              } else {
+                // No existing session - create new tmux session using projectId for persistence
+                serverLog(`🖥️  Creating new terminal ${terminalId} for project ${projectId}`);
+                const tmuxSession = await tmuxService.createSession(projectId, projectPath, {
+                  autoStartClaude: false
+                });
+                tmuxSessionName = tmuxSession.sessionName;
+              }
             }
           }
 
@@ -1205,6 +1138,18 @@ wss.on('connection', (ws: WebSocket) => {
           serverLog(`⏹️ Voice session interrupted for terminal ${message.terminalId}`);
           // Log the interrupt for debugging
           voiceService.handleInterrupt(message.terminalId);
+        }
+        return;
+      }
+
+      // Handle screenshot_captured message (sent after take_screenshot action)
+      if (message.type === 'screenshot_captured' && message.terminalId) {
+        const session = terminals.get(message.terminalId);
+        if (session && session.pendingScreenshotResolver) {
+          const screenshot = (message as any).screenshot;
+          serverLog(`[Voice] Received screenshot_captured for terminal ${message.terminalId}`);
+          session.pendingScreenshotResolver(screenshot);
+          session.pendingScreenshotResolver = undefined; // Clear resolver
         }
         return;
       }
@@ -1427,12 +1372,14 @@ wss.on('connection', (ws: WebSocket) => {
 
           const agentResponse = await voiceService.processVoiceInput(
             transcription,
-            message.terminalId,  // sessionId for conversation memory
+            session.projectId,  // sessionId for conversation memory - USE PROJECT ID so all terminals share memory!
             {
               projectName: message.appState?.projectName || projectMeta?.name,
               recentOutput: terminalContext + appStateDesc,
               claudeCodeState: stateDescription,
-              screenCapture: message.screenCapture  // Phone screenshot if provided
+              screenCapture: message.screenCapture,  // Phone screenshot if provided
+              terminalContent: terminalContext,
+              appState: message.appState
             },
             session.voiceAgentModel  // Pass selected model
           );
@@ -1442,6 +1389,647 @@ wss.on('connection', (ws: WebSocket) => {
 
           // Handle IGNORE - transcription artifacts, noise
           if (agentResponse.type === 'ignore') {
+            return;
+          }
+
+          // ======================================================================
+          // ACTION CLASSIFICATION HELPERS FOR PARALLEL EXECUTION
+          // ======================================================================
+
+          interface ActionWithTarget {
+            action: any;
+            index: number;
+            targetTerminalIndex?: number;
+            targetTmuxSession: string;
+          }
+
+          interface ActionGroup {
+            actions: ActionWithTarget[];
+            isParallel: boolean;
+            description: string;
+          }
+
+          /**
+           * Classifies actions into groups that can run in parallel vs sequentially.
+           *
+           * Rules:
+           * - Multiple prompt actions with DIFFERENT terminal targets → Parallel group
+           * - switch_terminal followed by prompt to SAME terminal → Sequential
+           * - take_screenshot → Always sequential (waits for all prompts first)
+           * - Other actions → Sequential by default
+           */
+          function classifyActionGroups(
+            actions: any[],
+            projectId: string,
+            currentTmuxSession: string
+          ): ActionGroup[] {
+            const groups: ActionGroup[] = [];
+            let currentGroup: ActionGroup = {
+              actions: [],
+              isParallel: false,
+              description: ''
+            };
+
+            // Get all terminals for this project (ordered by creation)
+            const projectTerminals = Array.from(terminals.values())
+              .filter(t => t.projectId === projectId);
+
+            // Track which terminal index is currently targeted based on previous switches
+            let currentTargetIndex: number | undefined = undefined;
+
+            // Find current terminal's index
+            for (let i = 0; i < projectTerminals.length; i++) {
+              if (projectTerminals[i].tmuxSessionName === currentTmuxSession) {
+                currentTargetIndex = i;
+                break;
+              }
+            }
+
+            for (let i = 0; i < actions.length; i++) {
+              const action = actions[i];
+
+              // Determine target terminal for this action based on previous switches
+              let targetTerminalIndex = currentTargetIndex;
+              let targetTmuxSession = currentTmuxSession;
+
+              // Check if this action is a terminal switch that updates the target
+              if (action.type === 'app_control' &&
+                  action.appAction?.action === 'switch_terminal' &&
+                  action.appAction?.params?.index !== undefined) {
+                const switchIndex = action.appAction.params.index as number;
+                if (switchIndex >= 0 && switchIndex < projectTerminals.length) {
+                  currentTargetIndex = switchIndex;
+                  targetTerminalIndex = switchIndex;
+                  targetTmuxSession = projectTerminals[switchIndex].tmuxSessionName;
+                }
+              } else {
+                // Use current target from previous switches
+                if (currentTargetIndex !== undefined && currentTargetIndex < projectTerminals.length) {
+                  targetTmuxSession = projectTerminals[currentTargetIndex].tmuxSessionName;
+                }
+              }
+
+              const actionWithTarget: ActionWithTarget = {
+                action,
+                index: i,
+                targetTerminalIndex,
+                targetTmuxSession
+              };
+
+              // RULE 1: switch_terminal creates a new sequential group
+              if (action.type === 'app_control' &&
+                  action.appAction?.action === 'switch_terminal') {
+                // Flush current group if it has actions
+                if (currentGroup.actions.length > 0) {
+                  groups.push(currentGroup);
+                }
+                // Start new sequential group with just the switch
+                currentGroup = {
+                  actions: [actionWithTarget],
+                  isParallel: false,
+                  description: `Switch to Terminal ${(action.appAction.params?.index ?? 0) + 1}`
+                };
+                continue;
+              }
+
+              // RULE 2: take_screenshot must be sequential (wait for all prompts first)
+              if (action.type === 'app_control' &&
+                  action.appAction?.action === 'take_screenshot') {
+                // Flush current group
+                if (currentGroup.actions.length > 0) {
+                  groups.push(currentGroup);
+                }
+                // Screenshot is its own sequential group
+                groups.push({
+                  actions: [actionWithTarget],
+                  isParallel: false,
+                  description: 'Capture screenshot'
+                });
+                currentGroup = { actions: [], isParallel: false, description: '' };
+                continue;
+              }
+
+              // RULE 3: Multiple prompt actions with DIFFERENT targets = parallel
+              if (action.type === 'prompt') {
+                if (currentGroup.actions.length === 0) {
+                  // First prompt - start a new group
+                  currentGroup.actions.push(actionWithTarget);
+                  currentGroup.description = action.description || 'Execute command';
+                } else {
+                  // Check if this prompt targets a different terminal than others in group
+                  const existingPromptTargets = new Set(
+                    currentGroup.actions
+                      .filter(a => a.action.type === 'prompt')
+                      .map(a => a.targetTmuxSession)
+                  );
+
+                  if (existingPromptTargets.size > 0 && !existingPromptTargets.has(targetTmuxSession)) {
+                    // Different target - can run in parallel
+                    currentGroup.isParallel = true;
+                    currentGroup.actions.push(actionWithTarget);
+                    currentGroup.description += ` + ${action.description || 'Execute command'}`;
+                  } else {
+                    // Same target - must be sequential, flush and start new group
+                    groups.push(currentGroup);
+                    currentGroup = {
+                      actions: [actionWithTarget],
+                      isParallel: false,
+                      description: action.description || 'Execute command'
+                    };
+                  }
+                }
+                continue;
+              }
+
+              // RULE 4: All other actions are sequential
+              currentGroup.actions.push(actionWithTarget);
+              if (!currentGroup.description) {
+                currentGroup.description = action.description || 'Execute action';
+              }
+            }
+
+            // Flush final group
+            if (currentGroup.actions.length > 0) {
+              groups.push(currentGroup);
+            }
+
+            return groups;
+          }
+
+          /**
+           * Execute a single action sequentially.
+           * Handles app_control, prompt, and control action types.
+           */
+          async function executeSequentialAction(
+            actionWithTarget: ActionWithTarget,
+            ws: WebSocket,
+            session: TerminalSession,
+            message: Message,
+            results: Array<{ action: string; success: boolean; error?: string; claudeResponse?: string; screenshot?: string; terminalIndex?: number }>
+          ): Promise<{ lastClaudeResponse?: string; capturedScreenshot?: string }> {
+            const { action, targetTmuxSession, targetTerminalIndex } = actionWithTarget;
+            let lastClaudeResponse: string | undefined;
+            let capturedScreenshot: string | undefined;
+
+            serverLog(`[Voice] Executing action: ${action.description}`);
+
+            // Send progress update
+            ws.send(JSON.stringify({
+              type: 'voice_progress',
+              terminalId: message.terminalId,
+              progress: action.description
+            }));
+
+            if (action.type === 'app_control' && action.appAction) {
+              // Send app control action
+              serverLog(`[Voice] Sending app_control: ${JSON.stringify(action.appAction)}`);
+              ws.send(JSON.stringify({
+                type: 'voice_app_control',
+                terminalId: message.terminalId,
+                appControl: action.appAction
+              }));
+
+              // Special handling for take_screenshot - wait for screenshot response
+              if (action.appAction.action === 'take_screenshot') {
+                serverLog(`[Voice] Waiting for screenshot response...`);
+
+                // Wait for screenshot_captured message (with timeout)
+                const screenshot = await new Promise<string | undefined>((resolve) => {
+                  const timeoutId = setTimeout(() => {
+                    serverLog(`[Voice] Screenshot timeout - no response received`);
+                    resolve(undefined);
+                  }, 5000);
+
+                  session.pendingScreenshotResolver = (screenshot: string) => {
+                    clearTimeout(timeoutId);
+                    serverLog(`[Voice] Screenshot received (${screenshot.length} chars)`);
+                    resolve(screenshot);
+                  };
+                });
+
+                if (screenshot) {
+                  capturedScreenshot = screenshot;
+                  results.push({ action: action.description, success: true, screenshot });
+                  serverLog(`[Voice] Screenshot captured and stored`);
+                } else {
+                  results.push({ action: action.description, success: false, error: 'Screenshot capture timed out' });
+                }
+              } else {
+                // Wait for action to complete
+                await new Promise(resolve => setTimeout(resolve, 800));
+                results.push({ action: action.description, success: true, terminalIndex: targetTerminalIndex });
+              }
+
+            } else if (action.type === 'prompt') {
+              // Auto-navigate to terminal if needed
+              const currentTab = message.appState?.currentTab;
+              if (currentTab && currentTab !== 'terminal' && currentTab !== 'chat') {
+                serverLog(`[Voice] Auto-navigating to terminal before sending prompt (currently on ${currentTab})`);
+                ws.send(JSON.stringify({
+                  type: 'voice_app_control',
+                  terminalId: message.terminalId,
+                  appControl: { action: 'navigate', target: 'terminal' }
+                }));
+                await new Promise(resolve => setTimeout(resolve, 800));
+              }
+
+              // Capture output before sending
+              const outputBeforeCommand = await tmuxService.captureOutput(targetTmuxSession, 100);
+
+              // Send prompt to Claude Code with verification
+              await tmuxService.sendPromptWithVerification(targetTmuxSession, action.content);
+
+              // Wait for Claude Code to respond
+              const claudeResult = await tmuxService.waitForClaudeReadyWithHooks(targetTmuxSession, {
+                timeoutMs: 180000,
+                pollIntervalMs: 300,
+                previousOutput: outputBeforeCommand
+              });
+
+              if (claudeResult.isReady) {
+                // Extract Claude's response
+                const claudeResponse = tmuxService.extractClaudeResponse(claudeResult.rawOutput);
+                lastClaudeResponse = claudeResponse;
+                results.push({
+                  action: action.description,
+                  success: true,
+                  claudeResponse: claudeResponse?.substring(0, 200),
+                  terminalIndex: targetTerminalIndex
+                });
+                serverLog(`[Voice] Claude responded: ${claudeResponse?.substring(0, 100)}...`);
+              } else {
+                results.push({
+                  action: action.description,
+                  success: false,
+                  error: 'Claude Code did not respond',
+                  terminalIndex: targetTerminalIndex
+                });
+                throw new Error('Claude Code did not respond');
+              }
+
+            } else if (action.type === 'control') {
+              // Send control command (placeholder for future implementation)
+              results.push({ action: action.description, success: true, terminalIndex: targetTerminalIndex });
+            }
+
+            return { lastClaudeResponse, capturedScreenshot };
+          }
+
+          /**
+           * Execute a group of actions in parallel.
+           * Only applies to prompt actions targeting different terminals.
+           */
+          async function executeParallelActionGroup(
+            group: ActionGroup,
+            ws: WebSocket,
+            session: TerminalSession,
+            message: Message,
+            results: Array<{ action: string; success: boolean; error?: string; claudeResponse?: string; terminalIndex?: number }>
+          ): Promise<{ lastClaudeResponse?: string }> {
+            serverLog(`[Voice] Starting parallel execution of ${group.actions.length} prompts`);
+
+            // Send initial progress
+            ws.send(JSON.stringify({
+              type: 'voice_progress',
+              terminalId: message.terminalId,
+              progress: `Running commands in ${group.actions.length} terminals...`
+            }));
+
+            // Auto-switch to first-mentioned terminal for visual feedback
+            const firstTerminalIndex = group.actions[0].targetTerminalIndex;
+            if (firstTerminalIndex !== undefined) {
+              serverLog(`[Voice] Auto-switching to Terminal ${firstTerminalIndex + 1} (first mentioned)`);
+              ws.send(JSON.stringify({
+                type: 'voice_app_control',
+                terminalId: message.terminalId,
+                appControl: {
+                  action: 'switch_terminal',
+                  params: { index: firstTerminalIndex }
+                }
+              }));
+              await new Promise(resolve => setTimeout(resolve, 600));
+            }
+
+            // Prepare sessions for parallel execution
+            const parallelSessions: Array<{
+              sessionName: string;
+              terminalIndex: number;
+              previousOutput: string;
+              description: string;
+              actionIndex: number;
+            }> = [];
+
+            // Auto-navigate to terminal if needed (once, before all prompts)
+            const currentTab = message.appState?.currentTab;
+            if (currentTab && currentTab !== 'terminal' && currentTab !== 'chat') {
+              serverLog(`[Voice] Auto-navigating to terminal before parallel prompts`);
+              ws.send(JSON.stringify({
+                type: 'voice_app_control',
+                terminalId: message.terminalId,
+                appControl: { action: 'navigate', target: 'terminal' }
+              }));
+              await new Promise(resolve => setTimeout(resolve, 800));
+            }
+
+            // Send all prompts to their respective terminals
+            for (const actionWithTarget of group.actions) {
+              const { action, targetTmuxSession, targetTerminalIndex } = actionWithTarget;
+
+              if (action.type === 'prompt') {
+                // Capture output before command
+                const outputBefore = await tmuxService.captureOutput(targetTmuxSession, 100);
+
+                // Send prompt
+                await tmuxService.sendPromptWithVerification(targetTmuxSession, action.content);
+                serverLog(`[Voice] Sent prompt to Terminal ${(targetTerminalIndex ?? 0) + 1} (${targetTmuxSession}): "${action.content.substring(0, 50)}..."`);
+
+                parallelSessions.push({
+                  sessionName: targetTmuxSession,
+                  terminalIndex: targetTerminalIndex ?? 0,
+                  previousOutput: outputBefore,
+                  description: action.description,
+                  actionIndex: actionWithTarget.index
+                });
+              }
+            }
+
+            // Wait for all sessions concurrently with progress streaming
+            const progressResults = await tmuxService.waitForMultipleClaudeSessions(
+              parallelSessions,
+              {
+                timeoutMs: 180000,
+                pollIntervalMs: 300,
+                onProgress: async (progress) => {
+                  // Stream TTS update when a terminal completes
+                  const terminalLabel = `Terminal ${progress.terminalIndex + 1}`;
+                  const statusText = progress.isSuccess
+                    ? `${terminalLabel} finished`
+                    : `${terminalLabel} had an error`;
+
+                  serverLog(`[Voice] Progress update: ${statusText}`);
+
+                  // Generate and send TTS for this progress update
+                  try {
+                    const ttsAudio = await voiceService.textToSpeech(statusText);
+                    ws.send(JSON.stringify({
+                      type: 'voice_terminal_speaking',
+                      terminalId: message.terminalId,
+                      responseText: statusText,
+                      audioData: ttsAudio.toString('base64'),
+                      audioMimeType: 'audio/mp3',
+                      isComplete: false  // More terminals may still be running
+                    }));
+                    session.voiceLastTTSTime = Date.now();
+                  } catch (ttsError) {
+                    serverLog(`[Voice] TTS failed for progress update: ${ttsError}`);
+                  }
+                }
+              }
+            );
+
+            // Record results
+            let lastClaudeResponse: string | undefined;
+            for (let i = 0; i < progressResults.length; i++) {
+              const progress = progressResults[i];
+              const parallelSession = parallelSessions[i];
+
+              results.push({
+                action: parallelSession.description,
+                success: progress.isSuccess,
+                error: progress.error,
+                claudeResponse: progress.claudeResponse?.substring(0, 200),
+                terminalIndex: progress.terminalIndex
+              });
+
+              // Keep the last successful Claude response for summary
+              if (progress.isSuccess && progress.claudeResponse) {
+                lastClaudeResponse = progress.claudeResponse;
+              }
+            }
+
+            const successCount = progressResults.filter(p => p.isSuccess).length;
+            serverLog(`[Voice] Parallel group complete: ${successCount}/${progressResults.length} succeeded`);
+
+            return { lastClaudeResponse };
+          }
+
+          // Handle ACTION_SEQUENCE - execute multiple actions (parallel or sequential)
+          if (agentResponse.type === 'action_sequence' && agentResponse.actions) {
+            serverLog(`[Voice] Executing action sequence with ${agentResponse.actions.length} actions`);
+
+            // Speak initial response
+            const initialSpeech = agentResponse.voiceResponse || agentResponse.content;
+            const initialTTS = await voiceService.textToSpeech(initialSpeech);
+            ws.send(JSON.stringify({
+              type: 'voice_terminal_speaking',
+              terminalId: message.terminalId,
+              responseText: initialSpeech,
+              audioData: initialTTS.toString('base64'),
+              audioMimeType: 'audio/mp3',
+              isComplete: false
+            }));
+            session.voiceLastTTSTime = Date.now();
+
+            // Classify actions into parallel/sequential groups
+            const actionGroups = classifyActionGroups(
+              agentResponse.actions,
+              session.projectId,
+              session.tmuxSessionName
+            );
+
+            serverLog(`[Voice] Classified ${agentResponse.actions.length} actions into ${actionGroups.length} group(s)`);
+            actionGroups.forEach((group, idx) => {
+              serverLog(`[Voice] Group ${idx + 1}: ${group.isParallel ? 'PARALLEL' : 'SEQUENTIAL'} - ${group.description}`);
+            });
+
+            // Execute action groups with error handling
+            const results: Array<{ action: string; success: boolean; error?: string; claudeResponse?: string; screenshot?: string; terminalIndex?: number }> = [];
+            let lastClaudeResponse: string | undefined;
+            let capturedScreenshot: string | undefined;
+            let hasError = false;
+
+            for (let groupIdx = 0; groupIdx < actionGroups.length; groupIdx++) {
+              const group = actionGroups[groupIdx];
+
+              // Stop on first error (user requirement: let successful terminals continue)
+              // But we stop BETWEEN groups, not within parallel groups
+              if (hasError) {
+                serverLog(`[Voice] Skipping group ${groupIdx + 1} due to previous error`);
+                break;
+              }
+
+              serverLog(`[Voice] Executing group ${groupIdx + 1}/${actionGroups.length}: ${group.description} (${group.isParallel ? 'parallel' : 'sequential'})`);
+
+              try {
+                if (group.isParallel) {
+                  // PARALLEL EXECUTION
+                  const parallelResult = await executeParallelActionGroup(group, ws, session, message, results);
+                  if (parallelResult.lastClaudeResponse) {
+                    lastClaudeResponse = parallelResult.lastClaudeResponse;
+                  }
+
+                  // Check if any action in the parallel group failed
+                  // User requirement: let successful terminals continue, so we don't break here
+                  // We only set hasError if ALL actions failed
+                  const groupResults = results.slice(-group.actions.length);
+                  const allFailed = groupResults.every(r => !r.success);
+                  if (allFailed) {
+                    hasError = true;
+                  }
+
+                } else {
+                  // SEQUENTIAL EXECUTION
+                  for (const actionWithTarget of group.actions) {
+                    try {
+                      const actionResult = await executeSequentialAction(actionWithTarget, ws, session, message, results);
+
+                      if (actionResult.lastClaudeResponse) {
+                        lastClaudeResponse = actionResult.lastClaudeResponse;
+                      }
+                      if (actionResult.capturedScreenshot) {
+                        capturedScreenshot = actionResult.capturedScreenshot;
+                      }
+
+                      // Check if this action failed
+                      const lastResult = results[results.length - 1];
+                      if (!lastResult.success) {
+                        hasError = true;
+                        break; // Stop sequential execution on first failure
+                      }
+
+                    } catch (error) {
+                      const errorMsg = String(error);
+                      serverLog(`[Voice] Action failed: ${errorMsg}`);
+                      // Error already recorded in results by executeSequentialAction
+                      hasError = true;
+                      break; // Stop sequential execution on error
+                    }
+                  }
+                }
+
+              } catch (error) {
+                const errorMsg = String(error);
+                serverLog(`[Voice] Group ${groupIdx + 1} failed: ${errorMsg}`);
+                results.push({
+                  action: group.description,
+                  success: false,
+                  error: errorMsg
+                });
+                hasError = true;
+                break; // Stop on group failure
+              }
+            }
+
+            // Generate summary of what happened
+            const successCount = results.filter(r => r.success).length;
+            const failedAction = results.find(r => !r.success);
+
+            // If a screenshot was captured, analyze it with the voice agent
+            if (capturedScreenshot && !failedAction) {
+              serverLog(`[Voice] Re-invoking voice agent to analyze captured screenshot`);
+
+              // Build context about what was requested
+              const analysisContext = `You just navigated to a different screen and captured a screenshot. The user originally asked: "${transcription}"\n\nNow describe what you see on the screen and respond to their request.`;
+
+              // Re-invoke voice agent with screenshot for vision analysis
+              // IMPORTANT: Set isSystemPrompt=true to skip semantic validation (this is AI-to-AI, not user voice)
+              const screenshotAnalysis = await voiceService.processVoiceInput(
+                analysisContext,
+                session.projectId,
+                {
+                  projectName: message.appState?.projectName || projectMeta?.name,
+                  screenCapture: capturedScreenshot,
+                  appState: message.appState,
+                  isSystemPrompt: true  // Skip semantic validation - this is system-generated, not user voice
+                },
+                session.voiceAgentModel
+              );
+
+              // Use the analysis response as the summary
+              const analysisText = screenshotAnalysis.voiceResponse || screenshotAnalysis.content;
+              const analysisTTS = await voiceService.textToSpeech(analysisText);
+              ws.send(JSON.stringify({
+                type: 'voice_terminal_speaking',
+                terminalId: message.terminalId,
+                responseText: analysisText,
+                audioData: analysisTTS.toString('base64'),
+                audioMimeType: 'audio/mp3',
+                isComplete: true
+              }));
+              session.voiceLastTTSTime = Date.now();
+              session.voiceIdleWaiting = true;
+              return;
+            }
+
+            let summaryText: string;
+            const failedActions = results.filter(r => !r.success);
+            const successfulActions = results.filter(r => r.success);
+
+            // Detect if we had parallel execution
+            const hadParallelExecution = actionGroups.some(g => g.isParallel);
+
+            if (failedActions.length > 0 && successfulActions.length > 0) {
+              // PARTIAL SUCCESS (some terminals succeeded, others failed)
+              const successTerminals = successfulActions
+                .filter(r => r.terminalIndex !== undefined)
+                .map(r => `Terminal ${r.terminalIndex! + 1}`)
+                .join(', ');
+              const failedTerminals = failedActions
+                .filter(r => r.terminalIndex !== undefined)
+                .map(r => `Terminal ${r.terminalIndex! + 1}`)
+                .join(', ');
+
+              if (successTerminals && failedTerminals) {
+                summaryText = `Completed with partial success. ${successTerminals} finished successfully. ${failedTerminals} encountered errors.`;
+              } else {
+                summaryText = `I completed ${successCount} step${successCount !== 1 ? 's' : ''}, but encountered an error at: ${failedActions[0].action}. ${failedActions[0].error || 'The action failed.'}`;
+              }
+
+              // If we have Claude responses from successful terminals, present the first one
+              const firstClaudeResponse = successfulActions.find(r => r.claudeResponse && r.claudeResponse.length > 20);
+              if (firstClaudeResponse && firstClaudeResponse.claudeResponse) {
+                const presentation = await voiceService.presentClaudeResponse(
+                  firstClaudeResponse.claudeResponse,
+                  session.projectId,
+                  transcription
+                );
+                summaryText += ` ${presentation}`;
+              }
+
+            } else if (failedActions.length > 0) {
+              // COMPLETE FAILURE (all actions failed)
+              summaryText = `All ${failedActions.length} action${failedActions.length !== 1 ? 's' : ''} failed. ${failedActions[0].error || 'Unknown error occurred.'}`;
+
+            } else if (lastClaudeResponse && lastClaudeResponse.length > 20) {
+              // SUCCESS with Claude response
+              const claudePresentation = await voiceService.presentClaudeResponse(
+                lastClaudeResponse,
+                session.projectId,
+                transcription
+              );
+              summaryText = hadParallelExecution
+                ? `All terminals completed successfully. ${claudePresentation}`
+                : `Done. ${claudePresentation}`;
+
+            } else {
+              // SUCCESS without Claude response
+              summaryText = hadParallelExecution
+                ? `All ${results.length} terminals completed successfully.`
+                : `All ${results.length} steps completed successfully.`;
+            }
+
+            // Speak final summary
+            const summaryTTS = await voiceService.textToSpeech(summaryText);
+            ws.send(JSON.stringify({
+              type: 'voice_terminal_speaking',
+              terminalId: message.terminalId,
+              responseText: summaryText,
+              audioData: summaryTTS.toString('base64'),
+              audioMimeType: 'audio/mp3',
+              isComplete: true
+            }));
+            session.voiceLastTTSTime = Date.now();
+            session.voiceIdleWaiting = true;
             return;
           }
 
@@ -1871,6 +2459,19 @@ wss.on('connection', (ws: WebSocket) => {
           session.voiceIdleWaiting = false;
           const promptText = agentResponse.content;
 
+          // Auto-navigate to terminal if needed (unless we're already on terminal tab)
+          // This fixes the issue where prompts are sent without navigating back to terminal
+          const currentTab = message.appState?.currentTab;
+          if (currentTab && currentTab !== 'terminal' && currentTab !== 'chat') {
+            serverLog(`[Voice] Auto-navigating to terminal before sending prompt (currently on ${currentTab})`);
+            ws.send(JSON.stringify({
+              type: 'voice_app_control',
+              terminalId: message.terminalId,
+              appControl: { action: 'navigate', target: 'terminal' }
+            }));
+            await new Promise(resolve => setTimeout(resolve, 800));
+          }
+
           // If there's a voiceResponse, speak it FIRST before sending the command
           // This lets the user know what's happening ("Let me check that for you")
           if (agentResponse.voiceResponse) {
@@ -1911,11 +2512,9 @@ wss.on('connection', (ws: WebSocket) => {
           // Capture terminal output BEFORE sending command so we can filter it out later
           const outputBeforeCommand = await tmuxService.captureOutput(session.tmuxSessionName, 100);
 
-          // Send the translated command to Claude Code via tmux
-          // Use tmux send-keys for reliable command execution
-          await tmuxService.sendCommand(session.tmuxSessionName, promptText);
-          await new Promise(resolve => setTimeout(resolve, 50)); // Small delay
-          await tmuxService.sendEnter(session.tmuxSessionName);
+          // Send the translated command to Claude Code via tmux WITH VERIFICATION
+          // Handles race conditions where Enter key might be dropped
+          await tmuxService.sendPromptWithVerification(session.tmuxSessionName, promptText);
 
           // Wait for Claude Code using hook-based state detection
           // Pass previousOutput so we can filter out old content from the response
@@ -1947,7 +2546,8 @@ wss.on('connection', (ws: WebSocket) => {
             session.voiceIdleWaiting = true;
           } else if (claudeResponse && claudeResponse.length > 50) {
             // Generate voice response (isComplete=true by default)
-            await processTerminalVoiceResponse(ws, message.terminalId, claudeResponse, session, true);
+            // Pass the user's original transcription for contextual attribution
+            await processTerminalVoiceResponse(ws, message.terminalId, claudeResponse, session, true, transcription);
 
             // Enter idle state - wait for user to speak next
             session.voiceIdleWaiting = true;

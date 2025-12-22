@@ -104,11 +104,13 @@ export default function PreviewScreen() {
     const prompt = `I'm getting the following console output from my app preview. Please analyze these logs and help me fix any issues:\n\n\`\`\`\n${logsText}\n\`\`\``;
 
     // Navigate to chat tab with the prompt - chat tab will handle creating terminal and sending
+    // Add timestamp to ensure each click creates a unique navigation (React will detect param change)
     router.push({
       pathname: '/chat',
       params: {
         pendingPrompt: prompt,
-        createNewTerminal: 'true'
+        createNewTerminal: 'true',
+        timestamp: Date.now().toString() // Make each navigation unique
       }
     });
   };
@@ -368,7 +370,7 @@ export default function PreviewScreen() {
             <ActivityIndicator size="large" color={colors.brandTiger} />
             <Text style={styles.loadingText}>Generating preview...</Text>
             <Text style={styles.loadingSubtext}>
-              Starting preview server
+              Starting {project.projectType === 'web' ? 'Vite' : 'Expo'} dev server...
             </Text>
           </View>
         ) : error ? (

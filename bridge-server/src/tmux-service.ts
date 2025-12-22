@@ -956,6 +956,87 @@ export async function sendCommandAndWait(
 }
 
 /**
+ * Send a prompt to Claude Code with verification that Enter was received
+ * Handles race conditions where Enter key might be dropped by tmux
+ *
+ * This is critical for voice-driven workflows where reliability is paramount
+ */
+export async function sendPromptWithVerification(
+  sessionName: string,
+  prompt: string,
+  options?: {
+    maxRetries?: number;
+    delayBeforeEnter?: number;
+    verificationDelay?: number;
+  }
+): Promise<void> {
+  const {
+    maxRetries = 2,
+    delayBeforeEnter = 150,  // ms to wait between typing and Enter
+    verificationDelay = 500   // ms to wait before verification
+  } = options || {};
+
+  console.log(`[Tmux] Sending prompt with verification to ${sessionName}`);
+
+  // Step 1: Type the text
+  await sendCommand(sessionName, prompt);
+  await sleep(delayBeforeEnter);
+
+  // Step 2: Send Enter
+  await sendEnter(sessionName);
+  await sleep(verificationDelay);
+
+  // Step 3: Verify submission succeeded
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const output = await captureOutput(sessionName, 10);
+    const lines = output.split('\n').filter(l => l.trim());
+    const lastLine = lines[lines.length - 1] || '';
+
+    // Detection Method 1: Check if text is still sitting at prompt (not submitted)
+    // Pattern: "> Transform this application..." means typed but NOT submitted
+    // Pattern: "Transform this application..." (no >) means submitted successfully
+    const hasPromptWithText = lastLine.startsWith('>') && lastLine.length > 2;
+
+    // Detection Method 2: Check if state file was updated (Claude started processing)
+    const hookState = claudeStateService.readState(sessionName, false);
+    const stateAge = Date.now() - hookState.timestamp;
+    const stateIsStale = stateAge > 2000; // More than 2s old = likely didn't receive Enter
+
+    // If BOTH detection methods indicate failure, retry
+    // (Require both to avoid false positives)
+    if (hasPromptWithText && stateIsStale) {
+      console.log(`[Tmux] ⚠️ Enter verification failed (attempt ${attempt + 1}/${maxRetries})`);
+      console.log(`[Tmux]   Last line: "${lastLine.substring(0, 60)}..."`);
+      console.log(`[Tmux]   State age: ${stateAge}ms (stale: ${stateIsStale})`);
+
+      // Retry Enter key
+      await sleep(200);
+      await sendEnter(sessionName);
+      await sleep(verificationDelay);
+
+      // Continue loop to re-verify
+      continue;
+    }
+
+    // Verification passed!
+    console.log(`[Tmux] ✓ Prompt submitted successfully`);
+    return;
+  }
+
+  // Final check after all retries
+  const finalOutput = await captureOutput(sessionName, 5);
+  const finalLine = finalOutput.split('\n').filter(l => l.trim()).slice(-1)[0] || '';
+
+  if (finalLine.startsWith('>') && finalLine.length > 2) {
+    console.error(`[Tmux] ❌ Failed to submit prompt after ${maxRetries} retries`);
+    console.error(`[Tmux]    Final line: "${finalLine}"`);
+    throw new Error(`Failed to submit prompt to Claude Code: Enter key not received after ${maxRetries} attempts`);
+  }
+
+  console.log(`[Tmux] ✓ Prompt submitted (verified after retry)`);
+}
+
+/**
  * Clear terminal screen
  */
 export async function clearScreen(sessionName: string): Promise<void> {
@@ -1168,6 +1249,169 @@ export async function waitForClaudeReadyWithHooks(
 }
 
 /**
+ * Progress information for a Claude session in multi-terminal execution
+ */
+export interface ClaudeSessionProgress {
+  sessionName: string;
+  terminalIndex: number;
+  isComplete: boolean;
+  isSuccess: boolean;
+  error?: string;
+  claudeResponse?: string;
+  startTime: number;
+  endTime?: number;
+}
+
+/**
+ * Wait for multiple Claude Code sessions to complete concurrently.
+ *
+ * This enables parallel command execution across multiple terminals by monitoring
+ * their hook state files simultaneously. Each session is watched independently,
+ * and the function returns when ALL sessions have completed (success or failure).
+ *
+ * @param sessions - Array of sessions to monitor, each with sessionName, terminalIndex, previousOutput, and description
+ * @param options - Configuration including timeoutMs, pollIntervalMs, and onProgress callback
+ * @returns Promise<ClaudeSessionProgress[]> - Array of results for each session
+ *
+ * @example
+ * const results = await waitForMultipleClaudeSessions([
+ *   { sessionName: 'lora-term1', terminalIndex: 0, previousOutput: '', description: 'Run /compact' },
+ *   { sessionName: 'lora-term2', terminalIndex: 1, previousOutput: '', description: 'Run /clear' }
+ * ], {
+ *   onProgress: (progress) => {
+ *     console.log(`Terminal ${progress.terminalIndex + 1} finished: ${progress.isSuccess}`);
+ *   }
+ * });
+ */
+export async function waitForMultipleClaudeSessions(
+  sessions: Array<{
+    sessionName: string;
+    terminalIndex: number;
+    previousOutput: string;
+    description: string;
+  }>,
+  options?: {
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    onProgress?: (progress: ClaudeSessionProgress) => void;
+  }
+): Promise<ClaudeSessionProgress[]> {
+  const {
+    timeoutMs = 180000,  // 3 minutes per session
+    pollIntervalMs = 300,
+    onProgress
+  } = options || {};
+
+  console.log(`[Tmux] Waiting for ${sessions.length} Claude sessions concurrently...`);
+
+  const startTime = Date.now();
+
+  // Initialize progress tracking for each session
+  const progressMap = new Map<string, ClaudeSessionProgress>();
+  for (const session of sessions) {
+    progressMap.set(session.sessionName, {
+      sessionName: session.sessionName,
+      terminalIndex: session.terminalIndex,
+      isComplete: false,
+      isSuccess: false,
+      startTime: Date.now()
+    });
+
+    // Ensure we're watching this session's hook state
+    if (!claudeStateService.getWatchedSessions().includes(session.sessionName)) {
+      console.log(`[Tmux] Starting to watch session: ${session.sessionName}`);
+      claudeStateService.startWatching(session.sessionName);
+    }
+
+    // Mark as processing
+    claudeStateService.markProcessing(session.sessionName);
+  }
+
+  // Create a monitoring promise for each session
+  const monitoringPromises = sessions.map(async (session) => {
+    const progress = progressMap.get(session.sessionName)!;
+
+    try {
+      console.log(`[Tmux] Monitoring Terminal ${session.terminalIndex + 1} (${session.sessionName}) - ${session.description}`);
+
+      // Wait for this specific session using existing hook-based waiting
+      const result = await waitForClaudeReadyWithHooks(session.sessionName, {
+        timeoutMs,
+        pollIntervalMs,
+        previousOutput: session.previousOutput
+      });
+
+      progress.isComplete = true;
+      progress.isSuccess = result.isReady;
+      progress.endTime = Date.now();
+
+      if (result.isReady) {
+        // Extract Claude's response from the output
+        const output = await captureOutput(session.sessionName, 100);
+        const newOutput = extractNewOutput(output, session.previousOutput);
+        progress.claudeResponse = extractClaudeResponse(newOutput);
+      } else {
+        progress.error = 'Claude did not respond in time';
+      }
+
+      // Notify progress callback
+      if (onProgress) {
+        onProgress(progress);
+      }
+
+      const duration = ((progress.endTime || Date.now()) - progress.startTime) / 1000;
+      console.log(`[Tmux] Terminal ${session.terminalIndex + 1} (${session.sessionName}) completed in ${duration.toFixed(1)}s: ${progress.isSuccess ? 'SUCCESS' : 'FAILED'}`);
+
+      return progress;
+
+    } catch (error) {
+      progress.isComplete = true;
+      progress.isSuccess = false;
+      progress.endTime = Date.now();
+      progress.error = String(error);
+
+      if (onProgress) {
+        onProgress(progress);
+      }
+
+      const duration = ((progress.endTime || Date.now()) - progress.startTime) / 1000;
+      console.log(`[Tmux] Terminal ${session.terminalIndex + 1} (${session.sessionName}) failed after ${duration.toFixed(1)}s: ${error}`);
+
+      return progress;
+    }
+  });
+
+  // Wait for ALL sessions to complete using Promise.allSettled
+  // This ensures we wait for all sessions even if some fail
+  const results = await Promise.allSettled(monitoringPromises);
+
+  // Extract the progress objects from settled promises
+  const finalProgress = results.map((result, index) => {
+    if (result.status === 'fulfilled') {
+      return result.value;
+    } else {
+      // Promise rejection (shouldn't happen since we catch errors, but just in case)
+      const session = sessions[index];
+      return {
+        sessionName: session.sessionName,
+        terminalIndex: session.terminalIndex,
+        isComplete: true,
+        isSuccess: false,
+        error: 'Promise rejection: ' + result.reason,
+        startTime: Date.now(),
+        endTime: Date.now()
+      };
+    }
+  });
+
+  const successCount = finalProgress.filter(p => p.isSuccess).length;
+  const totalDuration = (Date.now() - startTime) / 1000;
+  console.log(`[Tmux] Multi-session wait complete in ${totalDuration.toFixed(1)}s: ${successCount}/${sessions.length} succeeded`);
+
+  return finalProgress;
+}
+
+/**
  * Mark a session as processing (call before sending a command)
  */
 export function markSessionProcessing(sessionName: string): void {
@@ -1201,8 +1445,10 @@ export default {
   waitForResponse,
   waitForClaudeReady,
   waitForClaudeReadyWithHooks,
+  waitForMultipleClaudeSessions,
   extractClaudeResponse,
   sendCommandAndWait,
+  sendPromptWithVerification,
   clearScreen,
   restartClaude,
   cleanupStaleSessions,
