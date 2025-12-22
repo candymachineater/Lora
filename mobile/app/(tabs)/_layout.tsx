@@ -228,7 +228,17 @@ function VoiceTabButton() {
 
       if (micPressHandler) {
         // Use the registered handler for proper cleanup
-        micPressHandler();
+        console.log('[VoiceButton] Calling handler...');
+        try {
+          micPressHandler();
+          console.log('[VoiceButton] Handler called successfully');
+        } catch (error) {
+          console.error('[VoiceButton] Handler error:', error);
+          // Force status to off on error
+          useVoiceStore.getState().setVoiceStatus('off');
+          useVoiceStore.getState().setVoiceTranscript('');
+          useVoiceStore.getState().setVoiceProgress('');
+        }
       } else {
         // Fallback: handler not available (chat component unmounted)
         // Navigate to chat tab to trigger proper cleanup

@@ -988,7 +988,7 @@ export default function TerminalScreen() {
             // Log audio level every 500ms for debugging
             if (now - lastLogTime > 500) {
               lastLogTime = now;
-              const status = level >= speechThreshold ? '🔊 SPEECH' : level < silenceThreshold ? '🔇 silence' : '📢 ambient';
+              const status = level >= speechThreshold ? '[SPEECH]' : level < silenceThreshold ? '[silence]' : '[ambient]';
               console.log(`[VAD] Level: ${level.toFixed(1)} dB ${status} (threshold: ${speechThreshold.toFixed(1)})`);
             }
 
@@ -1291,8 +1291,8 @@ export default function TerminalScreen() {
 
   // Register voice functions with store for tab bar access
   useEffect(() => {
-    setToggleVoiceMode(() => toggleVoiceMode);
-    setHandleVoiceMicPress(() => handleVoiceMicPress);
+    setToggleVoiceMode(toggleVoiceMode);
+    setHandleVoiceMicPress(handleVoiceMicPress);
 
     return () => {
       setToggleVoiceMode(null);
