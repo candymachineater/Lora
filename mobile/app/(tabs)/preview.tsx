@@ -11,6 +11,7 @@ import {
   Animated,
 } from 'react-native';
 import { useRouter } from 'expo-router';
+import { useFocusEffect } from '@react-navigation/native';
 import ViewShot from 'react-native-view-shot';
 import {
   Play,
@@ -25,11 +26,12 @@ import {
   AlertCircle,
   AlertTriangle,
   Info,
+  Smartphone,
 } from 'lucide-react-native';
 import { useProjectStore, useSettingsStore, useVoiceStore } from '../../stores';
 import { createSnack, createEmbeddedSnackUrl } from '../../services/bundler';
 import { bridgeService } from '../../services/claude';
-import { PreviewFrame, ConsoleMessage } from '../../components/preview';
+import { PreviewFrame, ConsoleMessage, MobilePreviewModal } from '../../components/preview';
 import { EmptyState, Button } from '../../components/common';
 import { colors, spacing, radius, typography } from '../../theme';
 import { Project, ProjectFile } from '../../types';
@@ -50,26 +52,37 @@ export default function PreviewScreen() {
   const [consoleMessages, setConsoleMessages] = useState<ConsoleMessage[]>([]);
   const [consoleExpanded, setConsoleExpanded] = useState(false);
   const [consoleHeight] = useState(new Animated.Value(0));
+  const [showMobileModal, setShowMobileModal] = useState(false);
 
   const project = currentProject();
+
+  // Fix: Default to 'mobile' if projectType is missing (for older projects)
+  const projectType = project?.projectType || 'mobile';
 
   // Count errors and warnings
   const errorCount = consoleMessages.filter(m => m.type === 'error').length;
   const warnCount = consoleMessages.filter(m => m.type === 'warn').length;
 
   const handleConsoleMessage = useCallback((message: ConsoleMessage) => {
-    setConsoleMessages(prev => {
-      const updated = [...prev, message];
-      // Keep only last N messages
-      if (updated.length > MAX_CONSOLE_MESSAGES) {
-        return updated.slice(-MAX_CONSOLE_MESSAGES);
-      }
-      return updated;
-    });
+    // Only add error and warning messages to reduce console noise
+    if (message.type === 'error' || message.type === 'warn') {
+      console.log('[Preview] Adding console message:', message.type, message.message.substring(0, 100));
+      setConsoleMessages(prev => {
+        const updated = [...prev, message];
+        // Keep only last N messages
+        if (updated.length > MAX_CONSOLE_MESSAGES) {
+          return updated.slice(-MAX_CONSOLE_MESSAGES);
+        }
+        return updated;
+      });
 
-    // Auto-expand console on errors
-    if (message.type === 'error' && !consoleExpanded) {
-      toggleConsole(true);
+      // Auto-expand console on errors
+      if (message.type === 'error' && !consoleExpanded) {
+        toggleConsole(true);
+      }
+    } else {
+      // Ignore info and log level messages from web preview
+      console.log('[Preview] Ignoring non-critical web console message:', message.type);
     }
   }, [consoleExpanded]);
 
@@ -83,25 +96,52 @@ export default function PreviewScreen() {
     }).start();
   };
 
-  const clearConsole = () => {
+  const clearConsole = async () => {
+    console.log('[Preview] Manual console clear requested');
     setConsoleMessages([]);
+    // Also clear remote logs from bridge server
+    if (project) {
+      try {
+        await bridgeService.clearPreviewLogs(project.id);
+        console.log('[Preview] Cleared remote preview logs');
+      } catch (err) {
+        console.warn('[Preview] Failed to clear remote logs:', err);
+      }
+    }
   };
 
   const sendToClaude = async () => {
     if (!project || consoleMessages.length === 0) return;
 
+    // Filter to only errors and warnings (critical issues only)
+    const criticalMessages = consoleMessages.filter(m =>
+      m.type === 'error' || m.type === 'warn'
+    );
+
+    if (criticalMessages.length === 0) {
+      Alert.alert('No Issues Found', 'There are no errors or warnings to send to Claude.');
+      return;
+    }
+
     // Format the logs for Claude
-    const logsText = consoleMessages
+    const logsText = criticalMessages
       .map(m => {
         const time = m.timestamp.toLocaleTimeString();
-        const prefix = m.type === 'error' ? '[ERROR]' :
-                      m.type === 'warn' ? '[WARN]' :
-                      m.type === 'info' ? '[INFO]' : '[LOG]';
+        const prefix = m.type === 'error' ? '[ERROR]' : '[WARN]';
         return `${time} ${prefix} ${m.message}`;
       })
       .join('\n');
 
-    const prompt = `I'm getting the following console output from my app preview. Please analyze these logs and help me fix any issues:\n\n\`\`\`\n${logsText}\n\`\`\``;
+    // Send plain prompt text - bridge server will wrap it with claude --dangerously-skip-permissions automatically
+    const prompt = `Analyze these console logs from my app preview and help fix any issues:\n\n${logsText}`;
+
+    console.log('[Preview] ==================== SEND TO CLAUDE ====================');
+    console.log('[Preview] Total console messages:', consoleMessages.length);
+    console.log('[Preview] Critical messages (errors/warnings):', criticalMessages.length);
+    console.log('[Preview] Prompt length:', prompt.length, 'characters');
+    console.log('[Preview] FULL PROMPT:');
+    console.log(prompt);
+    console.log('[Preview] ============================================================');
 
     // Navigate to chat tab with the prompt - chat tab will handle creating terminal and sending
     // Add timestamp to ensure each click creates a unique navigation (React will detect param change)
@@ -126,7 +166,7 @@ export default function PreviewScreen() {
 
     setLoading(true);
     setError(null);
-    setConsoleMessages([]); // Clear console on refresh
+    // Don't clear console here - Metro bundler errors will be fetched after preview starts
 
     try {
       console.log('[Preview] Starting local preview server for project:', project.name);
@@ -139,6 +179,10 @@ export default function PreviewScreen() {
         setLoading(false);
         return;
       }
+
+      // Clear console only when starting a NEW preview server
+      console.log('[Preview] Clearing console for new preview server');
+      setConsoleMessages([]);
 
       // Start a new preview server with error callback
       const { url } = await bridgeService.startPreview(project.id, (error, errorType) => {
@@ -245,6 +289,7 @@ export default function PreviewScreen() {
     lastProjectIdRef.current = project?.id || null;
 
     // Reset state when project changes
+    console.log('[Preview] Project changed, resetting state. New project:', project?.name);
     setSnackUrl(null);
     setConsoleMessages([]);
     setError(null);
@@ -304,6 +349,81 @@ export default function PreviewScreen() {
     }
   }, [pendingPreviewAction, clearPreviewAction]);
 
+  // Debug: Log state changes
+  useEffect(() => {
+    console.log('[Preview] State changed:', {
+      hasSnackUrl: !!snackUrl,
+      snackUrl,
+      projectType,
+      showMobileModal,
+      shouldShowButton: !!(snackUrl && projectType === 'mobile'),
+    });
+  }, [snackUrl, projectType, showMobileModal]);
+
+  // Fetch preview logs when tab gains focus
+  useFocusEffect(
+    useCallback(() => {
+      const fetchLogs = async () => {
+        // Fetch logs for mobile projects even if preview isn't currently running
+        // (logs might have accumulated from Expo Go sessions)
+        if (project && projectType === 'mobile') {
+          try {
+            console.log('[Preview] Fetching logs for project:', project.id);
+            const newLogs = await bridgeService.getPreviewLogs(project.id);
+            console.log('[Preview] Fetched logs count:', newLogs.length);
+
+            if (newLogs.length > 0) {
+              // Filter to only show errors and warnings (exclude info and log levels)
+              const filteredLogs = newLogs.filter(log =>
+                log.level === 'error' || log.level === 'warn'
+              );
+
+              console.log('[Preview] Total fetched logs:', newLogs.length, 'Errors/Warnings:', filteredLogs.length);
+
+              if (filteredLogs.length > 0) {
+                // Convert logs to ConsoleMessage format
+                const messages: ConsoleMessage[] = filteredLogs.map(log => ({
+                  type: log.level,
+                  message: log.message,
+                  timestamp: new Date(log.timestamp),
+                }));
+
+                setConsoleMessages(prev => {
+                  // Avoid duplicates by checking timestamps
+                  const existingTimestamps = new Set(prev.map(m => m.timestamp.getTime()));
+                  const uniqueMessages = messages.filter(m => !existingTimestamps.has(m.timestamp.getTime()));
+                  const newTotal = prev.length + uniqueMessages.length;
+                  console.log('[Preview] Console state:', {
+                    existing: prev.length,
+                    fetched: messages.length,
+                    unique: uniqueMessages.length,
+                    newTotal
+                  });
+                  return [...prev, ...uniqueMessages];
+                });
+
+                // Auto-expand console if there are errors
+                if (messages.some(log => log.type === 'error')) {
+                  console.log('[Preview] Auto-expanding console due to errors');
+                  toggleConsole(true);
+                }
+              }
+            }
+          } catch (err) {
+            console.error('[Preview] Failed to fetch logs:', err);
+          }
+        } else {
+          console.log('[Preview] Not fetching logs:', {
+            hasProject: !!project,
+            projectType
+          });
+        }
+      };
+
+      fetchLogs();
+    }, [project, snackUrl, projectType])
+  );
+
   const getMessageIcon = (type: ConsoleMessage['type']) => {
     switch (type) {
       case 'error':
@@ -359,6 +479,24 @@ export default function PreviewScreen() {
           </TouchableOpacity>
           <TouchableOpacity style={styles.iconButton} onPress={handleShare}>
             <ShareIcon color={colors.foreground} size={20} />
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.iconButton}
+            onPress={() => {
+              console.log('[Preview] Smartphone button clicked', {
+                snackUrl,
+                projectType,
+                projectName: project?.name,
+                hasProject: !!project
+              });
+              setShowMobileModal(true);
+            }}
+            disabled={!snackUrl || projectType !== 'mobile'}
+          >
+            <Smartphone
+              color={snackUrl && projectType === 'mobile' ? colors.foreground : colors.mutedForeground}
+              size={20}
+            />
           </TouchableOpacity>
         </View>
       </View>
@@ -431,13 +569,16 @@ export default function PreviewScreen() {
             <View style={styles.consoleHeaderRight}>
               {consoleMessages.length > 0 && (
                 <>
-                  <TouchableOpacity
-                    style={styles.consoleAction}
-                    onPress={sendToClaude}
-                  >
-                    <Send color={colors.brandTiger} size={16} />
-                    <Text style={styles.sendText}>Send to Claude</Text>
-                  </TouchableOpacity>
+                  {/* Only show Send to Claude button if there are errors or warnings */}
+                  {consoleMessages.some(m => m.type === 'error' || m.type === 'warn') && (
+                    <TouchableOpacity
+                      style={styles.consoleAction}
+                      onPress={sendToClaude}
+                    >
+                      <Send color={colors.brandTiger} size={16} />
+                      <Text style={styles.sendText}>Send to Claude</Text>
+                    </TouchableOpacity>
+                  )}
                   <TouchableOpacity
                     style={styles.consoleAction}
                     onPress={clearConsole}
@@ -482,6 +623,19 @@ export default function PreviewScreen() {
           </Animated.View>
         </View>
       )}
+
+      {/* Mobile Preview Modal */}
+      {snackUrl && projectType === 'mobile' ? (
+        <MobilePreviewModal
+          visible={showMobileModal}
+          onClose={() => {
+            console.log('[Preview] Closing mobile modal');
+            setShowMobileModal(false);
+          }}
+          previewUrl={snackUrl}
+          projectName={project?.name || 'Project'}
+        />
+      ) : null}
     </ViewShot>
   );
 }

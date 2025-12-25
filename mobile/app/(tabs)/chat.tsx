@@ -151,6 +151,14 @@ export default function TerminalScreen() {
   // Handle pending prompt from preview (console logs to send to Claude)
   useEffect(() => {
     if (params.pendingPrompt && params.timestamp) {
+      console.log('[Terminal] ==================== RECEIVED PENDING PROMPT ====================');
+      console.log('[Terminal] Timestamp:', params.timestamp);
+      console.log('[Terminal] createNewTerminal:', params.createNewTerminal);
+      console.log('[Terminal] Prompt length:', params.pendingPrompt.length, 'characters');
+      console.log('[Terminal] FULL RECEIVED PROMPT:');
+      console.log(params.pendingPrompt);
+      console.log('[Terminal] =================================================================');
+
       // Reset the sent flag for each new timestamp (each button click)
       pendingPromptRef.current = params.pendingPrompt;
       pendingPromptSentRef.current = false;
@@ -267,6 +275,13 @@ export default function TerminalScreen() {
     if (!currentProjectId) return;
 
     try {
+      console.log('[Terminal] ==================== CREATE TERMINAL WITH PROMPT ====================');
+      console.log('[Terminal] Project ID:', currentProjectId);
+      console.log('[Terminal] Prompt length:', prompt.length, 'characters');
+      console.log('[Terminal] Full prompt:', prompt);
+      console.log('[Terminal] Calling bridgeService.createTerminal with prompt...');
+      console.log('[Terminal] ====================================================================');
+
       terminalCounter.current += 1;
       pendingPromptSentRef.current = true; // Mark as sent since it's passed as initial prompt
 
@@ -292,6 +307,8 @@ export default function TerminalScreen() {
         projectSandbox,
         prompt  // Pass the prompt directly to Claude Code startup
       );
+
+      console.log('[Terminal] Terminal created with ID:', id);
 
       const newSession: TerminalSession = { id, output: '', sandbox: projectSandbox };
       setTerminals((prev) => [...prev, newSession]);

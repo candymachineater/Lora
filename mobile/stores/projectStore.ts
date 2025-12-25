@@ -19,6 +19,7 @@ interface ProjectState {
   setProjects: (projects: Project[]) => void;
   updateProject: (id: string, updates: Partial<Project>) => void;
   deleteProject: (id: string) => void;
+  renameProject: (oldId: string, newProject: Project) => void;
   setCurrentProject: (id: string | null) => void;
   setCurrentFile: (path: string | null) => void;
 
@@ -72,6 +73,15 @@ export const useProjectStore = create<ProjectState>()(
           projects: state.projects.filter((p) => p.id !== id),
           currentProjectId:
             state.currentProjectId === id ? null : state.currentProjectId,
+        })),
+
+      renameProject: (oldId: string, newProject: Project) =>
+        set((state) => ({
+          projects: state.projects.map((p) =>
+            p.id === oldId ? newProject : p
+          ),
+          currentProjectId:
+            state.currentProjectId === oldId ? newProject.id : state.currentProjectId,
         })),
 
       setCurrentProject: (id: string | null) =>

@@ -90,6 +90,7 @@ export function PreviewFrame({ url, onError, onConsoleMessage }: PreviewFramePro
     try {
       const data = JSON.parse(event.nativeEvent.data);
       if (data.type === 'console' && onConsoleMessage) {
+        console.log('[PreviewFrame] Captured console message:', data.level, data.message.substring(0, 100));
         onConsoleMessage({
           type: data.level,
           message: data.message,
@@ -98,7 +99,10 @@ export function PreviewFrame({ url, onError, onConsoleMessage }: PreviewFramePro
       }
     } catch (e) {
       // Ignore parse errors - might be non-JSON messages
-      console.log('[PreviewFrame] Non-JSON message:', event.nativeEvent.data?.substring(0, 100));
+      const msgPreview = event.nativeEvent.data?.substring(0, 100);
+      if (msgPreview && !msgPreview.includes('webpack') && !msgPreview.includes('HMR')) {
+        console.log('[PreviewFrame] Non-JSON message:', msgPreview);
+      }
     }
   };
 

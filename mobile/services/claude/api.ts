@@ -189,6 +189,17 @@ class BridgeService {
         }
         break;
 
+      case 'project_renamed':
+        if (response.oldProjectId && response.project) {
+          this.pendingResolvers.get('project_renamed')?.(
+{
+            oldId: response.oldProjectId,
+            newProject: response.project
+          });
+          this.pendingResolvers.delete('project_renamed');
+        }
+        break;
+
       case 'terminal_created':
         if (response.terminalId) {
           this.pendingResolvers.get('terminal_created')?.(response.terminalId);
@@ -368,6 +379,18 @@ class BridgeService {
           }
         }
         break;
+
+      case 'preview_logs':
+        const previewLogsResolver = this.pendingResolvers.get('preview_logs');
+        if (previewLogsResolver) {
+          previewLogsResolver({ logs: response.logs || [] });
+          this.pendingResolvers.delete('preview_logs');
+        }
+        break;
+
+      case 'preview_logs_cleared':
+        // No resolver needed for clear operation (fire and forget)
+        break;
     }
   }
 
@@ -477,6 +500,23 @@ class BridgeService {
         if (this.pendingResolvers.has('project_deleted')) {
           this.pendingResolvers.delete('project_deleted');
           reject(new Error('Timeout deleting project'));
+        }
+      }, 10000);
+    });
+  }
+
+  async renameProject(projectId: string, newName: string): Promise<{ oldId: string; newProject: ServerProject }> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+      this.pendingResolvers.set('project_renamed', resolve);
+      this.send({ type: 'rename_project', projectId, projectName: newName });
+      setTimeout(() => {
+        if (this.pendingResolvers.has('project_renamed')) {
+          this.pendingResolvers.delete('project_renamed');
+          reject(new Error('Timeout renaming project'));
         }
       }, 10000);
     });
@@ -921,6 +961,36 @@ class BridgeService {
         }
       }, 5000);
     });
+  }
+
+  async getPreviewLogs(projectId: string): Promise<{ timestamp: number; level: 'log' | 'warn' | 'error' | 'info'; message: string; stack?: string; }[]> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+
+      this.pendingResolvers.set('preview_logs', (response: { logs?: { timestamp: number; level: 'log' | 'warn' | 'error' | 'info'; message: string; stack?: string; }[] }) => {
+        resolve(response.logs || []);
+      });
+
+      this.send({ type: 'get_preview_logs', projectId });
+
+      setTimeout(() => {
+        if (this.pendingResolvers.has('preview_logs')) {
+          this.pendingResolvers.delete('preview_logs');
+          resolve([]); // Return empty array on timeout instead of rejecting
+        }
+      }, 5000);
+    });
+  }
+
+  async clearPreviewLogs(projectId: string): Promise<void> {
+    if (!this.isConnected()) {
+      return;
+    }
+
+    this.send({ type: 'clear_preview_logs', projectId });
   }
 
   // Event listeners

@@ -5,6 +5,8 @@ import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as pty from 'node-pty';
+import * as http from 'http';
+import express from 'express';
 import * as voiceService from './voice-service';
 import * as tmuxService from './tmux-service';
 import { getTemplate } from './templates';
@@ -54,8 +56,19 @@ function terminalLog(terminalId: string, event: string, data?: any) {
 fs.writeFileSync(serverLogFile, `=== Bridge Server Started at ${getTimestamp()} ===\n`);
 fs.writeFileSync(terminalLogFile, `=== Terminal Logs Started at ${getTimestamp()} ===\n`);
 
+// Preview logs storage (for remote log capture from Expo Go)
+interface PreviewLogEntry {
+  timestamp: number;
+  level: 'log' | 'warn' | 'error' | 'info';
+  message: string;
+  stack?: string;
+}
+
+const projectLogs: Map<string, PreviewLogEntry[]> = new Map();
+const MAX_LOGS_PER_PROJECT = 500; // Prevent memory overflow
+
 interface Message {
-  type: 'ping' | 'create_project' | 'delete_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'screenshot_captured' | 'preview_start' | 'preview_stop' | 'preview_status';
+  type: 'ping' | 'create_project' | 'delete_project' | 'rename_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'screenshot_captured' | 'preview_start' | 'preview_stop' | 'preview_status' | 'get_preview_logs' | 'clear_preview_logs';
   projectName?: string;
   projectId?: string;
   projectType?: ProjectType;
@@ -105,7 +118,7 @@ interface FileInfo {
 }
 
 interface StreamResponse {
-  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_background_task_started' | 'voice_background_task_complete' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error';
+  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'project_renamed' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_background_task_started' | 'voice_background_task_complete' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error' | 'preview_logs' | 'preview_logs_cleared';
   content?: string;
   error?: string;
   projects?: ProjectInfo[];
@@ -115,6 +128,7 @@ interface StreamResponse {
   project?: ProjectInfo;
   terminalId?: string;
   projectId?: string; // For delete confirmation
+  oldProjectId?: string; // For rename - original project ID before rename
   // Voice-related fields
   voiceSessionId?: string;
   transcription?: string; // STT result
@@ -162,6 +176,8 @@ interface StreamResponse {
   stopped?: boolean;
   previewError?: string; // Error message from preview server
   previewErrorType?: 'error' | 'warn' | 'info'; // Severity of preview message
+  // Preview logs
+  logs?: PreviewLogEntry[];
 }
 
 // Terminal session management (hybrid: tmux for commands, PTY for output)
@@ -420,6 +436,148 @@ async function startPreviewServer(
 
   const template = getTemplate(projectType);
 
+  // Inject remote logger for log capture (only for mobile projects)
+  if (projectType === 'mobile') {
+    try {
+      const loggerIP = getLoggerIP(); // Use LAN IP for Expo Go compatibility
+      const loggerCode = `// Auto-injected by Lora for remote log capture
+const BRIDGE_URL = 'http://${loggerIP}:${PORT}';
+const PROJECT_ID = '${projectId}';
+
+const originalConsole = {
+  log: console.log,
+  warn: console.warn,
+  error: console.error,
+  info: console.info
+};
+
+// Track if we've shown the connectivity error to avoid spam
+let hasShownConnectivityError = false;
+
+const sendLog = async (level, args) => {
+  try {
+    const message = args.map(arg =>
+      typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
+    ).join(' ');
+
+    const logEntry = {
+      level,
+      message,
+      timestamp: Date.now(),
+      stack: level === 'error' && args[0]?.stack ? args[0].stack : undefined
+    };
+
+    const response = await fetch(\`\${BRIDGE_URL}/api/logs/\${PROJECT_ID}\`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(logEntry)
+    });
+
+    if (!response.ok) {
+      if (!hasShownConnectivityError) {
+        originalConsole.warn('[Lora Logger] ⚠️  Failed to send log. Status:', response.status);
+        hasShownConnectivityError = true;
+      }
+    }
+  } catch (err) {
+    // Log fetch errors to help debug connectivity issues (only once to avoid spam)
+    if (!hasShownConnectivityError) {
+      originalConsole.error('[Lora Logger] ❌ Cannot send logs to bridge server');
+      originalConsole.error('[Lora Logger] URL:', BRIDGE_URL + '/api/logs/' + PROJECT_ID);
+      originalConsole.error('[Lora Logger] Error:', err.message || String(err));
+      originalConsole.error('[Lora Logger] Make sure your device can reach the bridge server.');
+      hasShownConnectivityError = true;
+    }
+  }
+};
+
+console.log = (...args) => {
+  originalConsole.log(...args);
+  sendLog('log', args);
+};
+
+console.warn = (...args) => {
+  originalConsole.warn(...args);
+  sendLog('warn', args);
+};
+
+console.error = (...args) => {
+  originalConsole.error(...args);
+  sendLog('error', args);
+};
+
+console.info = (...args) => {
+  originalConsole.info(...args);
+  sendLog('info', args);
+};
+
+// Capture unhandled errors
+if (typeof ErrorUtils !== 'undefined') {
+  const originalHandler = ErrorUtils.getGlobalHandler();
+  ErrorUtils.setGlobalHandler((error, isFatal) => {
+    sendLog('error', [error.message, error.stack]);
+    originalHandler(error, isFatal);
+  });
+}
+
+// Test log to verify logger is active
+console.log('[Lora Logger] Remote logging active for project ' + PROJECT_ID);
+console.log('[Lora Logger] Bridge URL: ' + BRIDGE_URL);
+
+// Test connectivity to bridge server
+(async () => {
+  try {
+    const testResponse = await fetch(\`\${BRIDGE_URL}/api/logs/\${PROJECT_ID}\`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        level: 'info',
+        message: '[Lora Logger] Connectivity test - logger initialized',
+        timestamp: Date.now()
+      })
+    });
+    if (testResponse.ok) {
+      originalConsole.log('[Lora Logger] ✅ Connected to bridge server');
+    } else {
+      originalConsole.warn('[Lora Logger] ⚠️  Bridge server responded with:', testResponse.status);
+    }
+  } catch (err) {
+    originalConsole.error('[Lora Logger] ❌ Cannot reach bridge server:', BRIDGE_URL);
+    originalConsole.error('[Lora Logger] Error:', err.message || err);
+    originalConsole.error('[Lora Logger] Logs will not be captured. Check network connectivity.');
+  }
+})();
+
+export default {};
+`;
+
+      // Write logger to project directory
+      const loggerPath = path.join(projectPath, 'lora-logger.js');
+      fs.writeFileSync(loggerPath, loggerCode);
+      serverLog(`📝 Injected remote logger for project ${projectId}`);
+
+      // Add import to entry file (App.tsx/App.js/App.jsx)
+      const entryFiles = ['App.tsx', 'App.js', 'App.jsx'];
+      for (const entryFile of entryFiles) {
+        const entryPath = path.join(projectPath, entryFile);
+        if (fs.existsSync(entryPath)) {
+          const content = fs.readFileSync(entryPath, 'utf-8');
+          if (!content.includes('lora-logger')) {
+            const updatedContent = `import './lora-logger';\n${content}`;
+            fs.writeFileSync(entryPath, updatedContent);
+            serverLog(`✅ Added logger import to ${entryFile}`);
+          } else {
+            serverLog(`ℹ️  Logger already imported in ${entryFile}`);
+          }
+          break;
+        }
+      }
+    } catch (err) {
+      serverError(`Failed to inject logger:`, err);
+      // Don't fail the preview, just log the error
+    }
+  }
+
   // Find an available port
   const port = await findAvailablePort(nextPreviewPort);
   nextPreviewPort = port + 1; // Update for next time
@@ -452,14 +610,55 @@ async function startPreviewServer(
   let serverFailed = false;
   let failureReason = '';
 
+  // Helper to parse and store Metro bundler logs
+  const parseAndStoreLog = (output: string, isStderr: boolean = false) => {
+    // Parse Metro bundler log format
+    let level: 'log' | 'warn' | 'error' | 'info' = 'log';
+    let message = output;
+
+    // Detect log level from output
+    if (output.includes('ERROR') || output.includes('Error:')) {
+      level = 'error';
+    } else if (output.includes('WARN') || output.includes('warning') || output.includes('deprecated')) {
+      level = 'warn';
+    } else if (output.includes('LOG')) {
+      level = 'log';
+    } else if (isStderr) {
+      // stderr output is likely an error or warning
+      level = output.includes('warning') ? 'warn' : 'error';
+    }
+
+    // Store in projectLogs (only errors and warnings to reduce noise)
+    if (level === 'error' || level === 'warn') {
+      if (!projectLogs.has(projectId)) {
+        projectLogs.set(projectId, []);
+      }
+
+      const logs = projectLogs.get(projectId)!;
+      logs.push({
+        timestamp: Date.now(),
+        level,
+        message: output,
+        stack: undefined
+      });
+
+      // Keep only last MAX_LOGS_PER_PROJECT entries
+      if (logs.length > MAX_LOGS_PER_PROJECT) {
+        logs.splice(0, logs.length - MAX_LOGS_PER_PROJECT);
+      }
+    }
+  };
+
   expoProcess.stdout?.on('data', (data) => {
     const output = data.toString().trim();
     serverLog(`[Preview ${projectId}] ${output}`);
+    parseAndStoreLog(output, false);
   });
 
   expoProcess.stderr?.on('data', (data) => {
     const output = data.toString().trim();
     serverError(`[Preview ${projectId}] ${output}`);
+    parseAndStoreLog(output, true);
 
     // Determine error type and forward to client
     let errorType: 'error' | 'warn' | 'info' = 'error';
@@ -517,6 +716,11 @@ function stopPreviewServer(projectId: string): boolean {
   serverLog(`🛑 Stopping preview server for ${projectId}`);
   server.process.kill();
   previewServers.delete(projectId);
+
+  // Clear preview logs when server stops
+  projectLogs.delete(projectId);
+  serverLog(`🗑️  Cleared preview logs for ${projectId}`);
+
   return true;
 }
 
@@ -594,16 +798,86 @@ function getLocalIP(): string {
   return candidates.length > 0 ? candidates[0].address : 'localhost';
 }
 
-const wss = new WebSocketServer({ port: PORT });
+/**
+ * Get the best IP for Expo Go logger
+ * Uses Tailscale IP (requires Tailscale installed on phone)
+ * Falls back to LAN IP if Tailscale not available
+ */
+function getLoggerIP(): string {
+  const interfaces = networkInterfaces();
+  let tailscaleIP: string | null = null;
+  let lanIP: string | null = null;
 
-serverLog('╔════════════════════════════════════════════════════════════╗');
-serverLog('║           LORA BRIDGE SERVER                               ║');
-serverLog('╠════════════════════════════════════════════════════════════╣');
-serverLog(`║  Local:   ws://localhost:${PORT}`);
-serverLog(`║  Network: ws://${getLocalIP()}:${PORT}`);
-serverLog('╠════════════════════════════════════════════════════════════╣');
-serverLog('║  Waiting for Lora iOS app connection...                    ║');
-serverLog('╚════════════════════════════════════════════════════════════╝');
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name] || []) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        if (iface.address.startsWith('100.')) {
+          tailscaleIP = iface.address;
+        } else if (iface.address.startsWith('192.168.')) {
+          lanIP = iface.address;
+        }
+      }
+    }
+  }
+
+  // Prefer Tailscale for remote access, fallback to LAN
+  return tailscaleIP || lanIP || 'localhost';
+}
+
+// Set up Express app for HTTP endpoints
+const app = express();
+app.use(express.json());
+
+// HTTP endpoint for log ingestion from Expo Go apps
+// This allows the Expo Go app to send logs even when Lora is closed
+app.post('/api/logs/:projectId', (req, res) => {
+  const { projectId } = req.params;
+  const { level, message, stack, timestamp } = req.body;
+
+  if (!projectId || !level || !message) {
+    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  }
+
+  serverLog(`[Preview Logs] Received ${level} log from project ${projectId}: ${message.substring(0, 100)}`);
+
+  if (!projectLogs.has(projectId)) {
+    projectLogs.set(projectId, []);
+  }
+
+  const logs = projectLogs.get(projectId)!;
+  logs.push({ timestamp, level, message, stack });
+
+  // Keep only last MAX_LOGS_PER_PROJECT entries
+  if (logs.length > MAX_LOGS_PER_PROJECT) {
+    logs.splice(0, logs.length - MAX_LOGS_PER_PROJECT);
+  }
+
+  serverLog(`[Preview Logs] Total logs for ${projectId}: ${logs.length}`);
+  res.status(200).json({ success: true });
+});
+
+// Create HTTP server and attach WebSocket server to it
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+// Start the HTTP server
+server.listen(PORT, () => {
+  const tailscaleIP = getLocalIP();
+  const loggerIP = getLoggerIP();
+
+  serverLog('╔════════════════════════════════════════════════════════════╗');
+  serverLog('║           LORA BRIDGE SERVER                               ║');
+  serverLog('╠════════════════════════════════════════════════════════════╣');
+  serverLog(`║  Lora App:  ws://${tailscaleIP}:${PORT}`);
+  serverLog(`║  Expo Logs: http://${loggerIP}:${PORT}`);
+  if (loggerIP === tailscaleIP) {
+    serverLog('║  📱 Note: Tailscale must be installed on your phone       ║');
+    serverLog('║     for Expo Go log capture to work remotely              ║');
+  }
+  serverLog('╠════════════════════════════════════════════════════════════╣');
+  serverLog('║  Waiting for Lora iOS app connection...                    ║');
+  serverLog('╚════════════════════════════════════════════════════════════╝');
+});
 
 // Helper functions for project management
 function createProjectId(name: string): string {
@@ -614,6 +888,30 @@ function createProjectId(name: string): string {
 
 function getProjectPath(projectId: string): string {
   return path.join(PROJECTS_DIR, projectId);
+}
+
+/**
+ * Derive a human-readable name from a project ID (folder name)
+ * Strips timestamp suffix and converts slug to title case
+ */
+function deriveNameFromFolderId(folderId: string): string {
+  // Remove timestamp suffix (last segment after dash if it looks like a timestamp)
+  const parts = folderId.split('-');
+  let nameSlug = folderId;
+
+  // If last part is likely a timestamp (alphanumeric, 6-10 chars), remove it
+  if (parts.length > 1) {
+    const lastPart = parts[parts.length - 1];
+    if (/^[a-z0-9]{6,10}$/.test(lastPart)) {
+      nameSlug = parts.slice(0, -1).join('-');
+    }
+  }
+
+  // Convert slug to title case
+  return nameSlug
+    .split('-')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
 }
 
 function listProjects(): ProjectInfo[] {
@@ -627,11 +925,55 @@ function listProjects(): ProjectInfo[] {
       const projectPath = path.join(PROJECTS_DIR, entry.name);
       const metaPath = path.join(projectPath, '.lora.json');
 
-      let meta = { name: entry.name, createdAt: new Date().toISOString() };
+      // Derive expected name from folder ID
+      const folderDerivedName = deriveNameFromFolderId(entry.name);
+
+      let meta = { name: folderDerivedName, createdAt: new Date().toISOString() };
+      let needsUpdate = false;
+
       if (fs.existsSync(metaPath)) {
         try {
-          meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
-        } catch {}
+          const existingMeta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+          meta = existingMeta;
+
+          // Check if stored name differs from folder-derived name
+          // (indicating folder was renamed externally)
+          if (meta.name !== folderDerivedName) {
+            serverLog(`📝 Syncing project name: "${meta.name}" → "${folderDerivedName}" (folder: ${entry.name})`);
+            const oldName = meta.name;
+            meta.name = folderDerivedName;
+            needsUpdate = true;
+
+            // Update CLAUDE.md if it exists (replace old name references)
+            const claudeMdPath = path.join(projectPath, 'CLAUDE.md');
+            if (fs.existsSync(claudeMdPath)) {
+              try {
+                let claudeMdContent = fs.readFileSync(claudeMdPath, 'utf-8');
+                // Replace old name with new name
+                const oldNameRegex = new RegExp(oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+                claudeMdContent = claudeMdContent.replace(oldNameRegex, folderDerivedName);
+                fs.writeFileSync(claudeMdPath, claudeMdContent, 'utf-8');
+                serverLog(`  └─ Updated CLAUDE.md: ${oldName} → ${folderDerivedName}`);
+              } catch (err) {
+                serverError(`  └─ Failed to update CLAUDE.md:`, err);
+              }
+            }
+          }
+        } catch (err) {
+          serverError(`Failed to read metadata for ${entry.name}:`, err);
+        }
+      } else {
+        // No metadata file, create one with folder-derived name
+        needsUpdate = true;
+      }
+
+      // Write updated metadata if needed
+      if (needsUpdate) {
+        try {
+          fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+        } catch (err) {
+          serverError(`Failed to write metadata for ${entry.name}:`, err);
+        }
       }
 
       projects.push({
@@ -711,6 +1053,85 @@ function deleteProject(projectId: string): boolean {
   fs.rmSync(projectPath, { recursive: true, force: true });
   serverLog(`🗑️  Deleted project: ${projectId}`);
   return true;
+}
+
+function renameProject(oldProjectId: string, newName: string): ProjectInfo | null {
+  const oldPath = getProjectPath(oldProjectId);
+  if (!fs.existsSync(oldPath)) return null;
+
+  // Generate new ID from new name
+  const newProjectId = createProjectId(newName);
+  const newPath = getProjectPath(newProjectId);
+
+  // Check if new path already exists
+  if (fs.existsSync(newPath)) {
+    serverError(`Project ${newProjectId} already exists`);
+    return null;
+  }
+
+  // Read existing metadata
+  const metaPath = path.join(oldPath, '.lora.json');
+  let metadata: any = { name: newName, createdAt: new Date().toISOString() };
+  if (fs.existsSync(metaPath)) {
+    try {
+      metadata = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      metadata.name = newName; // Update name
+    } catch (err) {
+      serverError(`Failed to read metadata for ${oldProjectId}:`, err);
+    }
+  }
+
+  // Rename the directory
+  fs.renameSync(oldPath, newPath);
+
+  // Update metadata with new name
+  fs.writeFileSync(
+    path.join(newPath, '.lora.json'),
+    JSON.stringify(metadata, null, 2)
+  );
+
+  // Update CLAUDE.md file if it exists
+  const claudeMdPath = path.join(newPath, 'CLAUDE.md');
+  if (fs.existsSync(claudeMdPath)) {
+    try {
+      let claudeMdContent = fs.readFileSync(claudeMdPath, 'utf-8');
+
+      // Replace all occurrences of old project ID with new project ID
+      const oldIdRegex = new RegExp(oldProjectId, 'g');
+      claudeMdContent = claudeMdContent.replace(oldIdRegex, newProjectId);
+
+      // Replace old project path with new project path (if absolute paths are used)
+      const oldPathRegex = new RegExp(oldPath.replace(/\\/g, '\\\\'), 'g');
+      claudeMdContent = claudeMdContent.replace(oldPathRegex, newPath);
+
+      // Write updated CLAUDE.md
+      fs.writeFileSync(claudeMdPath, claudeMdContent, 'utf-8');
+      serverLog(`Updated CLAUDE.md: replaced ${oldProjectId} → ${newProjectId}`);
+    } catch (err) {
+      serverError(`Failed to update CLAUDE.md for ${newProjectId}:`, err);
+    }
+  }
+
+  // Update Claude session registry if exists
+  if (claudeSessionRegistry.has(oldProjectId)) {
+    const sessions = claudeSessionRegistry.get(oldProjectId);
+    claudeSessionRegistry.delete(oldProjectId);
+    if (sessions) {
+      claudeSessionRegistry.set(newProjectId, sessions);
+      serverLog(`Updated Claude session registry: ${oldProjectId} → ${newProjectId} (${sessions.length} session(s))`);
+    }
+  }
+
+  serverLog(`✏️  Renamed project: ${oldProjectId} → ${newProjectId} (${newName})`);
+
+  // Return new project info
+  return {
+    id: newProjectId,
+    name: metadata.name,
+    path: newPath,
+    projectType: metadata.projectType || 'mobile',
+    createdAt: metadata.createdAt
+  };
 }
 
 // Create a new project with Expo template for easy previews
@@ -832,6 +1253,25 @@ wss.on('connection', (ws: WebSocket) => {
           const response: StreamResponse = {
             type: 'error',
             error: `Project not found: ${message.projectId}`
+          };
+          ws.send(JSON.stringify(response));
+        }
+        return;
+      }
+
+      if (message.type === 'rename_project' && message.projectId && message.projectName) {
+        const newProject = renameProject(message.projectId, message.projectName);
+        if (newProject) {
+          const response: StreamResponse = {
+            type: 'project_renamed',
+            oldProjectId: message.projectId,
+            project: newProject
+          };
+          ws.send(JSON.stringify(response));
+        } else {
+          const response: StreamResponse = {
+            type: 'error',
+            error: `Failed to rename project ${message.projectId}`
           };
           ws.send(JSON.stringify(response));
         }
@@ -1020,23 +1460,49 @@ wss.on('connection', (ws: WebSocket) => {
 
               // If there's an initial prompt, include it in the command
               if (message.initialPrompt) {
+                serverLog(`==================== INITIAL PROMPT RECEIVED ====================`);
+                serverLog(`[Initial Prompt] Length: ${message.initialPrompt.length} characters`);
+                serverLog(`[Initial Prompt] FULL ORIGINAL PROMPT:`);
+                serverLog(message.initialPrompt);
+                serverLog(`[Initial Prompt] Has newlines: ${message.initialPrompt.includes('\n')}`);
+                serverLog(`[Initial Prompt] Has quotes: ${message.initialPrompt.includes('"')}`);
+                serverLog(`[Initial Prompt] Has exclamation: ${message.initialPrompt.includes('!')}`);
+
                 // Prepare prompt for shell command:
                 // 1. Replace newlines with literal \n (Claude CLI interprets these)
                 // 2. Escape double quotes (since we wrap in double quotes)
-                // 3. Escape backticks and $ (shell special chars within double quotes)
+                // 3. Escape backticks, $, and ! (shell special chars within double quotes)
                 const cleanPrompt = message.initialPrompt
                   .replace(/\\/g, '\\\\')  // Escape backslashes first
                   .replace(/"/g, '\\"')    // Escape double quotes
                   .replace(/\$/g, '\\$')   // Escape dollar signs
                   .replace(/`/g, '\\`')    // Escape backticks
+                  .replace(/!/g, '\\!')    // Escape exclamation marks (bash history expansion)
                   .replace(/\n/g, '\\n')   // Convert newlines to literal \n
                   .replace(/\r/g, '');     // Remove carriage returns
 
-                // Start Claude with --dangerously-skip-permissions to avoid permission prompts
-                const claudeCommand = `claude --dangerously-skip-permissions "${cleanPrompt}"`;
-                serverLog(`📝 With initial prompt: "${message.initialPrompt.substring(0, 50)}${message.initialPrompt.length > 50 ? '...' : ''}"`);
-                await tmuxService.sendCommand(tmuxSessionName, claudeCommand);
-                await tmuxService.sendEnter(tmuxSessionName);
+                serverLog(`[Clean Prompt] Length: ${cleanPrompt.length} characters`);
+                serverLog(`[Clean Prompt] FULL ESCAPED PROMPT:`);
+                serverLog(cleanPrompt);
+
+                // For long prompts, write to a temp file to avoid "command too long" error
+                const promptFile = `/tmp/claude-prompt-${Date.now()}.txt`;
+                try {
+                  fs.writeFileSync(promptFile, message.initialPrompt);
+                  const claudeCommand = `claude --dangerously-skip-permissions "$(cat ${promptFile})" && rm ${promptFile}`;
+                  serverLog(`[Final Command] Using temp file: ${promptFile}`);
+                  serverLog(`[Final Command] Length: ${claudeCommand.length} characters`);
+                  serverLog(`================================================================`);
+
+                  await tmuxService.sendCommand(tmuxSessionName, claudeCommand);
+                  await tmuxService.sendEnter(tmuxSessionName);
+                } catch (fileErr) {
+                  serverError(`Failed to write prompt file:`, fileErr);
+                  // Fallback to direct command (may fail if too long)
+                  const claudeCommand = `claude --dangerously-skip-permissions "${cleanPrompt}"`;
+                  await tmuxService.sendCommand(tmuxSessionName, claudeCommand);
+                  await tmuxService.sendEnter(tmuxSessionName);
+                }
               } else {
                 // Start Claude with --dangerously-skip-permissions
                 await tmuxService.sendCommand(tmuxSessionName, 'claude --dangerously-skip-permissions');
@@ -1048,14 +1514,24 @@ wss.on('connection', (ws: WebSocket) => {
               serverLog(`♻️  Reusing existing Claude Code session in terminal ${terminalId}`);
               // If there's an initial prompt for a reused session, send it after a delay
               if (message.initialPrompt) {
-                // Replace newlines with literal \n for existing session too
-                const cleanPrompt = message.initialPrompt
-                  .replace(/\n/g, '\\n')
-                  .replace(/\r/g, '');
                 serverLog(`📝 Sending prompt to existing session: "${message.initialPrompt.substring(0, 50)}..."`);
                 await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for prompt to be ready
-                await tmuxService.sendCommand(tmuxSessionName, cleanPrompt);
-                await tmuxService.sendEnter(tmuxSessionName);
+
+                // Write to temp file for long prompts
+                const promptFile = `/tmp/claude-prompt-${Date.now()}.txt`;
+                try {
+                  fs.writeFileSync(promptFile, message.initialPrompt);
+                  await tmuxService.sendCommand(tmuxSessionName, `cat ${promptFile} && rm ${promptFile}`);
+                  await tmuxService.sendEnter(tmuxSessionName);
+                } catch (fileErr) {
+                  serverError(`Failed to write prompt file:`, fileErr);
+                  // Fallback to direct input (may fail if too long)
+                  const cleanPrompt = message.initialPrompt
+                    .replace(/\n/g, '\\n')
+                    .replace(/\r/g, '');
+                  await tmuxService.sendCommand(tmuxSessionName, cleanPrompt);
+                  await tmuxService.sendEnter(tmuxSessionName);
+                }
               }
               // Note: Do NOT send any input when reconnecting without an initial prompt.
               // The PTY will display whatever is already on screen from the tmux session.
@@ -2712,6 +3188,29 @@ wss.on('connection', (ws: WebSocket) => {
         return;
       }
 
+      if (message.type === 'get_preview_logs' && message.projectId) {
+        const logs = projectLogs.get(message.projectId) || [];
+        serverLog(`[Preview Logs] Fetching ${logs.length} logs for project ${message.projectId}`);
+        const response: StreamResponse = {
+          type: 'preview_logs',
+          projectId: message.projectId,
+          logs: logs
+        };
+        ws.send(JSON.stringify(response));
+        return;
+      }
+
+      if (message.type === 'clear_preview_logs' && message.projectId) {
+        projectLogs.delete(message.projectId);
+        serverLog(`[Preview Logs] Cleared logs for project ${message.projectId}`);
+        const response: StreamResponse = {
+          type: 'preview_logs_cleared',
+          projectId: message.projectId
+        };
+        ws.send(JSON.stringify(response));
+        return;
+      }
+
       // Voice session management
 
       if (message.type === 'voice_status') {
@@ -2878,6 +3377,32 @@ wss.on('connection', (ws: WebSocket) => {
         const response: StreamResponse = {
           type: 'voice_closed',
           voiceSessionId: message.voiceSessionId
+        };
+        ws.send(JSON.stringify(response));
+        return;
+      }
+
+      // Preview log operations
+      if (message.type === 'get_preview_logs' && message.projectId) {
+        const logs = projectLogs.get(message.projectId) || [];
+        serverLog(`[Preview Logs] Fetching ${logs.length} logs for project ${message.projectId}`);
+
+        const response: StreamResponse = {
+          type: 'preview_logs',
+          projectId: message.projectId,
+          logs: logs
+        };
+        ws.send(JSON.stringify(response));
+        return;
+      }
+
+      if (message.type === 'clear_preview_logs' && message.projectId) {
+        projectLogs.delete(message.projectId);
+        serverLog(`[Preview Logs] Cleared logs for project ${message.projectId}`);
+
+        const response: StreamResponse = {
+          type: 'preview_logs_cleared',
+          projectId: message.projectId
         };
         ws.send(JSON.stringify(response));
         return;

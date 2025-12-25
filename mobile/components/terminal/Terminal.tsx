@@ -10,6 +10,7 @@ import {
   ScrollView,
 } from 'react-native';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
+import * as Clipboard from 'expo-clipboard';
 import { Plus, Keyboard as KeyboardIcon, ScrollText, ChevronsUp, ChevronsDown } from 'lucide-react-native';
 
 interface TerminalProps {
@@ -548,6 +549,19 @@ export function Terminal({
     onInput('\t');
   }, [onInput]);
 
+  // Paste handler
+  const handlePaste = useCallback(async () => {
+    try {
+      const text = await Clipboard.getStringAsync();
+      if (text) {
+        // Send paste to WebView terminal
+        sendToWebView({ type: 'paste', text });
+      }
+    } catch (err) {
+      console.error('[Terminal] Paste error:', err);
+    }
+  }, [sendToWebView]);
+
   // Escape key handler
   const handleEscape = useCallback(() => {
     onInput('\x1b');
@@ -715,6 +729,9 @@ export function Terminal({
         </TouchableOpacity>
         <TouchableOpacity style={styles.controlButton} onPress={handleTab}>
           <Text style={styles.controlButtonText}>Tab</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.controlButton} onPress={handlePaste}>
+          <Text style={styles.controlButtonText}>Paste</Text>
         </TouchableOpacity>
 
         {/* Line navigation */}
