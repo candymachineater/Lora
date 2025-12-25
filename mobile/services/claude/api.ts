@@ -1,4 +1,4 @@
-import { WSMessage, WSResponse, ServerProject, ProjectFile } from '../../types';
+import { WSMessage, WSResponse, ServerProject, ProjectFile, SessionInfo } from '../../types';
 
 type MessageCallback = (chunk: string) => void;
 type ConnectionCallback = () => void;
@@ -35,6 +35,23 @@ class BridgeService {
 
   // Track if a connection is in progress
   private connectingPromise: Promise<ServerProject[]> | null = null;
+
+  // Helper to rewrite preview URLs for localhost connections (Android emulator)
+  private rewritePreviewUrl(url: string | undefined): string | undefined {
+    if (!url) return url;
+
+    // If connected via localhost, rewrite any IP addresses to localhost
+    // This is for Android emulator which uses ADB reverse port forwarding
+    if (this.serverUrl.includes('localhost') || this.serverUrl.includes('127.0.0.1')) {
+      // Replace Tailscale IPs (100.x.x.x) or any IP address with localhost
+      return url.replace(/https?:\/\/[\d.]+:/g, (match) => {
+        const protocol = match.startsWith('https') ? 'https://' : 'http://';
+        return `${protocol}localhost:`;
+      });
+    }
+
+    return url;
+  }
 
   async connect(serverUrl: string): Promise<ServerProject[]> {
     // If already connected to the same server, return empty (caller should use listProjects)
@@ -346,7 +363,8 @@ class BridgeService {
       case 'preview_started':
         const previewStartedResolver = this.pendingResolvers.get('preview_started');
         if (previewStartedResolver) {
-          previewStartedResolver({ previewUrl: response.previewUrl, previewPort: response.previewPort });
+          const rewrittenUrl = this.rewritePreviewUrl(response.previewUrl);
+          previewStartedResolver({ previewUrl: rewrittenUrl, previewPort: response.previewPort });
           this.pendingResolvers.delete('preview_started');
         }
         break;
@@ -362,9 +380,10 @@ class BridgeService {
       case 'preview_status':
         const previewStatusResolver = this.pendingResolvers.get('preview_status');
         if (previewStatusResolver) {
+          const rewrittenStatusUrl = this.rewritePreviewUrl(response.previewUrl);
           previewStatusResolver({
             previewRunning: response.previewRunning,
-            previewUrl: response.previewUrl,
+            previewUrl: rewrittenStatusUrl,
             previewPort: response.previewPort
           });
           this.pendingResolvers.delete('preview_status');
@@ -390,6 +409,14 @@ class BridgeService {
 
       case 'preview_logs_cleared':
         // No resolver needed for clear operation (fire and forget)
+        break;
+
+      case 'sessions_list':
+        const sessionsResolver = this.pendingResolvers.get('sessions_list');
+        if (sessionsResolver) {
+          sessionsResolver(response.sessions || []);
+          this.pendingResolvers.delete('sessions_list');
+        }
         break;
     }
   }
@@ -672,6 +699,28 @@ class BridgeService {
   closeTerminal(terminalId: string) {
     this.send({ type: 'terminal_close', terminalId });
     this.terminalCallbacks.delete(terminalId);
+  }
+
+  // Session management (for reconnecting to existing terminals)
+  async listSessions(projectId: string): Promise<SessionInfo[]> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected()) {
+        reject(new Error('Not connected'));
+        return;
+      }
+      this.pendingResolvers.set('sessions_list', resolve);
+      this.send({ type: 'list_sessions', projectId });
+      setTimeout(() => {
+        if (this.pendingResolvers.has('sessions_list')) {
+          this.pendingResolvers.delete('sessions_list');
+          resolve([]); // Return empty on timeout instead of rejecting
+        }
+      }, 5000);
+    });
+  }
+
+  killAllSessions(projectId: string): void {
+    this.send({ type: 'kill_all_sessions', projectId });
   }
 
   private handleTerminalOutput(terminalId: string, data: string) {

@@ -68,7 +68,7 @@ const projectLogs: Map<string, PreviewLogEntry[]> = new Map();
 const MAX_LOGS_PER_PROJECT = 500; // Prevent memory overflow
 
 interface Message {
-  type: 'ping' | 'create_project' | 'delete_project' | 'rename_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'screenshot_captured' | 'preview_start' | 'preview_stop' | 'preview_status' | 'get_preview_logs' | 'clear_preview_logs';
+  type: 'ping' | 'create_project' | 'delete_project' | 'rename_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'set_sandbox' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'screenshot_captured' | 'preview_start' | 'preview_stop' | 'preview_status' | 'get_preview_logs' | 'clear_preview_logs' | 'list_sessions' | 'kill_session' | 'kill_all_sessions';
   projectName?: string;
   projectId?: string;
   projectType?: ProjectType;
@@ -118,7 +118,7 @@ interface FileInfo {
 }
 
 interface StreamResponse {
-  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'project_renamed' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_background_task_started' | 'voice_background_task_complete' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error' | 'preview_logs' | 'preview_logs_cleared';
+  type: 'pong' | 'connected' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'project_renamed' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_background_task_started' | 'voice_background_task_complete' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error' | 'preview_logs' | 'preview_logs_cleared' | 'sessions_list';
   content?: string;
   error?: string;
   projects?: ProjectInfo[];
@@ -178,6 +178,16 @@ interface StreamResponse {
   previewErrorType?: 'error' | 'warn' | 'info'; // Severity of preview message
   // Preview logs
   logs?: PreviewLogEntry[];
+  // Session list for reconnection
+  sessions?: SessionInfo[];
+}
+
+// Session info for reconnection UI
+interface SessionInfo {
+  tmuxSessionName: string;
+  projectId: string;
+  createdAt: number;
+  isActive: boolean;
 }
 
 // Terminal session management (hybrid: tmux for commands, PTY for output)
@@ -291,6 +301,53 @@ async function getActiveClaudeSession(projectId: string): Promise<string | undef
   }
 
   return undefined;
+}
+
+/**
+ * Get all sessions for a project with their current status
+ * Validates that sessions still exist in tmux and discovers orphaned sessions
+ */
+async function getSessionsForProject(projectId: string): Promise<SessionInfo[]> {
+  const registeredSessions = claudeSessionRegistry.get(projectId) || [];
+  const result: SessionInfo[] = [];
+
+  // Check registered sessions
+  for (const session of registeredSessions) {
+    const exists = await tmuxService.sessionExists(session.tmuxSessionName);
+    if (exists) {
+      result.push({
+        tmuxSessionName: session.tmuxSessionName,
+        projectId,
+        createdAt: session.createdAt,
+        isActive: true,
+      });
+    } else {
+      // Session died, update registry
+      session.isActive = false;
+    }
+  }
+
+  // Also check for orphaned sessions not in registry (e.g., after server restart)
+  const allLoraSessions = await tmuxService.listSessions();
+  for (const tmuxSession of allLoraSessions) {
+    // Check if this session belongs to this project
+    const expectedPrefix = `lora-${projectId}`;
+    if (tmuxSession.sessionName === expectedPrefix || tmuxSession.sessionName.startsWith(expectedPrefix + '-')) {
+      const alreadyTracked = result.some(s => s.tmuxSessionName === tmuxSession.sessionName);
+      if (!alreadyTracked) {
+        result.push({
+          tmuxSessionName: tmuxSession.sessionName,
+          projectId,
+          createdAt: tmuxSession.createdAt,
+          isActive: true,
+        });
+        // Re-register this orphaned session
+        registerClaudeSession(projectId, tmuxSession.sessionName);
+      }
+    }
+  }
+
+  return result;
 }
 
 // ============================================================================
@@ -877,6 +934,22 @@ server.listen(PORT, () => {
   serverLog('╠════════════════════════════════════════════════════════════╣');
   serverLog('║  Waiting for Lora iOS app connection...                    ║');
   serverLog('╚════════════════════════════════════════════════════════════╝');
+
+  // Cleanup stale tmux sessions (older than 24 hours) on startup and periodically
+  const CLEANUP_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
+  const MAX_SESSION_AGE = 24 * 60 * 60 * 1000; // 24 hours
+
+  // Initial cleanup after 30 seconds (let things settle first)
+  setTimeout(async () => {
+    serverLog('[Cleanup] Running initial stale session cleanup...');
+    await tmuxService.cleanupStaleSessions(MAX_SESSION_AGE);
+  }, 30000);
+
+  // Periodic cleanup every 4 hours
+  setInterval(async () => {
+    serverLog('[Cleanup] Running periodic stale session cleanup...');
+    await tmuxService.cleanupStaleSessions(MAX_SESSION_AGE);
+  }, CLEANUP_INTERVAL);
 });
 
 // Helper functions for project management
@@ -3128,6 +3201,80 @@ wss.on('connection', (ws: WebSocket) => {
         return;
       }
 
+      // Session management - list existing sessions for a project
+      if (message.type === 'list_sessions' && message.projectId) {
+        const sessions = await getSessionsForProject(message.projectId);
+        serverLog(`📋 Listed ${sessions.length} sessions for project ${message.projectId}`);
+        const response: StreamResponse = {
+          type: 'sessions_list',
+          projectId: message.projectId,
+          sessions
+        };
+        ws.send(JSON.stringify(response));
+        return;
+      }
+
+      // Kill a specific session
+      if (message.type === 'kill_session' && message.terminalId) {
+        const session = terminals.get(message.terminalId);
+        if (session) {
+          // Kill PTY
+          if (session.pty) {
+            session.pty.kill();
+          }
+          // Kill tmux session
+          await tmuxService.killSession(session.tmuxSessionName);
+          markSessionInactive(session.projectId, session.tmuxSessionName);
+          terminals.delete(message.terminalId);
+          serverLog(`🗑️  Killed session ${message.terminalId} and tmux ${session.tmuxSessionName}`);
+
+          const response: StreamResponse = {
+            type: 'terminal_closed',
+            terminalId: message.terminalId
+          };
+          ws.send(JSON.stringify(response));
+        }
+        return;
+      }
+
+      // Kill all sessions for a project
+      if (message.type === 'kill_all_sessions' && message.projectId) {
+        const sessions = claudeSessionRegistry.get(message.projectId) || [];
+        let killedCount = 0;
+
+        // Kill all registered sessions
+        for (const session of sessions) {
+          if (session.isActive) {
+            try {
+              await tmuxService.killSession(session.tmuxSessionName);
+              markSessionInactive(message.projectId, session.tmuxSessionName);
+              killedCount++;
+            } catch {
+              // Session may already be dead
+            }
+          }
+        }
+
+        // Also kill any terminals in current connection for this project
+        for (const [id, terminal] of terminals) {
+          if (terminal.projectId === message.projectId) {
+            if (terminal.pty) {
+              terminal.pty.kill();
+            }
+            terminals.delete(id);
+          }
+        }
+
+        serverLog(`🗑️  Killed ${killedCount} sessions for project ${message.projectId}`);
+        const response: StreamResponse = {
+          type: 'sessions_list',
+          projectId: message.projectId,
+          sessions: [] // All killed
+        };
+        ws.send(JSON.stringify(response));
+        return;
+      }
+
       // Preview server management
       if (message.type === 'preview_start' && message.projectId) {
         try {
@@ -3419,29 +3566,23 @@ wss.on('connection', (ws: WebSocket) => {
   });
 
   ws.on('close', async () => {
-    serverLog('❌ Lora iOS app disconnected');
-    // Kill ALL terminal sessions including tmux sessions when app disconnects
-    // This ensures no orphaned terminals run in the background
+    serverLog('📱 Lora iOS app disconnected');
+    // Detach PTY connections but PRESERVE tmux sessions for reconnection
+    // Sessions persist so user can reconnect when app restarts
     for (const [id, session] of terminals) {
-      serverLog(`🖥️  Cleaning up terminal ${id} and tmux session ${session.tmuxSessionName}`);
-      terminalLog(id, 'CLOSED_ON_DISCONNECT');
+      serverLog(`🔌 Detaching terminal ${id} (tmux session ${session.tmuxSessionName} preserved)`);
+      terminalLog(id, 'DETACHED_ON_DISCONNECT');
 
-      // Kill the PTY
+      // Kill the PTY (detaches from tmux, but tmux session keeps running)
       if (session.pty) {
         session.pty.kill();
       }
 
-      // Kill the tmux session
-      try {
-        await tmuxService.killSession(session.tmuxSessionName);
-        // Mark session as inactive in registry
-        markSessionInactive(session.projectId, session.tmuxSessionName);
-      } catch (err) {
-        serverError(`Failed to kill tmux session ${session.tmuxSessionName}:`, err);
-      }
+      // DO NOT kill tmux session - preserve for reconnection
+      // DO NOT mark session as inactive - it's still running
     }
     terminals.clear();
-    serverLog('🧹 All terminal sessions cleaned up');
+    serverLog('🔌 All PTY connections detached (tmux sessions preserved for reconnection)');
   });
 
   ws.on('error', (err: Error) => {

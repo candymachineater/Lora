@@ -64,9 +64,17 @@ export interface PreviewLogEntry {
   stack?: string;
 }
 
+// Session info for reconnection
+export interface SessionInfo {
+  tmuxSessionName: string;
+  projectId: string;
+  createdAt: number;
+  isActive: boolean;
+}
+
 // WebSocket message types
 export interface WSMessage {
-  type: 'ping' | 'cancel' | 'create_project' | 'delete_project' | 'rename_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'screenshot_captured' | 'preview_start' | 'preview_stop' | 'preview_status' | 'get_preview_logs' | 'clear_preview_logs';
+  type: 'ping' | 'cancel' | 'create_project' | 'delete_project' | 'rename_project' | 'list_projects' | 'get_files' | 'get_file_content' | 'save_file' | 'terminal_create' | 'terminal_input' | 'terminal_resize' | 'terminal_close' | 'voice_create' | 'voice_audio' | 'voice_text' | 'voice_close' | 'voice_status' | 'voice_terminal_enable' | 'voice_terminal_disable' | 'voice_terminal_audio' | 'voice_interrupt' | 'screenshot_captured' | 'preview_start' | 'preview_stop' | 'preview_status' | 'get_preview_logs' | 'clear_preview_logs' | 'list_sessions' | 'kill_session' | 'kill_all_sessions';
   projectName?: string;
   projectId?: string;
   projectType?: 'mobile' | 'web';
@@ -97,7 +105,7 @@ export interface WSMessage {
 }
 
 export interface WSResponse {
-  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'project_renamed' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_background_task_started' | 'voice_background_task_complete' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error' | 'preview_logs' | 'preview_logs_cleared';
+  type: 'pong' | 'connected' | 'stream' | 'done' | 'projects' | 'files' | 'file_content' | 'file_saved' | 'project_created' | 'project_deleted' | 'project_renamed' | 'terminal_created' | 'terminal_output' | 'terminal_closed' | 'error' | 'voice_created' | 'voice_transcription' | 'voice_response' | 'voice_audio' | 'voice_progress' | 'voice_closed' | 'voice_status' | 'voice_terminal_enabled' | 'voice_terminal_disabled' | 'voice_terminal_speaking' | 'voice_app_control' | 'voice_working' | 'voice_background_task_started' | 'voice_background_task_complete' | 'preview_started' | 'preview_stopped' | 'preview_status' | 'preview_error' | 'preview_logs' | 'preview_logs_cleared' | 'sessions_list';
   content?: string;
   error?: string;
   projects?: ServerProject[];
@@ -141,6 +149,8 @@ export interface WSResponse {
   previewErrorType?: 'error' | 'warn' | 'info'; // Severity of preview message
   // Preview logs
   logs?: PreviewLogEntry[];
+  // Session list for reconnection
+  sessions?: SessionInfo[];
 }
 
 // Settings types

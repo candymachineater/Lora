@@ -131,13 +131,30 @@ export default function TerminalScreen() {
     };
   }, [currentProjectId, isConnected]);
 
-  // Create initial terminal when needed (separate effect to avoid race condition)
+  // Create initial terminal(s) when needed - checks for existing sessions to reconnect
   useEffect(() => {
     if (!currentProjectId || !bridgeService.isConnected()) return;
 
     if (terminals.length === 0) {
-      console.log('[Terminal] No terminals found, creating initial terminal for project:', currentProjectId);
-      createTerminal();
+      // Check for existing sessions before creating terminals
+      bridgeService.listSessions(currentProjectId).then(async (existingSessions) => {
+        const sessionCount = existingSessions.length;
+
+        if (sessionCount > 0) {
+          console.log(`[Terminal] Found ${sessionCount} existing session(s), reconnecting...`);
+          // Create terminals to reconnect to existing sessions
+          // First terminal reconnects to main session, additional ones may create new sessions
+          for (let i = 0; i < sessionCount; i++) {
+            await createTerminal();
+          }
+        } else {
+          console.log('[Terminal] No existing sessions, creating new terminal for project:', currentProjectId);
+          createTerminal();
+        }
+      }).catch((err) => {
+        console.log('[Terminal] Failed to check sessions, creating new terminal:', err);
+        createTerminal();
+      });
     }
   }, [currentProjectId, isConnected, terminals.length, createTerminal]);
 
